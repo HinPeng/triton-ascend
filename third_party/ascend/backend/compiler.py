@@ -52,6 +52,8 @@ from triton.backends.ascend.utils import (
     force_disable_ffts,
     get_cann_version_file_hash,
 )
+
+from triton.backends.ascend.backend import timing as _compile_timing
 from triton.backends.ascend.driver import (
     NPUUtils
 )
@@ -116,25 +118,28 @@ def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
 
 
 def make_ttir(mod, metadata, opt):
-    if "hash" not in metadata:
-        metadata["hash"] = hashlib.sha256(f"{mod}-{metadata}".encode()).hexdigest()
-    # the same optimize pass for triton-ir as all other backends
-    pm = ir.pass_manager(mod.context)
-    pm.enable_debug()
-    passes.common.add_inliner(pm)
-    passes.ttir.add_combine(pm)
-    passes.common.add_canonicalizer(pm)
-    passes.ttir.add_reorder_broadcast(pm)
-    passes.common.add_cse(pm)
-    passes.common.add_licm(pm)
-    passes.common.add_symbol_dce(pm)
-    passes.ttir.add_loop_unroll(pm)
-    pm.run(mod)
-    if opt.debug:
-        dump_manager = get_dump_manager(metadata["hash"])
-        print(f"Dumping intermediate results to {dump_manager.cache_dir}")
-        dump_manager.put(str(mod), "kernel.ttir.mlir", binary=False)
+    _timer = _compile_timing.time_phase("make_ttir")
+    with _timer:
+        if "hash" not in metadata:
+            metadata["hash"] = hashlib.sha256(f"{mod}-{metadata}".encode()).hexdigest()
+        # the same optimize pass for triton-ir as all other backends
+        pm = ir.pass_manager(mod.context)
+        pm.enable_debug()
+        passes.common.add_inliner(pm)
+        passes.ttir.add_combine(pm)
+        passes.common.add_canonicalizer(pm)
+        passes.ttir.add_reorder_broadcast(pm)
+        passes.common.add_cse(pm)
+        passes.common.add_licm(pm)
+        passes.common.add_symbol_dce(pm)
+        passes.ttir.add_loop_unroll(pm)
+        pm.run(mod)
+        if opt.debug:
+            dump_manager = get_dump_manager(metadata["hash"])
+            print(f"Dumping intermediate results to {dump_manager.cache_dir}")
+            dump_manager.put(str(mod), "kernel.ttir.mlir", binary=False)
 
+    metadata["_timing_make_ttir_ms"] = _timer.elapsed_ms
     return mod
 
 
@@ -175,6 +180,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             auto_blockify_size = 1
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
+        if _compile_timing._timing_enabled():
+            pm.enable_timing()
         ascend.passes.ttir.add_auto_blockify(
             pm,
             auto_blockify_size
@@ -235,7 +242,30 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         if _load_val is not None:
             ascend.passes.ttir.set_buffer_count("LOAD", _load_val)
 
-        pm.run(mod)
+        ir_stats_before = _compile_timing.count_ir_ops(mod)
+        _total_timer = _compile_timing.time_phase("ttir_to_linalg")
+        with _total_timer:
+            if _compile_timing._timing_enabled():
+                import io as _io
+                import contextlib as _contextlib
+                _stderr_buf = _io.StringIO()
+                with _contextlib.redirect_stderr(_stderr_buf):
+                    pm.run(mod)
+                _timing_output = _stderr_buf.getvalue()
+                _passes = _compile_timing.parse_mlir_timing(_timing_output)
+            else:
+                pm.run(mod)
+                _passes = []
+
+        ir_stats_after = _compile_timing.count_ir_ops(mod)
+
+        metadata["_timing_ttir_to_linalg_ms"] = _total_timer.elapsed_ms
+        metadata["_timing_ttir_to_linalg_passes"] = _passes
+        metadata["_timing_ir_stats"] = {
+            "num_ops_before": ir_stats_before,
+            "num_ops_after": ir_stats_after,
+        }
+
         _adjust_metadata_by_module_result(mod, metadata, opt,
                                           enable_mixed_cv=enable_mixed_cv,
                                           disable_auto_inject_block_sync=disable_auto_inject_block_sync,
@@ -624,18 +654,21 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
             print(f"[DEBUG] cmd_list: {' '.join(cmd_list)}")
 
-        try:
-            ret = subprocess.run(
-                cmd_list,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True
-            )
-        except subprocess.CalledProcessError as e:
-            if opt.debug:
-                _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
-            raise
+        _bin_timer = _compile_timing.time_phase("linalg_to_bin")
+        with _bin_timer:
+            try:
+                ret = subprocess.run(
+                    cmd_list,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True
+                )
+            except subprocess.CalledProcessError as e:
+                if opt.debug:
+                    _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
+                raise
+        metadata["_timing_linalg_to_bin_ms"] = _bin_timer.elapsed_ms
 
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
@@ -846,18 +879,21 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         if opt.debug or os.getenv("TRITON_PRINT_UBTUNING", None) == "1":
             print(f"[DEBUG] cmd_list: {' '.join(cmd_list)}")
 
-        try:
-            ret = subprocess.run(
-                cmd_list,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True
-            )
-        except subprocess.CalledProcessError as e:
-            if opt.debug:
-                _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
-            raise
+        _bin_timer = _compile_timing.time_phase("linalg_to_bin")
+        with _bin_timer:
+            try:
+                ret = subprocess.run(
+                    cmd_list,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True
+                )
+            except subprocess.CalledProcessError as e:
+                if opt.debug:
+                    _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
+                raise
+        metadata["_timing_linalg_to_bin_ms"] = _bin_timer.elapsed_ms
 
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
@@ -1072,7 +1108,10 @@ def ttir_to_npubin(mod, metadata, opt):
             + _compile_option_list
             + ["-o", bin_file]
         )
-        ret = subprocess.run(cmd_list, env = env, capture_output = True, check = True)
+        _bin_timer = _compile_timing.time_phase("linalg_to_bin")
+        with _bin_timer:
+            ret = subprocess.run(cmd_list, env = env, capture_output = True, check = True)
+        metadata["_timing_linalg_to_bin_ms"] = _bin_timer.elapsed_ms
         if not Path(bin_path).exists():
             error_msg = ret.stderr.decode('utf-8')
             print(f"[DEBUG] {bin_path} is not found")

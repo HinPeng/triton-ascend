@@ -1701,6 +1701,9 @@ void init_triton_ir(py::module &&m) {
                    printingFlags);
              }
            })
+      .def("enable_timing", [](PassManager &self) {
+          self.enableTiming();
+      })
       .def("run", [](PassManager &self, ModuleOp &mod) {
         // TODO: maybe dump module to file and print error for better
         // diagnostics
