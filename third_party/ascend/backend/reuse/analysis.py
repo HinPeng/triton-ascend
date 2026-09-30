@@ -1,0 +1,87 @@
+from .dsl.facts import Value, kind_of
+from .dsl.uses import Uses
+from .local_axis import match_local_axis
+from .model import AutoReuseProfile, FunctionPlan, ParameterClass, ParameterDecision
+from .rules import match_grid_stride
+
+_INTEGER_ANNOTATIONS = {
+    **{f"i{bits}": f"int{bits}" for bits in (8, 16, 32, 64)},
+    **{f"u{bits}": f"uint{bits}" for bits in (8, 16, 32, 64)},
+}
+_ANNOTATION_KINDS = {**_INTEGER_ANNOTATIONS, "i1": "bool", "u1": "bool"}
+
+
+def specialized_one(parameter, value):
+    annotation = parameter.annotation_type
+    return (not parameter.is_constexpr and not parameter.do_not_specialize and isinstance(value, int)
+            and not isinstance(value, bool) and int.__eq__(value, 1) is True
+            and (not annotation or annotation in _INTEGER_ANNOTATIONS))
+
+
+def parameter_kind(parameter, value):
+    if parameter.is_constexpr or specialized_one(parameter, value):
+        return kind_of(value)
+    annotation = parameter.annotation_type
+    if annotation:
+        pointer = annotation.startswith("*")
+        scalar = annotation.removeprefix("*k").removeprefix("*")
+        return ("ptr:" if pointer else "") + _ANNOTATION_KINDS.get(scalar, scalar)
+    # This is structural analysis context, not native scalar type inference.
+    # Width and signedness of unannotated arguments belong to the JIT binder.
+    return kind_of(value)
+
+
+def type_context(fn, arguments):
+    return tuple((parameter_kind(p, value), specialized_one(p, value)) for p, value in zip(fn.params, arguments))
+
+
+def static_context(fn, arguments):
+    """Keep constexpr-controlled paths distinct in the structural-analysis cache."""
+    from .identity import typed
+    return tuple((i, typed(value)) for i, (p, value) in enumerate(zip(fn.params, arguments))
+                 if p.is_constexpr and type(value) in (bool, int, float))
+
+
+def analyze(fn, bound, source_key, *, allow_tile_reuse=True):
+    candidates = {p.num for p in fn.params if p.is_constexpr and isinstance(bound[p.name], (int, float))}
+    inputs = {
+        p.name:
+        Value(
+            frozenset((p.num, )) if p.is_constexpr else frozenset(), not p.is_constexpr
+            and not specialized_one(p, bound[p.name]), parameter_kind(p, bound[p.name]))
+        for p in fn.params
+    }
+    uses = Uses(fn, inputs)
+    facts = uses.run()
+    dynamic = candidates - uses.reasons.keys() if facts.complete else set()
+    recipe = match_local_axis(fn, bound) or match_grid_stride(fn)
+    if recipe:
+        dynamic.discard(recipe.tile)
+        dynamic.difference_update(getattr(recipe, "static_parameters", ()))
+    decisions = []
+    for p in fn.params:
+        if not p.is_constexpr:
+            continue
+        reasons = tuple(sorted(uses.reasons.get(p.num, ())))
+        if recipe and p.num == recipe.tile:
+            classification = ParameterClass.ScheduleReusable if allow_tile_reuse else ParameterClass.Unknown
+            if not allow_tile_reuse:
+                reasons += (("TILE_REUSE_TARGET_UNSUPPORTED", 0), )
+        elif p.num in dynamic:
+            classification = ParameterClass.RuntimeEligible
+        elif any(reason.startswith("STATIC_") or reason == "CONTROL_SPECIALIZATION_PRESERVED" for reason, _ in reasons):
+            classification = ParameterClass.StaticRequired
+        else:
+            classification = ParameterClass.Unknown
+            reasons = reasons or facts.diagnostics or (("TYPE_OR_USE_NOT_SUPPORTED", 0), )
+        decisions.append(ParameterDecision(p.num, classification, reasons))
+
+    def plan(context):
+        current = context["fn"]
+        slots = tuple(p.num for p in current.params if p.is_constexpr and context["inputs"][p.name].deps & dynamic)
+        lines = tuple(line for line, deps in context["locals"].items() if deps & dynamic)
+        helpers = tuple((site, plan(child)) for site, child in sorted(context["helpers"].items()))
+        return FunctionPlan(current, slots, lines, helpers)
+
+    transform = plan(facts.facts[0]) if facts.complete else FunctionPlan(fn, (), (), ())
+    return AutoReuseProfile(source_key, tuple(decisions), transform, recipe if allow_tile_reuse else None)

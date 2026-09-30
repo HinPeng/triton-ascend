@@ -640,19 +640,19 @@ index c572f81e3..6e06b8477 100644
  
  
 diff --git a/python/triton/compiler/compiler.py b/python/triton/compiler/compiler.py
-index d4872a463..51347e144 100644
 --- a/python/triton/compiler/compiler.py
 +++ b/python/triton/compiler/compiler.py
-@@ -10,6 +10,7 @@ from ..runtime.autotuner import OutOfResources
- from ..runtime.cache import get_cache_manager, get_dump_manager, get_override_manager, get_cache_key
+@@ -11,7 +11,9 @@
  from ..runtime.driver import driver
  from ..tools.disasm import get_sass
 +from .errors import MLIRCompilationError
  from pathlib import Path
  import re
  import functools
-@@ -321,7 +322,29 @@ def compile(src, target=None, options=None, _env_vars=None):
-     if compilation_listener:
++import threading
+ import os
+ import time
+@@ -322,5 +324,27 @@
          timer.finished_ir_initialization()
      for ext, compile_ir in list(stages.items())[first_stage:]:
 -        next_module = compile_ir(module, metadata)
@@ -681,9 +681,7 @@ index d4872a463..51347e144 100644
 +            raise MLIRCompilationError(stage_name, error_detail) from e
          ir_filename = f"{file_name}.{ext}"
          if fn_override_manager is None:
-             # Users can override kernels at scale by setting `ir_override` in autotune config
-@@ -420,8 +443,10 @@ class CompiledKernel:
-         # stores the text of each level of IR that was generated during compilation
+@@ -421,6 +445,8 @@
          asm_files = [Path(p) for c, p in metadata_group.items() if not c.endswith(".json")]
          binary_ext = backend.binary_ext
 +        binary_extensions = getattr(backend, 'binary_extensions', {binary_ext})
@@ -693,16 +691,32 @@ index d4872a463..51347e144 100644
 +            file.read_bytes() if file.suffix[1:] in binary_extensions else file.read_text()
              for file in asm_files
          })
-         self.metadata_group = metadata_group
-@@ -463,7 +488,7 @@ class CompiledKernel:
-             knobs.runtime.kernel_load_start_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
+@@ -433,6 +459,12 @@
+         self.function = None
+         self._run = None
++        self._initialization_complete = False
++        self._initialization_lock = threading.RLock()
+
+     def _init_handles(self):
++        with self._initialization_lock:
++            return self._init_handles_impl()
++
++    def _init_handles_impl(self):
+         if self.module is not None:
+             return
+@@ -464,5 +496,5 @@
          # TODO: n_regs, n_spills should be metadata generated when calling `ptxas`
          self.module, self.function, self.n_regs, self.n_spills, self.n_max_threads = driver.active.utils.load_binary(
 -            self.name, self.kernel, self.metadata.shared, device)
 +            self.metadata.kernel_name, self.kernel, self.metadata.shared, device, self.metadata.mix_mode)
          warp_size = driver.active.get_current_target().warp_size
          if self.metadata.num_warps * warp_size > self.n_max_threads:
-             raise_(OutOfResources(self.metadata.num_warps * warp_size, self.n_max_threads, "threads"))
+@@ -470,4 +502,5 @@
+         if knobs.runtime.kernel_load_end_hook is not None:
+             knobs.runtime.kernel_load_end_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
++        self._initialization_complete = True
+
+     @property
 diff --git a/python/triton/compiler/errors.py b/python/triton/compiler/errors.py
 index 39e6c4dfb..c72ca65c2 100644
 --- a/python/triton/compiler/errors.py
@@ -1130,11 +1144,9 @@ index cd871cb2e..82eb6960d 100644
                  if triton.knobs.compilation.front_end_debugging:
                      raise
 diff --git a/python/triton/runtime/jit.py b/python/triton/runtime/jit.py
-index 0f506818f..43742c328 100644
 --- a/python/triton/runtime/jit.py
 +++ b/python/triton/runtime/jit.py
-@@ -398,14 +398,19 @@ def create_function_from_signature(sig, kparams, backend):
-     assert len(sig.parameters) == len(kparams)
+@@ -399,4 +399,7 @@
      # Create the function argument list and the dict entries for the return statement
      specialization = []
 +    uses_alignment_specialization = False
@@ -1142,7 +1154,7 @@ index 0f506818f..43742c328 100644
 +    integer_annotation_types = {"i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"}
      # signature
      for name, kp in zip(sig.parameters.keys(), kparams):
-         if kp.is_constexpr:
+@@ -404,8 +407,10 @@
              specialization.append(f'("constexpr", {name})')
          else:
 -            is_const = 'True' if kp.is_const else 'False'
@@ -1157,8 +1169,7 @@ index 0f506818f..43742c328 100644
 +                   f"{effective_align})")
              if kp.annotation_type:
                  if isinstance(kp.annotation_type, str):
-@@ -413,7 +418,14 @@ def create_function_from_signature(sig, kparams, backend):
-                         # we do not specialize non-constexpr floats and bools:
+@@ -414,16 +419,27 @@
                          specialize = False
                  if specialize:
 -                    specialization.append(f'("{kp.annotation_type}",) + {ret}[1:]')
@@ -1173,11 +1184,10 @@ index 0f506818f..43742c328 100644
                  else:
                      # skip runtime specialization:
                      specialization.append(f'("{kp.annotation_type}", None)')
-@@ -420,2 +432,3 @@ def create_function_from_signature(sig, kparams, backend):
              else:
 +                uses_alignment_specialization = uses_alignment_specialization or (align and specialize)
                  specialization.append(f"{ret}")
-@@ -423,8 +436,11 @@ def create_function_from_signature(sig, kparams, backend):
+
      # compute argument string for a given parameter
      arg = lambda x: x[0] if x[1].default is inspect.Parameter.empty else f"{x[0]}=default_{x[0]}"
 +    alignment_specialization_init = (f"    {alignment_specialization_name} = "
@@ -1189,4 +1199,117 @@ index 0f506818f..43742c328 100644
 +{alignment_specialization_init}    params = {{{', '.join([f"'{name}': {name}" for name in sig.parameters.keys()])}}}
      specialization = [{','.join(specialization)}]
      return params, specialization, options
- """
+@@ -705,18 +721,37 @@
+             hook(*args, **kwargs)
+
+-        kernel_cache, kernel_key_cache, target, backend, binder = self.device_caches[device]
++        _, _, _, backend, _ = self.device_caches[device]
++        get_handler = getattr(backend, "get_jit_reuse_handler", None)
++        handler = get_handler() if get_handler is not None else None
++        if handler is not None:
++            return handler.run(self, args, kwargs, grid, warmup, device, stream, backend, self._run_jit_tail)
++        return self._run_jit_tail(args, kwargs, grid, warmup, device, stream)
++
++    def _run_jit_tail(self, args, kwargs, grid, warmup, device, stream, *, owner=None, prepared=None,
++                      bound=None, specialization=None, raw_options=None, memory_key=None,
++                      on_initialized=None, initialize=None, frame=None):
++        # Optional backend continuation; all compilation and launch remain on this path.
++        owner = self if owner is None else owner
++        kernel_cache, kernel_key_cache, target, backend, binder = owner.device_caches[device]
+         # specialization is list[tuple[str, Any]], where first element of tuple is
+         # the type and the second parameter is the 'specialization' value.
+-        bound_args, specialization, options = binder(*args, **kwargs)
+-
+-        key = compute_cache_key(kernel_key_cache, specialization, options)
+-        kernel = kernel_cache.get(key, None)
++        if bound is None:
++            bound_args, specialization, options = binder(*args, **kwargs)
++        else:
++            bound_args, options = bound, raw_options
++
++        key = memory_key
++        kernel = prepared
++        if kernel is None:
++            if key is None:
++                key = compute_cache_key(kernel_key_cache, specialization, options)
++            kernel = kernel_cache.get(key, None)
+
+         # Kernel is not cached; we have to compile.
+         if kernel is None:
+-            options, signature, constexprs, attrs = self._pack_args(backend, kwargs, bound_args, specialization,
++            options, signature, constexprs, attrs = owner._pack_args(backend, kwargs, bound_args, specialization,
+                                                                     options)
+
+-            kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
++            kernel = owner._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             if kernel is None:
+                 return None
+@@ -732,5 +767,7 @@
+             # canonicalize grid
+             assert grid is not None
+-            if callable(grid):
++            if frame is not None:
++                grid = frame.resolve_grid(grid, bound_args)
++            elif callable(grid):
+                 grid = grid(bound_args)
+             grid_size = len(grid)
+@@ -740,4 +777,12 @@
+             if hasattr(kernel, "result"):
+                 kernel = kernel.result()
++            if initialize is not None:
++                kernel = initialize(kernel)
++            elif on_initialized is not None:
++                kernel._init_handles()
++            if on_initialized is not None:
++                on_initialized(kernel)
++            if frame is not None:
++                frame.before_launch()
+             # launch kernel
+             launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+diff --git a/python/triton/runtime/autotuner.py b/python/triton/runtime/autotuner.py
+--- a/python/triton/runtime/autotuner.py
++++ b/python/triton/runtime/autotuner.py
+@@ -15,4 +15,13 @@
+ from .cache import get_cache_manager, triton_key
+ from triton._C.libtriton import get_cache_invalidating_env_vars
++
++
++def _exact_request_scope():
++    from contextlib import nullcontext
++    from ..compiler import make_backend
++    from .driver import driver
++    backend = make_backend(driver.active.get_current_target())
++    factory = getattr(backend, "get_exact_request_scope", None)
++    return nullcontext() if factory is None else factory()
+
+
+@@ -148,8 +157,9 @@
+             self.pre_hook(full_nargs)
+             try:
+-                self.fn.run(
+-                    *args,
+-                    **current,
+-                )
++                with _exact_request_scope():
++                    self.fn.run(
++                        *args,
++                        **current,
++                    )
+             except Exception as e:
+                 try:
+@@ -289,9 +299,10 @@
+         ret = []
+         for autotune_config in self.prune_configs(kwargs):
+-            ret.append(self.fn.warmup(
+-                *args,
+-                **kwargs,
+-                **autotune_config.all_kwargs(),
+-            ))
++            with _exact_request_scope():
++                ret.append(self.fn.warmup(
++                    *args,
++                    **kwargs,
++                    **autotune_config.all_kwargs(),
++                ))
+         self.nargs = None
+         return ret

@@ -150,6 +150,7 @@ def get_triton_ascend_patch_file():
         "python/triton/language/standard.py",
         "python/triton/runtime/interpreter.py",
         "python/triton/runtime/jit.py",
+        "python/triton/runtime/autotuner.py",
         "bin/RegisterTritonDialects.h",
         "bin/triton-opt.cpp",
         "bin/CMakeLists.txt",
@@ -163,12 +164,13 @@ def _apply_triton_ascend_patch():
     dev_patch = os.path.join(patch_path, "triton-ascend-dev-3.6.0.patch")
     patch = os.path.join(patch_path, "triton-ascend-3.6.0.patch")
     patch_files, dev_patch_files = get_triton_ascend_patch_file()
-    if _is_dev_mode() and os.path.isfile(dev_patch):
-        checkout_file(dev_patch_files)
-        _apply_patch(str(dev_patch))
+    apply_dev = _is_dev_mode() and os.path.isfile(dev_patch)
+    restore_files = list(dict.fromkeys(patch_files + (dev_patch_files if apply_dev else [])))
+    checkout_file(restore_files)
     if os.path.isfile(patch):
-        checkout_file(patch_files)
         _apply_patch(str(patch))
+    if apply_dev:
+        _apply_patch(str(dev_patch))
 
 
 def _print_patch_restore_warning():
@@ -557,6 +559,8 @@ def patch_module(mod):
 
     def get_package_dirs():
         yield from _orig_get_package_dirs()
+        yield ("triton.backends.ascend.reuse", "third_party/ascend/backend/reuse")
+        yield ("triton.backends.ascend.reuse.dsl", "third_party/ascend/backend/reuse/dsl")
         if mod.check_env_flag("TRITON_BUILD_TD", "OFF"):
             yield ("triton_dist",
                    os.path.join("third_party", "ascend", "Triton-distributed-ascend", "python", "triton_dist"))
@@ -566,7 +570,9 @@ def patch_module(mod):
     _orig_get_packages = mod.get_packages
 
     def get_packages():
-        yield from _orig_get_packages()
+        packages = set(_orig_get_packages())
+        packages.update(("triton.backends.ascend.reuse", "triton.backends.ascend.reuse.dsl"))
+        yield from sorted(packages)
         if mod.check_env_flag("TRITON_BUILD_TD", "OFF"):
             distributed_pkg_root = os.path.join("third_party", "ascend", "Triton-distributed-ascend", "python",
                                                 "triton_dist")

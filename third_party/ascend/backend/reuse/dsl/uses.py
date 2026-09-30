@@ -1,0 +1,260 @@
+"""Use-site dependency interpretation with branch joins and bounded loop fixed points."""
+import ast
+import inspect
+
+from .. import config
+from ..operations import STATIC_ARGUMENTS, operation, resolve
+from .facts import FactResult, Value, constant_value, merge
+
+
+class Incomplete(Exception):
+    pass
+
+
+class Uses:
+
+    def __init__(self, root, inputs):
+        self.root = root
+        self.inputs = inputs
+        self.reasons = {}
+        self.diagnostics = []
+        self.remaining = config.ANALYSIS_NODE_BUDGET
+        self.active = set()
+        self.contexts = []
+
+    def reject(self, value, reason, node):
+        line = getattr(node, "lineno", 0)
+        for dep in value.deps:
+            self.reasons.setdefault(dep, set()).add((reason, line))
+
+    def unknown(self, node, reason):
+        self.diagnostics.append((reason, getattr(node, "lineno", 0)))
+        raise Incomplete(reason)
+
+    def run(self):
+        try:
+            context, _ = self.function(self.root, self.inputs)
+            return FactResult((context, ), True, tuple(self.diagnostics))
+        except Incomplete:
+            return FactResult((), False, tuple(self.diagnostics))
+
+    def function(self, fn, inputs):
+        if id(fn) in self.active:
+            self.unknown(fn.parse(), "RECURSIVE_JIT_CALL")
+        self.active.add(id(fn))
+        context = {"fn": fn, "inputs": dict(inputs), "locals": {}, "helpers": {}}
+        scope = fn.get_capture_scope()
+        env = dict(inputs)
+        returns = []
+        try:
+            self.statements(fn.parse().body[0].body, env, scope, context, returns)
+        finally:
+            self.active.remove(id(fn))
+        # The JIT frontend materializes scalar helper returns as tensors, even
+        # when the returned expression was computed entirely from constexprs.
+        return context, merge(*returns, runtime=True) if returns else Value()
+
+    def expression(self, node, env, scope, context):
+        self.remaining -= 1
+        if self.remaining < 0:
+            self.unknown(node, "ANALYSIS_BUDGET_EXHAUSTED")
+        if isinstance(node, ast.Constant):
+            return constant_value(node.value)
+        if isinstance(node, ast.Name):
+            if node.id in env:
+                return env[node.id]
+            obj = resolve(node, scope)
+            import triton.language as tl
+            if isinstance(obj, tl.constexpr):
+                obj = obj.value
+            if isinstance(obj, (int, float)):
+                return constant_value(obj)
+            if obj is not None or node.id in scope:
+                return Value(kind="static")
+            self.unknown(node, "UNRESOLVED_NAME")
+        if isinstance(node, (ast.Tuple, ast.List)):
+            return merge(*(self.expression(n, env, scope, context) for n in node.elts), kind="tuple")
+        if isinstance(node, ast.Attribute):
+            if resolve(node, scope) is not None:
+                return Value(kind="static")
+            value = self.expression(node.value, env, scope, context)
+            self.reject(value, "STATIC_ATTRIBUTE", node)
+            if node.attr not in ("dtype", "shape", "value"):
+                self.unknown(node, "ATTRIBUTE_SUMMARY_MISSING")
+            return Value(value.deps, False, "static")
+        if isinstance(node, ast.Subscript):
+            value = self.expression(node.value, env, scope, context)
+            index = self.expression(node.slice, env, scope, context)
+            self.reject(index, "STATIC_INDEX", node)
+            return merge(value, index, runtime=value.runtime)
+        if isinstance(node, ast.Slice):
+            return merge(*(self.expression(n, env, scope, context)
+                           for n in (node.lower, node.upper, node.step)
+                           if n is not None))
+        if isinstance(node, ast.BinOp):
+            # Track every use; native Triton owns operand types and arithmetic.
+            return merge(self.expression(node.left, env, scope, context),
+                         self.expression(node.right, env, scope, context))
+        if isinstance(node, ast.UnaryOp):
+            return self.expression(node.operand, env, scope, context)
+        if isinstance(node, ast.Compare):
+            values = [self.expression(n, env, scope, context) for n in [node.left, *node.comparators]]
+            return merge(*values, kind="bool")
+        if isinstance(node, ast.BoolOp):
+            values = [self.expression(n, env, scope, context) for n in node.values]
+            for v in values:
+                if not v.runtime:
+                    self.reject(v, "CONTROL_SPECIALIZATION_PRESERVED", node)
+            return merge(*values, kind="bool")
+        if isinstance(node, ast.IfExp):
+            condition = self.expression(node.test, env, scope, context)
+            if not condition.runtime:
+                self.reject(condition, "CONTROL_SPECIALIZATION_PRESERVED", node)
+            return merge(condition, self.expression(node.body, env, scope, context),
+                         self.expression(node.orelse, env, scope, context))
+        if isinstance(node, ast.Call):
+            return self.call(node, env, scope, context)
+        self.unknown(node, "EXPRESSION_SUMMARY_MISSING")
+
+    def call(self, node, env, scope, context):
+        from triton.runtime.jit import JITFunction
+        if any(isinstance(n, ast.Starred) for n in node.args) or any(k.arg is None for k in node.keywords):
+            self.unknown(node, "STAR_CALL_UNSUPPORTED")
+        args = [self.expression(n, env, scope, context) for n in node.args]
+        kwargs = {k.arg: self.expression(k.value, env, scope, context) for k in node.keywords}
+        obj = resolve(node.func, scope)
+        op = operation(obj)
+        if isinstance(obj, JITFunction) and op is None:
+            try:
+                bound = obj.signature.bind(*args, **kwargs)
+            except TypeError:
+                self.unknown(node, "JIT_CALLEE_BINDING_FAILED")
+            for name, p in obj.signature.parameters.items():
+                if name not in bound.arguments:
+                    if p.default is inspect.Parameter.empty:
+                        self.unknown(node, "JIT_CALLEE_DEFAULT_MISSING")
+                    bound.arguments[name] = constant_value(p.default)
+            child, result = self.function(obj, bound.arguments)
+            # Revisited loop bodies must retain dependencies from earlier iterations.
+            site = (node.lineno, node.col_offset)
+            previous = context["helpers"].get(site)
+            if previous and previous["inputs"] != child["inputs"]:
+                inputs = {k: merge(previous["inputs"][k], child["inputs"][k]) for k in child["inputs"]}
+                child, result = self.function(obj, inputs)
+            context["helpers"][site] = child
+            return result
+        if op is None and isinstance(node.func, ast.Attribute) and node.func.attr == "to":
+            value = self.expression(node.func.value, env, scope, context)
+            dtype_node = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg == "dtype"), None)
+            dtype = resolve(dtype_node, scope) if dtype_node is not None else None
+            kind = str(dtype)
+            for v in [*args, *kwargs.values()]:
+                self.reject(v, "STATIC_DTYPE", node)
+            return Value(value.deps, value.runtime, kind)
+        if op is None:
+            self.unknown(node, "OPERATION_SUMMARY_MISSING")
+        all_values = [*args, *kwargs.values()]
+        value = merge(*all_values)
+        if op in ("static_range", "static_assert", "pointer_type"):
+            self.reject(value, "STATIC_" + op.upper(), node)
+        if op == "range":
+            for attribute in args[3:]:
+                self.reject(attribute, "STATIC_LOOP_ATTRIBUTE", node)
+            for name, attribute in kwargs.items():
+                if name not in ("arg1", "arg2", "step", "start", "end"):
+                    self.reject(attribute, "STATIC_LOOP_ATTRIBUTE", node)
+        positions, names = STATIC_ARGUMENTS.get(op, ((), ()))
+        for i in positions:
+            if i < len(args):
+                self.reject(args[i], "STATIC_" + op.upper(), node)
+        for name in names:
+            if name in kwargs:
+                self.reject(kwargs[name], "STATIC_" + op.upper(), node)
+        if op in ("program_id", "num_programs", "arange"):
+            return Value(value.deps, True, "int")
+        if op == "load":
+            pointer = args[0] if args else kwargs.get("pointer", Value(kind="unknown"))
+            other = args[2] if len(args) > 2 else kwargs.get("other", Value())
+            # Address dependence does not change the loaded element's type.
+            return Value(other.deps, True, pointer.kind.removeprefix("ptr:"))
+        if op == "cast":
+            dtype_node = node.args[1] if len(node.args) > 1 else next(
+                (k.value for k in node.keywords if k.arg == "dtype"), None)
+            dtype = resolve(dtype_node, scope) if dtype_node is not None else None
+            if isinstance(dtype_node, ast.Call) and operation(resolve(dtype_node.func, scope)) == "pointer_type":
+                element = resolve(dtype_node.args[0], scope)
+                return Value(runtime=True, kind="ptr:" + str(element))
+            kind = str(dtype)
+            return Value(value.deps, value.runtime, kind)
+        if op == "where":
+            condition = args[0] if args else kwargs.get("condition", Value())
+            x = args[1] if len(args) > 1 else kwargs.get("x", Value(kind="unknown"))
+            y = args[2] if len(args) > 2 else kwargs.get("y", Value(kind="unknown"))
+            return merge(condition, x, y, runtime=True, kind=y.kind)
+        return Value(value.deps, value.runtime or op not in ("static_range", "range", "pointer_type"), value.kind)
+
+    def assign(self, target, value, env, node):
+        if not isinstance(target, ast.Name):
+            self.unknown(node, "ASSIGNMENT_SUMMARY_MISSING")
+        env[target.id] = value
+
+    def statements(self, statements, env, scope, context, returns):
+        for node in statements:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                value = self.expression(node.value, env, scope, context)
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    self.assign(target, value, env, node)
+                if isinstance(node, ast.AnnAssign):
+                    import triton.language as tl
+                    if resolve(node.annotation, scope) is not tl.constexpr:
+                        self.unknown(node, "LOCAL_ANNOTATION_UNSUPPORTED")
+                    if value.runtime:
+                        self.reject(value, "RUNTIME_VALUE_IN_LOCAL_CONSTEXPR", node)
+                    context["locals"][node.lineno] = context["locals"].get(node.lineno, frozenset()) | value.deps
+            elif isinstance(node, ast.AugAssign):
+                value = self.expression(ast.copy_location(ast.BinOp(node.target, node.op, node.value), node), env,
+                                        scope, context)
+                self.assign(node.target, value, env, node)
+            elif isinstance(node, ast.Expr):
+                self.expression(node.value, env, scope, context)
+            elif isinstance(node, ast.Return):
+                if node.value:
+                    returns.append(self.expression(node.value, env, scope, context))
+            elif isinstance(node, ast.If):
+                condition = self.expression(node.test, env, scope, context)
+                if not condition.runtime:
+                    self.reject(condition, "CONTROL_SPECIALIZATION_PRESERVED", node)
+                left, right = dict(env), dict(env)
+                self.statements(node.body, left, scope, context, returns)
+                self.statements(node.orelse, right, scope, context, returns)
+                for name in left.keys() | right.keys():
+                    env[name] = merge(left.get(name, Value()), right.get(name, Value()))
+            elif isinstance(node, (ast.For, ast.While)):
+                before = dict(env)
+                for _ in range(config.LOOP_ITERATIONS):
+                    previous = dict(env)
+                    if isinstance(node, ast.For):
+                        value = self.expression(node.iter, env, scope, context)
+                        op = operation(resolve(node.iter.func, scope)) if isinstance(node.iter, ast.Call) else None
+                        if op not in ("range", "static_range"):
+                            self.unknown(node, "LOOP_ITERATOR_UNSUPPORTED")
+                        self.assign(node.target, Value(value.deps, op != "static_range", "int"), env, node)
+                    else:
+                        condition = self.expression(node.test, env, scope, context)
+                        if not condition.runtime:
+                            self.reject(condition, "CONTROL_SPECIALIZATION_PRESERVED", node)
+                    self.statements(node.body, env, scope, context, returns)
+                    # Backedges merge dependencies, not a last-assignment map.
+                    for name in before.keys() | previous.keys() | env.keys():
+                        values = [m[name] for m in (before, previous, env) if name in m]
+                        env[name] = merge(*values)
+                    if env == previous:
+                        break
+                else:
+                    self.unknown(node, "LOOP_ANALYSIS_NOT_CONVERGED")
+                self.statements(node.orelse, env, scope, context, returns)
+            elif isinstance(node, (ast.Pass, ast.Break, ast.Continue)):
+                pass
+            else:
+                self.unknown(node, "STATEMENT_SUMMARY_MISSING")
