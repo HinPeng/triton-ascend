@@ -1,18 +1,93 @@
+diff --git a/python/triton/compiler/compiler.py b/python/triton/compiler/compiler.py
+index 51347e1..7b8c751 100644
+--- a/python/triton/compiler/compiler.py
++++ b/python/triton/compiler/compiler.py
+@@ -14,6 +14,7 @@ from .errors import MLIRCompilationError
+ from pathlib import Path
+ import re
+ import functools
++import threading
+ import os
+ import time
+ import copy
+@@ -457,8 +458,14 @@ class CompiledKernel:
+         self.module = None
+         self.function = None
+         self._run = None
++        self._initialization_complete = False
++        self._initialization_lock = threading.RLock()
+
+     def _init_handles(self):
++        with self._initialization_lock:
++            return self._init_handles_impl()
++
++    def _init_handles_impl(self):
+         if self.module is not None:
+             return
+
+@@ -494,6 +501,7 @@ class CompiledKernel:
+             raise_(OutOfResources(self.metadata.num_warps * warp_size, self.n_max_threads, "threads"))
+         if knobs.runtime.kernel_load_end_hook is not None:
+             knobs.runtime.kernel_load_end_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
++        self._initialization_complete = True
+
+     @property
+     def run(self):
 diff --git a/python/triton/runtime/autotuner.py b/python/triton/runtime/autotuner.py
-index 0c4d710496..d98afb86f9 100644
+index 0c4d710..333507b 100644
 --- a/python/triton/runtime/autotuner.py
 +++ b/python/triton/runtime/autotuner.py
-@@ -126,7 +126,7 @@ class Autotuner(KernelInterface):
+@@ -5,6 +5,7 @@ import time
+ import inspect
+ import hashlib
+ import json
++from contextlib import nullcontext
+ from functools import cached_property
+ from typing import Dict, Tuple, List, Optional
+
+@@ -16,6 +17,15 @@ from .cache import get_cache_manager, triton_key
+ from triton._C.libtriton import get_cache_invalidating_env_vars
+
+
++def _exact_request_scope():
++    from ..compiler import make_backend
++    from .driver import driver
++
++    backend = make_backend(driver.active.get_current_target())
++    factory = getattr(backend, "get_exact_request_scope", None)
++    return nullcontext() if factory is None else factory()
++
++
+ class Autotuner(KernelInterface):
+
+     def __init__(self, fn, arg_names, configs, key, reset_to_zero, restore_value, pre_hook=None, post_hook=None,
+@@ -126,7 +136,7 @@ class Autotuner(KernelInterface):
          return self._do_bench
- 
+
      def _bench(self, *args, config, **meta):
 -        from ..compiler.errors import CompileTimeAssertionFailure
 +        from ..compiler.errors import CompileTimeAssertionFailure, MLIRCompilationError
- 
+
          verbose = knobs.autotuning.print
          if verbose:
-@@ -162,7 +162,7 @@ class Autotuner(KernelInterface):
- 
+@@ -147,10 +157,11 @@ class Autotuner(KernelInterface):
+                 config.pre_hook(full_nargs)
+             self.pre_hook(full_nargs)
+             try:
+-                self.fn.run(
+-                    *args,
+-                    **current,
+-                )
++                with _exact_request_scope():
++                    self.fn.run(
++                        *args,
++                        **current,
++                    )
+             except Exception as e:
+                 try:
+                     self.post_hook(full_nargs, exception=e)
+@@ -162,7 +173,7 @@ class Autotuner(KernelInterface):
+
          try:
              return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
 -        except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as e:
@@ -20,3 +95,97 @@ index 0c4d710496..d98afb86f9 100644
              if verbose:
                  print(f"Autotuning failed with {e}")
              return [float("inf"), float("inf"), float("inf")]
+@@ -288,11 +299,12 @@ class Autotuner(KernelInterface):
+         self.nargs = dict(zip(self.arg_names, args))
+         ret = []
+         for autotune_config in self.prune_configs(kwargs):
+-            ret.append(self.fn.warmup(
+-                *args,
+-                **kwargs,
+-                **autotune_config.all_kwargs(),
+-            ))
++            with _exact_request_scope():
++                ret.append(self.fn.warmup(
++                    *args,
++                    **kwargs,
++                    **autotune_config.all_kwargs(),
++                ))
+         self.nargs = None
+         return ret
+
+diff --git a/python/triton/runtime/jit.py b/python/triton/runtime/jit.py
+index 43742c3..9961a4e 100644
+--- a/python/triton/runtime/jit.py
++++ b/python/triton/runtime/jit.py
+@@ -720,20 +720,39 @@ class JITFunction(JITCallable, KernelInterface[T]):
+         for hook in self.pre_run_hooks:
+             hook(*args, **kwargs)
+
+-        kernel_cache, kernel_key_cache, target, backend, binder = self.device_caches[device]
++        _, _, _, backend, _ = self.device_caches[device]
++        get_handler = getattr(backend, "get_jit_reuse_handler", None)
++        handler = get_handler() if get_handler is not None else None
++        if handler is not None:
++            return handler.run(self, args, kwargs, grid, warmup, device, stream, backend, self._run_jit_tail)
++        return self._run_jit_tail(args, kwargs, grid, warmup, device, stream)
++
++    def _run_jit_tail(self, args, kwargs, grid, warmup, device, stream, *, owner=None, prepared=None,
++                      bound=None, specialization=None, raw_options=None, memory_key=None,
++                      on_initialized=None, initialize=None, frame=None):
++        # Optional backend continuation; all compilation and launch remain on this path.
++        owner = self if owner is None else owner
++        kernel_cache, kernel_key_cache, target, backend, binder = owner.device_caches[device]
+         # specialization is list[tuple[str, Any]], where first element of tuple is
+         # the type and the second parameter is the 'specialization' value.
+-        bound_args, specialization, options = binder(*args, **kwargs)
++        if bound is None:
++            bound_args, specialization, options = binder(*args, **kwargs)
++        else:
++            bound_args, options = bound, raw_options
+
+-        key = compute_cache_key(kernel_key_cache, specialization, options)
+-        kernel = kernel_cache.get(key, None)
++        key = memory_key
++        kernel = prepared
++        if kernel is None:
++            if key is None:
++                key = compute_cache_key(kernel_key_cache, specialization, options)
++            kernel = kernel_cache.get(key, None)
+
+         # Kernel is not cached; we have to compile.
+         if kernel is None:
+-            options, signature, constexprs, attrs = self._pack_args(backend, kwargs, bound_args, specialization,
++            options, signature, constexprs, attrs = owner._pack_args(backend, kwargs, bound_args, specialization,
+                                                                     options)
+
+-            kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
++            kernel = owner._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             if kernel is None:
+                 return None
+
+@@ -747,7 +766,9 @@ class JITFunction(JITCallable, KernelInterface[T]):
+         if not warmup:
+             # canonicalize grid
+             assert grid is not None
+-            if callable(grid):
++            if frame is not None:
++                grid = frame.resolve_grid(grid, bound_args)
++            elif callable(grid):
+                 grid = grid(bound_args)
+             grid_size = len(grid)
+             grid_0 = grid[0]
+@@ -755,6 +776,14 @@ class JITFunction(JITCallable, KernelInterface[T]):
+             grid_2 = grid[2] if grid_size > 2 else 1
+             if hasattr(kernel, "result"):
+                 kernel = kernel.result()
++            if initialize is not None:
++                kernel = initialize(kernel)
++            elif on_initialized is not None:
++                kernel._init_handles()
++            if on_initialized is not None:
++                on_initialized(kernel)
++            if frame is not None:
++                frame.before_launch()
+             # launch kernel
+             launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+             kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
