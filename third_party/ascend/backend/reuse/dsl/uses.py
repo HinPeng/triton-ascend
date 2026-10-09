@@ -119,6 +119,15 @@ class Uses:
             return self.call(node, env, scope, context)
         self.unknown(node, "EXPRESSION_SUMMARY_MISSING")
 
+    def bind_required_arguments(self, node, op, parameters, args, kwargs):
+        """Bind operations whose public parameters are all required."""
+        supplied = dict(zip(parameters, args))
+        if (len(args) > len(parameters) or kwargs.keys() & supplied.keys()
+                or supplied.keys() | kwargs.keys() != set(parameters)):
+            self.unknown(node, op.upper() + "_ARGUMENTS_UNSUPPORTED")
+        supplied.update(kwargs)
+        return supplied
+
     def call(self, node, env, scope, context):
         from triton.runtime.jit import JITFunction
 
@@ -147,6 +156,12 @@ class Uses:
                 child, result = self.function(obj, inputs)
             context["helpers"][site] = child
             return result
+        if op is None and obj is None and isinstance(node.func, ast.Attribute) and node.func.attr == "advance":
+            base = self.expression(node.func.value, env, scope, context)
+            if not base.kind.startswith("block_ptr:"):
+                self.unknown(node, "ADVANCE_BASE_NOT_BLOCK_POINTER")
+            args.insert(0, base)
+            op = "advance"
         if op is None and isinstance(node.func, ast.Attribute) and node.func.attr == "to":
             value = self.expression(node.func.value, env, scope, context)
             dtype_node = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg == "dtype"), None)
@@ -177,13 +192,42 @@ class Uses:
         for name in names:
             if name in kwargs:
                 self.reject(kwargs[name], "STATIC_" + op.upper(), node)
+        if op == "make_block_ptr":
+            parameters = ("base", "shape", "strides", "offsets", "block_shape", "order")
+            supplied = self.bind_required_arguments(node, op, parameters, args, kwargs)
+            base = supplied["base"]
+            # Parent shape/strides and offsets are runtime metadata; only the
+            # block shape and order determine the static block pointer type.
+            element = base.kind.removeprefix("ptr:") if base.kind.startswith("ptr:") else "unknown"
+            if element in ("bool", "int1"):
+                element = "int8"  # Native make_block_ptr promotes int1 pointers.
+            return Fact(value.deps, True, "block_ptr:" + element)
+        if op == "advance":
+            supplied = self.bind_required_arguments(node, op, ("base", "offsets"), args, kwargs)
+            base = supplied["base"]
+            if not base.kind.startswith("block_ptr:"):
+                self.unknown(node, "ADVANCE_BASE_NOT_BLOCK_POINTER")
+            return Fact(value.deps, True, base.kind)
+        if op == "dot":
+            parameters = ("input", "other", "acc", "input_precision", "allow_tf32", "max_num_imprecise_acc",
+                          "out_dtype")
+            supplied = set(parameters[:len(args)]) | kwargs.keys()
+            if (len(args) > len(parameters) or kwargs.keys() - set(parameters)
+                    or kwargs.keys() & set(parameters[:len(args)]) or not {"input", "other"} <= supplied):
+                self.unknown(node, "DOT_ARGUMENTS_UNSUPPORTED")
+            # Dot is a runtime tensor contraction, not a pointwise operation.
+            # Its shape producers and instruction attributes stay static. Keep
+            # data dependencies, but do not inherit the lhs element type: fp16
+            # can accumulate into fp32, and int8 into int32. Fact.kind is not a
+            # tensor type system; native Triton owns dot typing and validation.
+            return Fact(value.deps, True, "unknown")
         if op in ("program_id", "num_programs", "arange"):
             return Fact(value.deps, True, "int")
         if op == "load":
             pointer = args[0] if args else kwargs.get("pointer", Fact(kind="unknown"))
             other = args[2] if len(args) > 2 else kwargs.get("other", Fact())
             # Address dependence does not change the loaded element's type.
-            return Fact(other.deps, True, pointer.kind.removeprefix("ptr:"))
+            return Fact(other.deps, True, pointer.kind.removeprefix("ptr:").removeprefix("block_ptr:"))
         if op == "cast":
             dtype_node = node.args[1] if len(node.args) > 1 else next(
                 (k.value for k in node.keywords if k.arg == "dtype"), None)

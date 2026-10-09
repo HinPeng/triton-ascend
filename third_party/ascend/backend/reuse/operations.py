@@ -37,7 +37,7 @@ def identity_name(obj, names):
 
 _OPERATIONS = ("arange", "program_id", "num_programs", "load", "store", "where", "cast", "full", "zeros", "reshape",
                "broadcast_to", "expand_dims", "static_range", "range", "static_assert", "sum", "min", "max", "gather",
-               "cdiv", "minimum", "maximum", "sqrt", "pointer_type")
+               "cdiv", "minimum", "maximum", "sqrt", "pointer_type", "dot", "make_block_ptr", "advance")
 
 
 def operation(obj):
@@ -52,6 +52,8 @@ def operation(obj):
 
 
 STATIC_ARGUMENTS = {
+    "make_block_ptr": ((4, 5), ("block_shape", "order")),
+    "dot": ((3, 4, 5, 6), ("input_precision", "allow_tf32", "max_num_imprecise_acc", "out_dtype")),
     "arange": ((0, 1), ("start", "end")),
     "program_id": ((0, ), ("axis", )),
     "num_programs": ((0, ), ("axis", )),
