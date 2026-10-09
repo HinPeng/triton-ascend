@@ -1,6 +1,7 @@
 """Operation identities and the first, deliberately finite semantic vocabulary."""
 import ast
 import builtins
+import inspect
 import types
 from functools import lru_cache
 
@@ -49,6 +50,17 @@ def operation(obj):
     if obj is builtins.min:
         return "builtin_min"
     return None
+
+
+def is_language_builtin(obj):
+    """Bounded DSL call identity, without invoking user attribute descriptors."""
+    import triton.language as tl
+
+    if inspect.getattr_static(obj, "__triton_builtin__", False) is not True:
+        return False
+    # A marker on an arbitrary user callable is not sufficient. Only exports
+    # from these language namespaces have the DSL value/effect contract.
+    return any(value is obj for module in (tl, tl.math) for value in vars(module).values())
 
 
 STATIC_ARGUMENTS = {

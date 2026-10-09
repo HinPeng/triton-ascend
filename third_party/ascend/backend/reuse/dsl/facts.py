@@ -10,6 +10,13 @@ def kind_of(value):
         return "bool"
     if isinstance(value, int):
         return "int"
+    if isinstance(value, str):
+        return "str"
+    if callable(value):
+        import triton.language as tl
+
+        if not isinstance(value, tl.dtype):
+            return "callable"
     return "unknown"
 
 
@@ -30,11 +37,13 @@ class FactResult:
 
 @dataclass(frozen=True)
 class Fact:
+    # Dependencies relevant to specialization, not full runtime data taint.
     deps: frozenset = frozenset()
     runtime: bool = False
     kind: str = "int"
+    opaque: bool = False  # The value's compile-time/runtime behavior is unknown.
 
 
 def merge(*values, runtime=False, kind=None):
     return Fact(frozenset().union(*(v.deps for v in values)), runtime or any(v.runtime for v in values), kind
-                or (values[0].kind if values else "int"))
+                or (values[0].kind if values else "int"), any(v.opaque for v in values))

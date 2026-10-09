@@ -2,7 +2,7 @@ import os
 from functools import lru_cache
 
 SCHEMA_VERSION = 1
-RULE_VERSION = 19
+RULE_VERSION = 20
 ABI_VERSION = 2
 ANALYSIS_NODE_BUDGET = 12000
 LOOP_ITERATIONS = 16

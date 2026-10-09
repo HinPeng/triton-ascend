@@ -3,7 +3,7 @@ import ast
 import inspect
 
 from .. import config
-from ..operations import STATIC_ARGUMENTS, operation, resolve
+from ..operations import STATIC_ARGUMENTS, is_language_builtin, operation, resolve
 from ..syntax import parse
 from .facts import FactResult, Fact, constant_value, merge
 
@@ -31,6 +31,12 @@ class Uses:
     def unknown(self, node, reason):
         self.diagnostics.append((reason, getattr(node, "lineno", 0)))
         raise Incomplete(reason)
+
+    def opaque(self, node, reason, *values):
+        """Reject only bounded dependencies; keep walking with an opaque value."""
+        value = merge(*values)
+        self.reject(value, reason, node)
+        return Fact(value.deps, False, "unknown", True)
 
     def run(self):
         try:
@@ -63,6 +69,8 @@ class Uses:
             return constant_value(node.value)
         if isinstance(node, ast.Name):
             if node.id in env:
+                if env[node.id].kind == "callable":
+                    self.unknown(node, "CALLABLE_VALUE_UNSUPPORTED")
                 return env[node.id]
             obj = resolve(node, scope)
 
@@ -73,18 +81,28 @@ class Uses:
             if isinstance(obj, (int, float)):
                 return constant_value(obj)
             if obj is not None or node.id in scope:
+                if callable(obj) and not isinstance(obj, tl.dtype):
+                    self.unknown(node, "CALLABLE_VALUE_UNSUPPORTED")
                 return Fact(kind="static")
             self.unknown(node, "UNRESOLVED_NAME")
         if isinstance(node, (ast.Tuple, ast.List)):
             return merge(*(self.expression(n, env, scope, context) for n in node.elts), kind="tuple")
         if isinstance(node, ast.Attribute):
-            if resolve(node, scope) is not None:
+            import triton.language as tl
+
+            obj = resolve(node, scope)
+            if obj is not None:
+                if callable(obj) and not isinstance(obj, tl.dtype):
+                    self.unknown(node, "CALLABLE_VALUE_UNSUPPORTED")
                 return Fact(kind="static")
             value = self.expression(node.value, env, scope, context)
-            self.reject(value, "STATIC_ATTRIBUTE", node)
             if node.attr not in ("dtype", "shape", "value"):
+                if value.kind == "dtype":
+                    return self.opaque(node, "ATTRIBUTE_SUMMARY_MISSING", value)
                 self.unknown(node, "ATTRIBUTE_SUMMARY_MISSING")
-            return Fact(value.deps, False, "static")
+            self.reject(value, "STATIC_ATTRIBUTE", node)
+            kind = "dtype" if node.attr == "dtype" and value.kind.startswith(("ptr:", "block_ptr:")) else "static"
+            return Fact(value.deps, False, kind, value.opaque)
         if isinstance(node, ast.Subscript):
             value = self.expression(node.value, env, scope, context)
             index = self.expression(node.slice, env, scope, context)
@@ -106,12 +124,12 @@ class Uses:
         if isinstance(node, ast.BoolOp):
             values = [self.expression(n, env, scope, context) for n in node.values]
             for v in values:
-                if not v.runtime:
+                if v.opaque or not v.runtime:
                     self.reject(v, "CONTROL_SPECIALIZATION_PRESERVED", node)
             return merge(*values, kind="bool")
         if isinstance(node, ast.IfExp):
             condition = self.expression(node.test, env, scope, context)
-            if not condition.runtime:
+            if condition.opaque or not condition.runtime:
                 self.reject(condition, "CONTROL_SPECIALIZATION_PRESERVED", node)
             return merge(condition, self.expression(node.body, env, scope, context),
                          self.expression(node.orelse, env, scope, context))
@@ -135,7 +153,12 @@ class Uses:
             self.unknown(node, "STAR_CALL_UNSUPPORTED")
         args = [self.expression(n, env, scope, context) for n in node.args]
         kwargs = {k.arg: self.expression(k.value, env, scope, context) for k in node.keywords}
-        obj = resolve(node.func, scope)
+        target = node.func
+        while isinstance(target, ast.Attribute):
+            target = target.value
+        # A local alias can shadow a captured builtin. Do not resolve that call
+        # through globals; tensor methods are handled from the receiver below.
+        obj = None if isinstance(target, ast.Name) and target.id in env else resolve(node.func, scope)
         op = operation(obj)
         if isinstance(obj, JITFunction) and op is None:
             try:
@@ -169,8 +192,14 @@ class Uses:
             kind = str(dtype)
             for v in [*args, *kwargs.values()]:
                 self.reject(v, "STATIC_DTYPE", node)
-            return Fact(value.deps, value.runtime, kind)
+            return Fact(value.deps, value.runtime, kind, value.opaque
+                        or any(v.opaque for v in [*args, *kwargs.values()]))
         if op is None:
+            if is_language_builtin(obj):
+                return self.opaque(node, "OPERATION_SUMMARY_MISSING", *args, *kwargs.values())
+            if ((obj is float or obj is int or obj is bool) and not kwargs and len(args) == 1 and not args[0].opaque
+                    and args[0].kind in ("int", "float", "bool", "str")):
+                return self.opaque(node, "OPERATION_SUMMARY_MISSING", *args)
             self.unknown(node, "OPERATION_SUMMARY_MISSING")
         if op == "builtin_min" and (len(args) < 2 or kwargs.keys() - {"propagate_nan"}):
             # Iterable/key/default forms have no runtime tensor summary.
@@ -201,13 +230,13 @@ class Uses:
             element = base.kind.removeprefix("ptr:") if base.kind.startswith("ptr:") else "unknown"
             if element in ("bool", "int1"):
                 element = "int8"  # Native make_block_ptr promotes int1 pointers.
-            return Fact(value.deps, True, "block_ptr:" + element)
+            return Fact(value.deps, True, "block_ptr:" + element, value.opaque)
         if op == "advance":
             supplied = self.bind_required_arguments(node, op, ("base", "offsets"), args, kwargs)
             base = supplied["base"]
             if not base.kind.startswith("block_ptr:"):
                 self.unknown(node, "ADVANCE_BASE_NOT_BLOCK_POINTER")
-            return Fact(value.deps, True, base.kind)
+            return Fact(value.deps, True, base.kind, value.opaque)
         if op == "dot":
             parameters = ("input", "other", "acc", "input_precision", "allow_tf32", "max_num_imprecise_acc",
                           "out_dtype")
@@ -220,23 +249,24 @@ class Uses:
             # data dependencies, but do not inherit the lhs element type: fp16
             # can accumulate into fp32, and int8 into int32. Fact.kind is not a
             # tensor type system; native Triton owns dot typing and validation.
-            return Fact(value.deps, True, "unknown")
+            return Fact(value.deps, True, "unknown", value.opaque)
         if op in ("program_id", "num_programs", "arange"):
-            return Fact(value.deps, True, "int")
+            return Fact(value.deps, True, "int", value.opaque)
         if op == "load":
             pointer = args[0] if args else kwargs.get("pointer", Fact(kind="unknown"))
             other = args[2] if len(args) > 2 else kwargs.get("other", Fact())
             # Address dependence does not change the loaded element's type.
-            return Fact(other.deps, True, pointer.kind.removeprefix("ptr:").removeprefix("block_ptr:"))
+            return Fact(other.deps, True,
+                        pointer.kind.removeprefix("ptr:").removeprefix("block_ptr:"), pointer.opaque or other.opaque)
         if op == "cast":
             dtype_node = node.args[1] if len(node.args) > 1 else next(
                 (k.value for k in node.keywords if k.arg == "dtype"), None)
             dtype = resolve(dtype_node, scope) if dtype_node is not None else None
             if isinstance(dtype_node, ast.Call) and operation(resolve(dtype_node.func, scope)) == "pointer_type":
                 element = resolve(dtype_node.args[0], scope)
-                return Fact(runtime=True, kind="ptr:" + str(element))
+                return Fact(runtime=True, kind="ptr:" + str(element), opaque=value.opaque)
             kind = str(dtype)
-            return Fact(value.deps, value.runtime, kind)
+            return Fact(value.deps, value.runtime, kind, value.opaque)
         if op == "where":
             condition = args[0] if args else kwargs.get("condition", Fact())
             x = args[1] if len(args) > 1 else kwargs.get("x", Fact(kind="unknown"))
@@ -244,7 +274,7 @@ class Uses:
             return merge(condition, x, y, runtime=True, kind=y.kind)
         # Unlike tl.minimum, builtin min preserves constexpr-only evaluation.
         return Fact(value.deps, value.runtime or op not in ("static_range", "range", "pointer_type", "builtin_min"),
-                    value.kind)
+                    value.kind, value.opaque)
 
     def assign(self, target, value, env, node):
         if not isinstance(target, ast.Name):
@@ -263,7 +293,9 @@ class Uses:
                 if isinstance(node, ast.AnnAssign):
                     if resolve(node.annotation, scope) is not tl.constexpr:
                         self.unknown(node, "LOCAL_ANNOTATION_UNSUPPORTED")
-                    if value.runtime:
+                    if value.opaque:
+                        self.reject(value, "OPAQUE_VALUE_IN_LOCAL_CONSTEXPR", node)
+                    elif value.runtime:
                         self.reject(value, "RUNTIME_VALUE_IN_LOCAL_CONSTEXPR", node)
                     context["locals"][node.lineno] = context["locals"].get(node.lineno, frozenset()) | value.deps
             elif isinstance(node, ast.AugAssign):
@@ -277,7 +309,7 @@ class Uses:
                     returns.append(self.expression(node.value, env, scope, context))
             elif isinstance(node, ast.If):
                 condition = self.expression(node.test, env, scope, context)
-                if not condition.runtime:
+                if condition.opaque or not condition.runtime:
                     self.reject(condition, "CONTROL_SPECIALIZATION_PRESERVED", node)
                 left, right = dict(env), dict(env)
                 self.statements(node.body, left, scope, context, returns)
@@ -293,10 +325,10 @@ class Uses:
                         op = operation(resolve(node.iter.func, scope)) if isinstance(node.iter, ast.Call) else None
                         if op not in ("range", "static_range"):
                             self.unknown(node, "LOOP_ITERATOR_UNSUPPORTED")
-                        self.assign(node.target, Fact(value.deps, op != "static_range", "int"), env, node)
+                        self.assign(node.target, Fact(value.deps, op != "static_range", "int", value.opaque), env, node)
                     else:
                         condition = self.expression(node.test, env, scope, context)
-                        if not condition.runtime:
+                        if condition.opaque or not condition.runtime:
                             self.reject(condition, "CONTROL_SPECIALIZATION_PRESERVED", node)
                     self.statements(node.body, env, scope, context, returns)
                     # Backedges merge dependencies, not a last-assignment map.
