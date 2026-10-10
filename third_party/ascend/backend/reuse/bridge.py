@@ -101,6 +101,42 @@ class ReuseHandler:
         self.cache[key] = value
         return value
 
+    def _analysis_entry(self, fn, bound, source_key, target, option_token, *, allow_tile_reuse):
+        """Reuse value-independent D plans and their JIT owners; caller holds self.lock."""
+        from .analysis import analyze, static_context, type_context
+        from .transform import FrozenJITFunction, changed
+
+        arguments = tuple(bound.values())
+        versions = (config.SCHEMA_VERSION, config.RULE_VERSION, config.ABI_VERSION)
+        types = type_context(fn, arguments)
+        context = (id(fn), source_key, versions, types, repr(target), option_token, allow_tile_reuse)
+        values = static_context(fn, arguments)
+        masks_key = ("analysis-masks", context)
+        masks = self._cached(masks_key) or ()
+        for dynamic in masks:
+            key = ("analysis", context, dynamic, tuple(v for v in values if v[0] not in dynamic))
+            entry = self._cached(key)
+            if entry is not None:
+                self.registry.event("analysis_hit")
+                if dynamic:
+                    self.registry.event("analysis_fast_hit")
+                return entry
+
+        self.registry.event("analysis_miss")
+        profile = analyze(fn, bound, source_key, allow_tile_reuse=allow_tile_reuse)
+        log_profile(fn, profile)
+        owner = FrozenJITFunction.from_plan(profile.plan) if changed(profile.plan) else fn
+        # Uses interprets both branches symbolically, without reading scalar values.
+        # A completed D plan is therefore valid for every value of its dynamic slots
+        # in this type context. Keep all other constexprs exact. Tile recipes can
+        # depend on concrete values during matching and retain the full key.
+        dynamic = frozenset(profile.plan.dynamic) if profile.recipe is None else frozenset()
+        key = ("analysis", context, dynamic, tuple(v for v in values if v[0] not in dynamic))
+        entry = self._remember(key, (profile, owner))
+        if dynamic not in masks:
+            self._remember(masks_key, (*masks, dynamic))
+        return entry
+
     def run(self, fn, args, kwargs, grid, warmup, device, stream, backend, jit_tail):
 
         def original(frame=None, *, reason):
@@ -151,13 +187,11 @@ class ReuseHandler:
         from triton._C.libtriton import get_cache_invalidating_env_vars
         from triton.runtime.jit import compute_cache_key
 
-        from .analysis import analyze, static_context, type_context
         from .dispatch import resolve_dispatch
         from .dsl.source import source_stamp
         from .identity import family_key, variant_key
         from .model import BuildSpec, PreparedLaunch
         from .registry import VariantRegistry
-        from .transform import FrozenJITFunction, changed
 
         # No native specialization before independent binding and analysis.
         with self.lock:
@@ -175,18 +209,8 @@ class ReuseHandler:
             if stamp is None or not stamp.matches():
                 stamp = self._remember(stamp_key, source_stamp(fn))
             versions = (config.SCHEMA_VERSION, config.RULE_VERSION, config.ABI_VERSION)
-            key = (id(fn), stamp.token, versions, type_context(fn, arguments), static_context(fn, arguments),
-                   repr(backend.target), option_token)
-            entry = self._cached(key)
-            if entry is None:
-                self.registry.event("analysis_miss")
-                profile = analyze(fn, bound, stamp.token,
-                                  allow_tile_reuse=config.supports_tile_reuse(backend.target, options))
-                log_profile(fn, profile)
-                owner = FrozenJITFunction.from_plan(profile.plan) if changed(profile.plan) else fn
-                entry = self._remember(key, (profile, owner))
-            else:
-                self.registry.event("analysis_hit")
+            entry = self._analysis_entry(fn, bound, stamp.token, backend.target, option_token,
+                                         allow_tile_reuse=config.supports_tile_reuse(backend.target, options))
         profile, owner = entry
         if owner is fn and profile.recipe is None:
             self.registry.event("analysis_unknown")
