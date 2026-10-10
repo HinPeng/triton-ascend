@@ -1,8 +1,7 @@
 diff --git a/python/triton/compiler/compiler.py b/python/triton/compiler/compiler.py
-index 51347e1..7b8c751 100644
 --- a/python/triton/compiler/compiler.py
 +++ b/python/triton/compiler/compiler.py
-@@ -14,6 +14,7 @@ from .errors import MLIRCompilationError
+@@ -14,6 +14,7 @@
  from pathlib import Path
  import re
  import functools
@@ -10,29 +9,62 @@ index 51347e1..7b8c751 100644
  import os
  import time
  import copy
-@@ -457,8 +458,14 @@ class CompiledKernel:
+@@ -457,8 +458,30 @@
          self.module = None
          self.function = None
          self._run = None
 +        self._initialization_complete = False
 +        self._initialization_lock = threading.RLock()
++        self._initialization_started = False
++        self._load_hook_started = False
 
      def _init_handles(self):
 +        with self._initialization_lock:
++            if self._initialization_complete:
++                return
++            if self._initialization_started:
++                # A failed or reentrant initialization cannot be treated as a
++                # usable module, nor can its callbacks safely be replayed.
++                raise RuntimeError("Kernel initialization did not complete; cannot retry or launch this kernel")
++            self._initialization_started = True
 +            return self._init_handles_impl()
++
++    def _call_load_hook(self, hook):
++        if hook is not None:
++            # Only the exact empty built-in chain is known to have no effects;
++            # subclasses may override __call__ even when calls is empty.
++            self._load_hook_started |= type(hook) is not knobs.HookChain or bool(hook.calls)
++            hook(self.module, self.function, self.name, self.metadata_group, self.hash)
 +
 +    def _init_handles_impl(self):
          if self.module is not None:
              return
 
-@@ -494,6 +501,7 @@ class CompiledKernel:
+@@ -484,20 +507,19 @@
+             max_tmem_size = 512  # tmem size in number of columns
+             if self.metadata.tmem_size > max_tmem_size:
+                 raise_(OutOfResources(self.metadata.tmem_size, max_tmem_size, "tensor memory"))
+-        if knobs.runtime.kernel_load_start_hook is not None:
+-            knobs.runtime.kernel_load_start_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
++        self._call_load_hook(knobs.runtime.kernel_load_start_hook)
+         # TODO: n_regs, n_spills should be metadata generated when calling `ptxas`
+         self.module, self.function, self.n_regs, self.n_spills, self.n_max_threads = driver.active.utils.load_binary(
+             self.metadata.kernel_name, self.kernel, self.metadata.shared, device, self.metadata.mix_mode)
+         warp_size = driver.active.get_current_target().warp_size
+         if self.metadata.num_warps * warp_size > self.n_max_threads:
              raise_(OutOfResources(self.metadata.num_warps * warp_size, self.n_max_threads, "threads"))
-         if knobs.runtime.kernel_load_end_hook is not None:
-             knobs.runtime.kernel_load_end_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
+-        if knobs.runtime.kernel_load_end_hook is not None:
+-            knobs.runtime.kernel_load_end_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
++        self._call_load_hook(knobs.runtime.kernel_load_end_hook)
 +        self._initialization_complete = True
 
      @property
      def run(self):
+-        if self._run is None:
++        if not self._initialization_complete:
+             self._init_handles()
+         return self._run
+
 diff --git a/python/triton/runtime/autotuner.py b/python/triton/runtime/autotuner.py
 index 0c4d710..333507b 100644
 --- a/python/triton/runtime/autotuner.py

@@ -65,12 +65,13 @@ def requires_original(fn, warmup):
     if _async_compile.active_mode.get() is not None:
         return True
 
-    def has_hooks(hook):
-        return bool(hook.calls) if isinstance(hook, knobs.HookChain) else hook is not None
-
+    # Load hooks observe actual synchronous initialization, including transformed
+    # binaries. READY hits do not load again and must not replay those hooks.
+    # Compilation callbacks can alter compilation or interrupt it after side
+    # effects; their exception boundaries are not covered by this continuation.
     if any((knobs.runtime.jit_cache_hook, knobs.runtime.jit_post_compile_hook,
-            has_hooks(knobs.runtime.kernel_load_start_hook), has_hooks(knobs.runtime.kernel_load_end_hook),
-            knobs.runtime.add_stages_inspection_hook, knobs.compilation.override, knobs.compilation.always_compile)):
+            knobs.runtime.add_stages_inspection_hook, knobs.compilation.listener is not None,
+            knobs.compilation.override, knobs.compilation.always_compile)):
         return True
     return False
 
@@ -258,12 +259,21 @@ class ReuseHandler:
         from triton.compiler.errors import CompilationError, MLIRCompilationError
         from triton.runtime.errors import OutOfResources
 
+        def initialize(kernel):
+            try:
+                return self.registry.initialize(kernel, spec, load_context)
+            finally:
+                # Once an external load callback has run, a fallback would
+                # replay its effects, even when the error looks like a compiler
+                # or resource failure. Keep the original exception unchanged.
+                frame.load_hook_started |= getattr(kernel, "_load_hook_started", False)
+
         try:
             return jit_tail(args, kwargs, grid, warmup, device, stream, owner=owner, bound=actual_bound,
                             specialization=specialization, raw_options=raw_options, memory_key=memory_key,
-                            initialize=lambda kernel: self.registry.initialize(kernel, spec, load_context), frame=frame)
+                            initialize=initialize, frame=frame)
         except (CompilationError, MLIRCompilationError, OutOfResources) as error:
-            if owner is fn or frame.launch_started:
+            if owner is fn or frame.launch_started or frame.load_hook_started:
                 raise
             self.registry.record_transform_failure(spec.family_key, spec.variant_key)
             self.registry.event("fallback")

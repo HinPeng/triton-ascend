@@ -23,6 +23,7 @@ class InvocationFrame:
     grid_resolved: bool = False
     grid: object = None
     launch_started: bool = False
+    load_hook_started: bool = False
 
     def resolve_grid(self, grid, bound_args):
         if not self.grid_resolved:
