@@ -135,8 +135,6 @@ inline bool isPureSimtMode(CompileMode mode) {
 
 } // namespace ascend
 
-enum class IndirectLoadInterfaceOpType { Undefined = 0, Load = 1, Calc = 2 };
-
 // Traceback from rootOp to find the targetOp with the specified condition
 mlir::Operation *
 findFirstMatchingOperandDef(mlir::Operation *rootOp,
@@ -165,17 +163,31 @@ void traverseForwardUpdateUserChainIf(
     std::function<void(OpBuilder &, Operation *)> actionFn,
     llvm::SmallPtrSet<Operation *, 16> &stopOps);
 
-// UseAnalysis will tag operations whose results are used only as meta-data
-// with "MetaUse" tag.
-bool isMetaUse(Operation *op);
+// Traverse back from operand's defining op (inclusive) for the first op
+// matching condFn, or nullptr.
+mlir::Operation *findOperandDefinitionWithCondition(
+    mlir::Value operand, const std::function<bool(Operation *)> &condFn);
 
-bool isMixUse(Operation *op);
+// Traverse back from rootOp's operands (exclusive of rootOp itself) for the
+// first op matching condFn, or nullptr.
+mlir::Operation *
+findPrecedingOpWithCondition(mlir::Operation *rootOp,
+                             const std::function<bool(Operation *)> &condFn);
 
-IndirectLoadInterfaceOpType getIndirectLoadInterfaceOpType(Operation *op);
+// Traverse back from operand's defining op (inclusive) for the first op
+// matching condFn, or nullptr; stop early (also returning nullptr) if
+// stopFn matches first.
+mlir::Operation *findOperandDefinitionWithCondition(
+    mlir::Value operand, const std::function<bool(Operation *)> &condFn,
+    const std::function<bool(Operation *)> &stopFn);
 
-bool opIsIndirectLoad(Operation *op);
-
-bool opIsIndirectCalc(Operation *op);
+// Traverse back from rootOp's operands (exclusive of rootOp itself) for the
+// first op matching condFn, or nullptr; stop early (also returning nullptr)
+// if stopFn matches first.
+mlir::Operation *
+findPrecedingOpWithCondition(mlir::Operation *rootOp,
+                             const std::function<bool(Operation *)> &condFn,
+                             const std::function<bool(Operation *)> &stopFn);
 
 /// Maximum expected rank for loop tiling in tensor operations.
 static constexpr int kMaxTiledRank = 4;

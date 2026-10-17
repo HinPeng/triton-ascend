@@ -640,7 +640,10 @@ struct DiscreteMaskAtomicConversion
     llvm::DenseMap<Value, PtrOffsetInfo> offsetMap;
     triton::parse(ptr, loc, rewriter, offsetMap);
     auto it = offsetMap.find(ptr);
-    auto toSimd = it != offsetMap.end() && it->second.isStructured();
+    auto toSimd = it != offsetMap.end() &&
+                  llvm::all_of(it->second.getStructuredRef(), [](auto dim) {
+                    return dim == PtrOffsetInfo::AxisInfo::structured;
+                  });
     op->setAttr(ConverterUtils::explicitRouteToSIMDAttrName,
                 rewriter.getBoolAttr(toSimd));
     return toSimd;

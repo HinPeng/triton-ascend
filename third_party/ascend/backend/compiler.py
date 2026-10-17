@@ -68,10 +68,12 @@ from triton.backends.ascend.utils import (
     graph_ub_budget_bytes_for_arch,
     ub_size_in_kbytes_for_arch,
     get_cann_version_file_hash,
+    is_cann_version_at_least,
 )
 from triton.backends.ascend.driver import (NPUUtils)
 from triton.backends.ascend.program_grid import (
     DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK,
+    GATHER_OPTIMIZATION_RULE_BIT,
     PROGRAM_GRID_TRANSFORMS_ATTR,
     ProgramGridContractError,
     get_persistent_transform,
@@ -285,10 +287,14 @@ def _graph_optimize_kwargs(opt):
     kwargs = {
         "ub_capacity_bytes": graph_ub_budget_bytes_for_arch(opt.target_arch),
         "compile_mode": opt.compile_mode,
+        "target_arch": opt.target_arch,
     }
     rule_mask = getattr(opt, "rule_mask", DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK)
     if rule_mask != DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK:
         kwargs["rule_mask"] = rule_mask
+    # Toggling Gather must not change the existing mapping resource policy.
+    if (rule_mask & ~GATHER_OPTIMIZATION_RULE_BIT) != (DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK
+                                                       & ~GATHER_OPTIMIZATION_RULE_BIT):
         kwargs["ub_safety_percent"] = 80
         kwargs["reserved_ub_bytes"] = 0
         kwargs["mapping_ub_capacity_bytes"] = (ub_size_in_kbytes_for_arch(opt.target_arch) * 1024)
@@ -382,7 +388,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
         ascend.passes.ttir.add_triton_to_hivm(pm)
         ascend.passes.ttir.add_triton_to_hfusion(pm, compile_on_910_95)
         ascend.passes.ttir.add_triton_to_llvm(pm)
-        ascend.passes.ttir.add_bubble_up_operation(pm)
+        ascend.passes.ttir.add_bubble_up_operation(pm, compile_on_910_95)
         ascend.passes.ttir.add_triton_to_structure(pm, False, False)
         ascend.passes.ttir.add_triton_to_linalg(pm, False, named_ops, False, enable_select_analysis, compile_on_910_95,
                                                 compile_mode)
@@ -779,6 +785,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         _compile_option_list += [
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
         ]
+
+        _compile_option_list += [f"--enable-optimized-metaop={is_cann_version_at_least(9, 2, 0)}"]
+
         npu_utils = NPUUtils()
         if npu_utils.has_device_limit():
             _compile_option_list += [
@@ -918,10 +927,6 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if plan_memory_strategy is not None:
             _compile_option_list += [f"--plan-memory-strategy={plan_memory_strategy}"]
 
-        if opt.debug:
-            src_file, _ = _get_dump_paths(metadata["hash"], ttadapter_path, bin_file)
-            _compile_option_list += [f"--save-temps={os.path.dirname(src_file)}"]
-
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
@@ -1024,6 +1029,8 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         _compile_option_list += [
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
         ]
+
+        _compile_option_list += [f"--enable-optimized-metaop=false"]
 
         if _is_ascend_sanitizer_enabled():
             _compile_option_list += ["--enable-sanitizer=true"]
@@ -1131,10 +1138,6 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
             _compile_option_list += ["--bishengir-print-ir-after=hivm-graph-sync-solver"]
 
-        if opt.debug:
-            src_file, _ = _get_dump_paths(metadata["hash"], ttadapter_path, bin_file)
-            _compile_option_list += [f"--save-temps={os.path.dirname(src_file)}"]
-
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
@@ -1186,11 +1189,8 @@ def _is_a5_target_arch(arch: str) -> bool:
     return isinstance(arch, str) and arch.startswith(("Ascend910_95", "Ascend950"))
 
 
-def _get_libdevice_compile_state(arch: str) -> tuple[bool, bool]:
-    return (
-        bool(os.getenv("TRITON_ENABLE_LIBDEVICE", False)),
-        bool(os.getenv("TRITON_ENABLE_LIBDEVICE_SIMT", False)) and _is_a5_target_arch(arch),
-    )
+def _get_libdevice_compile_state() -> bool:
+    return bool(os.getenv("TRITON_ENABLE_LIBDEVICE", False))
 
 
 _CANONICAL_COMPILE_MODES = ("simd", "simd_simt_template", "simt_only")
@@ -1259,7 +1259,9 @@ class NPUOptions:
     allowed_dot_input_precisions: Tuple[str] = ("ieee", "hf32")
     max_num_imprecise_acc_default: int = 0
     extern_libs: dict = None
-    bisheng_options: str = "-cce-link-aicore-ll-module " + get_libdevice()
+    # Backend-managed BiSheng arguments. Keep the name discoverable so legacy
+    # launch keywords are accepted, but never forward a user-supplied value.
+    bisheng_options: str = field(default="-cce-link-aicore-ll-module " + get_libdevice(), init=False)
     multibuffer: bool = True
     # Public dictionaries are stored as sorted pairs for hashing and JSON caches.
     multibuffer_mode: Optional[Union[Dict[str, int], Tuple[Tuple[str, int], ...]]] = None
@@ -1675,7 +1677,7 @@ class AscendBackend(BaseBackend):
     @functools.lru_cache()
     def hash(self):
         # TODO fetch compiler version
-        version_key = (self.target, _get_libdevice_compile_state(self.target.arch))
+        version_key = (self.target, _get_libdevice_compile_state())
         return str(version_key)
 
     def get_module_map(self) -> Dict[str, ModuleType]:

@@ -130,9 +130,12 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
     pm.addPass(mlir::triton::createNormalizeDebugLineLocationsPass());
   });
 
-  m.def("add_bubble_up_operation", [](mlir::PassManager &pm) {
-    pm.addPass(mlir::triton::createBubbleUpOperationPass());
-  });
+  m.def("add_bubble_up_operation",
+        [](mlir::PassManager &pm, bool compileOn91095) {
+          BubbleUpOperationOptions opts;
+          opts.compileOn91095 = compileOn91095;
+          pm.addPass(mlir::triton::createBubbleUpOperationPass(opts));
+        });
 
   m.def("add_dynamic_cv_pipeline",
         [](mlir::PassManager &pm, bool compileOn91095) {
@@ -148,7 +151,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
          std::uint64_t mappingUBCapacityBytes,
          std::uint64_t storeCoalescingUBBudgetBytes,
          const std::string &compileMode, std::uint64_t ubSafetyPercent,
-         std::uint64_t reservedUBBytes) {
+         std::uint64_t reservedUBBytes, const std::string &targetArch) {
         if (ruleMask > std::numeric_limits<std::uint32_t>::max())
           throw py::value_error("rule_mask must fit in uint32_t");
         const auto graphRuleMask =
@@ -191,6 +194,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
         options.ubSafetyPercent = static_cast<unsigned>(ubSafetyPercent);
         options.reservedUBBytes = static_cast<unsigned>(reservedUBBytes);
         options.compileMode = compileMode;
+        options.targetArch = targetArch;
         pm.addPass(mlir::triton::cfg::createGraphOptimizePass(options));
       },
       py::arg("pm"),
@@ -201,7 +205,8 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       py::arg("mapping_ub_capacity_bytes") = 0,
       py::arg("store_coalescing_ub_budget_bytes") = 0,
       py::arg("compile_mode") = "simd_simt_template",
-      py::arg("ub_safety_percent") = 80, py::arg("reserved_ub_bytes") = 0);
+      py::arg("ub_safety_percent") = 80, py::arg("reserved_ub_bytes") = 0,
+      py::arg("target_arch") = "");
 
   m.def("set_buffer_count", [](mlir::ModuleOp &module, const std::string &type,
                                int count) {
