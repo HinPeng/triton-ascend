@@ -73,6 +73,7 @@ from triton.backends.ascend.utils import (
 from triton.backends.ascend.driver import (NPUUtils)
 from triton.backends.ascend.program_grid import (
     DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK,
+    GATHER_OPTIMIZATION_RULE_BIT,
     PROGRAM_GRID_TRANSFORMS_ATTR,
     ProgramGridContractError,
     get_persistent_transform,
@@ -286,10 +287,14 @@ def _graph_optimize_kwargs(opt):
     kwargs = {
         "ub_capacity_bytes": graph_ub_budget_bytes_for_arch(opt.target_arch),
         "compile_mode": opt.compile_mode,
+        "target_arch": opt.target_arch,
     }
     rule_mask = getattr(opt, "rule_mask", DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK)
     if rule_mask != DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK:
         kwargs["rule_mask"] = rule_mask
+    # Toggling Gather must not change the existing mapping resource policy.
+    if (rule_mask & ~GATHER_OPTIMIZATION_RULE_BIT) != (DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK
+                                                       & ~GATHER_OPTIMIZATION_RULE_BIT):
         kwargs["ub_safety_percent"] = 80
         kwargs["reserved_ub_bytes"] = 0
         kwargs["mapping_ub_capacity_bytes"] = (ub_size_in_kbytes_for_arch(opt.target_arch) * 1024)
@@ -1184,11 +1189,8 @@ def _is_a5_target_arch(arch: str) -> bool:
     return isinstance(arch, str) and arch.startswith(("Ascend910_95", "Ascend950"))
 
 
-def _get_libdevice_compile_state(arch: str) -> tuple[bool, bool]:
-    return (
-        bool(os.getenv("TRITON_ENABLE_LIBDEVICE", False)),
-        bool(os.getenv("TRITON_ENABLE_LIBDEVICE_SIMT", False)) and _is_a5_target_arch(arch),
-    )
+def _get_libdevice_compile_state() -> bool:
+    return bool(os.getenv("TRITON_ENABLE_LIBDEVICE", False))
 
 
 _CANONICAL_COMPILE_MODES = ("simd", "simd_simt_template", "simt_only")
@@ -1547,6 +1549,23 @@ def get_simt_stack_limit():
 class AscendBackend(BaseBackend):
 
     @staticmethod
+    def get_jit_reuse_handler():
+        from .reuse.config import enabled
+
+        if not enabled():
+            return None
+
+        from .reuse.bridge import get_handler
+
+        return get_handler()
+
+    @staticmethod
+    def get_exact_request_scope():
+        from .reuse.context import exact_request_scope
+
+        return exact_request_scope()
+
+    @staticmethod
     def supports_target(target: GPUTarget):
         return target.backend == "npu"
 
@@ -1658,7 +1677,7 @@ class AscendBackend(BaseBackend):
     @functools.lru_cache()
     def hash(self):
         # TODO fetch compiler version
-        version_key = (self.target, _get_libdevice_compile_state(self.target.arch))
+        version_key = (self.target, _get_libdevice_compile_state())
         return str(version_key)
 
     def get_module_map(self) -> Dict[str, ModuleType]:

@@ -1301,6 +1301,14 @@ bool OpClassifierPass::shouldStopPropagationForYield(
     return true;
   }
 
+  // Stop at hivm.hir.custom so the BFS does not cross from the SSA tensor
+  // world back into the memref world via memory dependencies and overwrite
+  // classifications already decided in earlier passes (e.g., a CUBE-classified
+  // memref.alloc that backs a matmul input via bufferization.to_tensor).
+  if (isa<hivm::CustomOp>(op)) {
+    return true;
+  }
+
   return false;
 }
 
