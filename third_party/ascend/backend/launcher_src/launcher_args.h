@@ -83,6 +83,15 @@ struct ArgSlot {
   size_t size;
 };
 
+// Internal representation; it never crosses the C ABI.
+struct LaunchSpec : TritonNpuLaunchSpecV1 {
+  uint32_t gridContractVersion = 0;
+  int32_t batchAxis = -1;
+  uint32_t batchFactor = 1;
+  LaunchSpec() : TritonNpuLaunchSpecV1{} {}
+  LaunchSpec(const TritonNpuLaunchSpecV1 &base) : TritonNpuLaunchSpecV1(base) {}
+};
+
 struct ArgLayout {
   static constexpr size_t absent = std::numeric_limits<size_t>::max();
   std::vector<ArgSlot> args;
@@ -97,7 +106,7 @@ struct ArgLayout {
     return offset;
   }
 
-  ArgLayout(const TritonNpuLaunchSpecV1 &spec, const TritonNpuArgTypeV1 *types,
+  ArgLayout(const LaunchSpec &spec, const TritonNpuArgTypeV1 *types,
             size_t count)
       : inputCount(count) {
     static_assert(sizeof(void *) == 8,
@@ -145,7 +154,9 @@ struct ArgLayout {
       args.push_back(
           {i, kind, types[i].dtype, reserve(size, size == 8 ? 8 : 4), size});
     }
-    if (spec.flags & (TRITON_NPU_IAT | TRITON_NPU_PTSM | TRITON_NPU_DOT_ROW))
+    if (spec.gridContractVersion == 3)
+      originalGrid = reserve(3 * sizeof(uint32_t), 4);
+    else if (spec.flags & (TRITON_NPU_IAT | TRITON_NPU_PTSM | TRITON_NPU_DOT_ROW))
       originalGrid = reserve(2 * sizeof(uint32_t), 4);
     grid = reserve(3 * sizeof(int32_t), 4);
     if (spec.flags & TRITON_NPU_PURE_SIMT) {
@@ -199,17 +210,44 @@ inline void validateSpec(const TritonNpuLaunchSpecV1 &spec) {
     throw std::invalid_argument("invalid profiling task configuration");
 }
 
+inline LaunchSpec decodeSpecV2(const TritonNpuLaunchSpecV2 &spec) {
+  static_assert(sizeof(TritonNpuLaunchSpecV1) == 80);
+  static_assert(sizeof(TritonNpuLaunchSpecV2) == 104);
+  static_assert(offsetof(TritonNpuLaunchSpecV2, base) == 8);
+  static_assert(offsetof(TritonNpuLaunchSpecV2, grid_contract_version) == 8 + sizeof(TritonNpuLaunchSpecV1));
+  if (spec.version != 2 || spec.struct_size != sizeof(spec) ||
+      spec.grid_contract_version != 3 || spec.reserved || spec.batch_axis < 0 ||
+      spec.batch_axis > 2 || spec.batch_factor < 2 || spec.batch_factor > INT32_MAX)
+    throw std::invalid_argument("invalid V2 block batching launch contract");
+  validateSpec(spec.base);
+  if (spec.base.flags & (TRITON_NPU_IAT | TRITON_NPU_PTSM | TRITON_NPU_DOT_ROW |
+                         TRITON_NPU_COALESCE_CEIL | TRITON_NPU_PURE_SIMT) ||
+      spec.base.coalesce_factor != 1 || spec.base.coalesce_axis != -1)
+    throw std::invalid_argument("block batching conflicts with another mapping or SIMT");
+  LaunchSpec result(spec.base);
+  result.gridContractVersion = 3;
+  result.batchAxis = spec.batch_axis;
+  result.batchFactor = spec.batch_factor;
+  return result;
+}
+
 struct LaunchGrid {
   std::array<int32_t, 3> grid;
   uint32_t logicalBlocks, physicalBlocks;
 };
 
-inline LaunchGrid prepareGrid(const TritonNpuLaunchSpecV1 &spec,
+inline LaunchGrid prepareGrid(const LaunchSpec &spec,
                               const int32_t *input) {
   LaunchGrid result{{input[0], input[1], input[2]}, 0, 0};
+  if (spec.gridContractVersion == 3) {
+    for (auto dim : result.grid)
+      if (dim < 0) throw std::invalid_argument("negative original grid extent");
+  }
   for (auto dim : result.grid)
     if (dim <= 0)
       return result;
+  if (spec.gridContractVersion == 3)
+    result.grid[spec.batchAxis] = (int64_t(input[spec.batchAxis]) + spec.batchFactor - 1) / spec.batchFactor;
   if (spec.flags & TRITON_NPU_IAT)
     result.grid[1] = (int64_t(input[1]) + 15) / 16;
   if (spec.flags & TRITON_NPU_PTSM) {
@@ -237,6 +275,8 @@ inline LaunchGrid prepareGrid(const TritonNpuLaunchSpecV1 &spec,
       checkedMultiply(result.grid[0], result.grid[1]), result.grid[2]);
   if (blocks > std::numeric_limits<uint32_t>::max())
     throw std::overflow_error("launch grid exceeds uint32 block count");
+  if (spec.gridContractVersion == 3 && blocks > INT32_MAX)
+    throw std::overflow_error("block batching exceeds the G0 signed i32 task domain");
   result.logicalBlocks = blocks;
   result.physicalBlocks =
       (spec.flags & TRITON_NPU_AUTO_MAP)

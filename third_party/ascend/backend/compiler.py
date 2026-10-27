@@ -70,6 +70,9 @@ from triton.backends.ascend.utils import (
     is_cann_version_at_least,
 )
 from triton.backends.ascend.driver import (NPUUtils)
+from triton.backends.ascend.compiler_capabilities import optimized_metaop_options
+from triton.backends.ascend.block_batching import BatchRequest, analyze_request, BatchingRejected
+from triton.backends.ascend.block_batching_report import VALIDATION_POLICY, validate_compilation_result
 from triton.backends.ascend.program_grid import (
     DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK,
     PROGRAM_GRID_TRANSFORMS_ATTR,
@@ -222,6 +225,8 @@ def _finalize_program_launch_policy(metadata, opt):
             raise RuntimeError(f"invalid exported program_grid_transforms: {error}") from error
     if mapping_applied != (transforms is not None):
         raise RuntimeError("program_grid_mapping_applied disagrees with program_grid_transforms")
+    if transforms is not None and transforms["version"] == 3 and "block_batching" not in metadata:
+        raise RuntimeError("v3 grid contract requires an owned guarded block batching plan")
     if mapping_applied and row_coalescing_applied:
         raise RuntimeError("program-grid mapping conflicts with legacy RowCoalescing")
 
@@ -286,6 +291,27 @@ def _with_debug_line(npubin_stage, options):
     return stage
 
 
+@functools.lru_cache(maxsize=128)
+def _batching_backend_file_hash(path, size, mtime):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _batching_backend_revision(path):
+    # The driver delegates to hivmc-a5 and links template bitcode. A driver-only
+    # hash misses exactly the independently rebuilt components used by batching.
+    root = Path(path).resolve().parent.parent
+    files = {Path(path).resolve()}
+    files.update(p for p in (root / "bin").glob("*") if p.is_file())
+    files.update(p for p in (root / "lib").rglob("*.bc") if p.is_file())
+    # Invalidate old candidates compiled under the NPUIR-report admission policy.
+    digest = hashlib.sha256(VALIDATION_POLICY.encode())
+    for item in sorted(files):
+        stat = item.stat()
+        digest.update(str(item.relative_to(root)).encode())
+        digest.update(_batching_backend_file_hash(str(item), stat.st_size, stat.st_mtime_ns).encode())
+    return digest.hexdigest()
+
+
 def _graph_optimize_kwargs(opt):
     kwargs = {
         "ub_capacity_bytes": graph_ub_budget_bytes_for_arch(opt.target_arch),
@@ -322,8 +348,37 @@ def make_ttir(mod, metadata, opt):
     passes.common.add_licm(pm)
     passes.common.add_symbol_dce(pm)
     passes.ttir.add_loop_unroll(pm)
+    if getattr(opt, "block_batching_factor", 1) > 1:
+        # Rewrite only the candidate's normalized frontend IR. The bundle
+        # controller retains an independently compiled original baseline.
+        if opt.debug:
+            get_dump_manager(metadata['hash']).put(str(mod), 'block_batching.raw.ttir', binary=False)
+        pm.run(mod, 'block_batching_normalize')
+        if opt.debug:
+            get_dump_manager(metadata['hash']).put(str(mod), 'block_batching.normalized.ttir', binary=False)
+        if opt.block_batching_factor > 64:
+            raise BatchingRejected("FACTOR_EXCEEDS_LANE_CAPACITY")
+        rewrite = getattr(ascend.passes.ttir, "rewrite_block_batching", None)
+        if rewrite is None:
+            raise RuntimeError("block batching requires the matching rebuilt C++ rewriter")
+        report = dict(rewrite(mod, opt.block_batching_factor, opt.block_batching_axis))
+        if report["compile_status"] != "REWRITTEN":
+            raise BatchingRejected(report["reason"])
+        report["guard"] = json.loads(report.pop("guard_json"))
+        report["guard"]["axis"] = report["selected_axis"]
+        report["owner"] = "block_batching"
+        report["plan_id"] = metadata["hash"]
+        report["candidate_factor"] = opt.block_batching_factor
+        metadata["block_batching"] = report
+        pm = ir.pass_manager(mod.context)
+        pm.enable_debug()
     if opt.enable_graph_optimize:
-        ascend.passes.ttir.add_graph_optimize(pm, **_graph_optimize_kwargs(opt))
+        graph_kwargs = _graph_optimize_kwargs(opt)
+        if opt.block_batching_factor > 1:
+            # Mapping ownership is reserved before any legacy graph rule runs.
+            # RowCoalescing also owns DotRow's special tail scheduling.
+            graph_kwargs["rule_mask"] = graph_kwargs.get("rule_mask", DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK) & ~((1 << 3) | (1 << 9) | (1 << 11))
+        ascend.passes.ttir.add_graph_optimize(pm, **graph_kwargs)
     pm.run(mod, 'make_ttir')
     if opt.debug:
         dump_manager = get_dump_manager(metadata["hash"])
@@ -444,6 +499,11 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
                                           disable_auto_inject_block_sync=disable_auto_inject_block_sync,
                                           set_workspace_multibuffer=set_workspace_multibuffer)
         _export_program_grid_metadata(mod, metadata)
+        if "block_batching" in metadata:
+            # Ownership has served every TA mapping/lowering gate. Preserve it
+            # in the immutable manifest, not as an unknown HACC LLVM attribute.
+            if not ascend.passes.ttir.clear_block_batching_owner(mod):
+                raise BatchingRejected("MAPPING_OWNER_LOST")
 
         linalg_text = _serialize_module(mod, opt)
         if opt.debug:
@@ -709,7 +769,8 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
         ]
 
-        _compile_option_list += [f"--enable-optimized-metaop={is_cann_version_at_least(9, 2, 0)}"]
+        _compile_option_list += optimized_metaop_options(
+            _get_npucompiler_path()[0], is_cann_version_at_least(9, 2, 0))
 
         npu_utils = NPUUtils()
         if npu_utils.has_device_limit():
@@ -893,6 +954,11 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                                             "sync_block_lock_layout")
             __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_init_function", metadata, "lock_init_val")
 
+        if "block_batching" in metadata:
+            if _batching_backend_revision(npu_compiler_path) != opt.block_batching_backend_revision:
+                raise BatchingRejected("BACKEND_CHANGED_DURING_COMPILE")
+            validate_compilation_result(metadata)
+            metadata["block_batching_binary_sha256"] = hashlib.sha256(Path(bin_path).read_bytes()).hexdigest()
         return Path(bin_path).read_bytes()
 
 
@@ -956,7 +1022,8 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
         ]
 
-        _compile_option_list += [f"--enable-optimized-metaop={is_cann_version_at_least(9, 2, 0)}"]
+        _compile_option_list += optimized_metaop_options(
+            _get_npucompiler_path()[0], is_cann_version_at_least(9, 2, 0))
 
         if _is_ascend_sanitizer_enabled():
             _compile_option_list += ["--enable-sanitizer=true"]
@@ -1183,6 +1250,10 @@ class NPUOptions:
     backend_name: str = 'cann'
     instrumentation_mode: str = ""
     enable_graph_optimize: bool = True
+    block_batching_factor: int = 1
+    block_batching_axis: int = -1
+    block_batching_implementation: int = field(default=2, init=False)
+    block_batching_backend_revision: str = field(default="", init=False)
     supported_fp8_dtypes: Tuple[str] = ("fp8e5", "fp8e4b15", "fp8e4nv", "fp8e4b8", "fp8e5b16")
     deprecated_fp8_dtypes: Tuple[str] = ()
     vf_merge_level: int = 1
@@ -1304,6 +1375,10 @@ class NPUOptions:
     use_bytecode: bool = field(default=False, init=False)
 
     def __post_init__(self, arch, rule_mask):
+        BatchRequest(self.block_batching_factor, self.block_batching_axis)
+        if self.block_batching_factor > 1:
+            compiler_path, _ = _get_npucompiler_path()
+            object.__setattr__(self, "block_batching_backend_revision", _batching_backend_revision(compiler_path))
         from triton.backends.ascend import _apply_ascend_patch
 
         if self.ir_override and self.ir_override.endswith((".mlirbc", ".bcmlir")):
@@ -1591,6 +1666,21 @@ class AscendBackend(BaseBackend):
         buffer_ir.load_dialects(ctx)
         ascend_ir.load_dialects(ctx)
         ascend.load_dialects(ctx)
+
+    def make_compilation_writer(self, src, options, cache, override_enabled):
+        if not hasattr(src, "block_batching_source_hash"):
+            return cache
+        if options.block_batching_factor > 1 and (override_enabled or options.ir_override):
+            raise BatchingRejected("IR_OVERRIDE_NOT_SUPPORTED")
+        from triton.runtime.cache import FileCacheManager
+        if type(cache) is not FileCacheManager:
+            raise BatchingRejected("CUSTOM_CACHE_NOT_SUPPORTED")
+        import uuid
+        return FileCacheManager(cache.key + "/attempts/" + uuid.uuid4().hex)
+
+    def compile_bundle(self, src, options, compile_variant):
+        from .block_batching import compile_bundle
+        return compile_bundle(self, src, options, compile_variant)
 
     def add_stages(self, stages, options, language):
         if self.target.backend == "npu":

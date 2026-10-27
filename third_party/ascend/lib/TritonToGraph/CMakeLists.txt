@@ -6,6 +6,8 @@ add_triton_library(TritonToGraph
   EntryArgPointerAliasAnalysis.cpp
   GraphOptimizationContext.cpp
   ResourceCostModel.cpp
+  BlockBatching/BatchAnalysis.cpp
+  BlockBatching/BatchRewrite.cpp
   GraphOptimizationPass.cpp
   LayoutMemoryCompatibilityPass.cpp
   MemorySsaBuilder.cpp

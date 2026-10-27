@@ -15,6 +15,7 @@
 #include "ascend/include/TritonControlFlowOpt/Passes.h"
 #include "ascend/include/TritonToAnnotation/Passes.h"
 #include "ascend/include/TritonToGraph/GraphOptimization.h"
+#include "ascend/include/TritonToGraph/BlockBatching/BatchPlan.h"
 #include "ascend/include/TritonToGraph/LayoutMemoryOptimization.h"
 #include "ascend/include/TritonToGraph/Passes.h"
 #include "ascend/include/TritonToHFusion/Passes.h"
@@ -60,6 +61,58 @@ namespace py = pybind11;
 using namespace mlir;
 
 void init_triton_ascend_passes_ttir(py::module &&m) {
+  m.def("clear_block_batching_owner", [](mlir::ModuleOp module) {
+    auto owner = module->getAttrOfType<mlir::StringAttr>("hacc.block_mapping_owner");
+    if (!owner || owner.getValue() != "block_batching") return false;
+    module.walk([](mlir::Operation *op) { op->removeAttr("hacc.block_mapping_owner"); });
+    return true;
+  });
+  m.def("rewrite_block_batching", [](mlir::ModuleOp module, py::object factorObject, py::object axisObject) {
+    if (!PyLong_CheckExact(factorObject.ptr()) || !PyLong_CheckExact(axisObject.ptr()))
+      throw py::value_error("block batching factor and axis must be integers (not bool)");
+    int64_t factor = factorObject.cast<int64_t>();
+    int64_t axisValue = axisObject.cast<int64_t>();
+    if (factor <= 0 || axisValue < -1 || axisValue > 2)
+      throw py::value_error("invalid block batching factor or axis");
+    int32_t axis = static_cast<int32_t>(axisValue);
+    auto result = mlir::triton::cfg::rewriteBlockBatching(module, {factor, axis});
+    if (mlir::failed(result)) throw std::runtime_error("block batching rewrite failed verification");
+    py::dict report;
+    report["report_version"] = 1;
+    report["compile_status"] = result->status;
+    report["reason"] = result->reason;
+    report["requested_factor"] = factor;
+    report["requested_axis"] = axis;
+    report["selected_axis"] = result->selectedAxis;
+    report["lane_width"] = result->laneWidth;
+    report["guard_json"] = result->guardJSON;
+    report["operations"] = result->operations;
+    return report;
+  });
+  m.def("analyze_block_batching", [](mlir::ModuleOp module,
+                                     py::object factor, py::object axis) {
+    if (!PyLong_CheckExact(factor.ptr()) || !PyLong_CheckExact(axis.ptr()))
+      throw py::value_error("block batching factor and axis must be integers (not bool)");
+    const auto factorValue = factor.cast<int64_t>();
+    const auto axisValue = axis.cast<int64_t>();
+    if (factorValue <= 0 || axisValue < -1 || axisValue > 2)
+      throw py::value_error("invalid block batching factor or axis");
+    mlir::triton::cfg::BatchRequest request{factorValue, static_cast<int32_t>(axisValue)};
+    auto report = mlir::triton::cfg::analyzeBlockBatching(module, request);
+    if (mlir::failed(report))
+      throw py::value_error("invalid block batching request");
+    py::dict result;
+    result["report_version"] = 1;
+    result["compile_status"] = report->status;
+    result["requested_factor"] = factorValue;
+    result["requested_axis"] = axisValue;
+    result["applied_factor"] = 1;
+    result["owner"] = "none";
+    result["reason"] = report->reason;
+    result["location"] = report->location;
+    result["operations"] = report->operations;
+    return result;
+  }, py::arg("module"), py::arg("factor"), py::arg("axis"));
   m.def("add_auto_blockify", [](mlir::PassManager &pm, int autoBlockifySize) {
     AutoBlockifyOptions opts;
     opts.autoBlockifySize = autoBlockifySize;
