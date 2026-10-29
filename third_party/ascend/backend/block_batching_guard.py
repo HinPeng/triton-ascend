@@ -51,6 +51,7 @@ class Affine:
 
 
 class Domain:
+
     def __init__(self, arguments, grid):
         self.arguments = arguments
         self.grid = grid
@@ -119,8 +120,15 @@ class Domain:
                 raise GuardFailure("UNSUPPORTED_ACCESS_MASK")
             index, limit = self.expression(mask[1]), self.expression(mask[2])
             counts[3] = self.extent or 1
-            if (not limit.uniform or limit.offset <= 0 or index.offset < 0 or
-                    any(c < 0 for c in index.coefficients) or index.coefficients[3] != 1):
+        # A mask can trim the proof domain only after its source arithmetic
+        # is proved nonwrapping on the full original domain. Otherwise a
+        # wrapped large PID could satisfy a predicate assumed to be false.
+        for expression, bits in self.checks:
+            lo, hi = self.bounds(expression, counts)
+            checked(lo, hi, abs(bits), unsigned=bits < 0)
+        if mask is not None:
+            if (not limit.uniform or limit.offset <= 0 or index.offset < 0 or any(c < 0 for c in index.coefficients)
+                    or index.coefficients[3] != 1):
                 raise GuardFailure("UNSUPPORTED_MASK_DOMAIN")
             bound = limit.offset - index.offset
             if bound <= 0:
@@ -146,12 +154,6 @@ class Domain:
             raise GuardFailure("NON_UNIT_COLUMN_STRIDE")
         if dimensions is None:
             dimensions = list(zip(address.coefficients, counts))
-        # Integer operations are checked before pointer-range construction. A
-        # rectangular over-approximation may reject a tail near an ABI limit;
-        # it may not approve wrapping arithmetic on any live original lane.
-        for expression, bits in self.checks:
-            lo, hi = self.bounds(expression, counts)
-            checked(lo, hi, abs(bits), unsigned=bits < 0)
         for stride, count in dimensions:
             if stride < 0:
                 raise GuardFailure("NEGATIVE_STRIDE")
@@ -172,6 +174,11 @@ class Domain:
 def check_guard(guard, arguments, grid, factor):
     """Return (accepted, reason), without changing any argument or device state."""
     try:
+        if type(guard.get("version")) is not int:
+            raise GuardFailure("INVALID_GUARD_SCHEMA")
+        if guard["version"] == 2:
+            from .block_batching_guard_v2 import check_guard_v2
+            return check_guard_v2(guard, arguments, grid, factor)
         if guard.get("version") != 1 or not guard.get("accesses"):
             raise GuardFailure("INVALID_GUARD_SCHEMA")
         grid = tuple(integer(x) for x in grid)
@@ -216,6 +223,7 @@ class RuntimeGuard:
     retain integers, never tensor owners; changing an alias, stride or extent
     therefore cannot reuse a proof made for different memory geometry.
     """
+
     def __init__(self, guard, factor):
         from copy import deepcopy
         from functools import lru_cache
@@ -235,6 +243,11 @@ class RuntimeGuard:
         for access in specification["accesses"]:
             visit(access["offset"])
             visit(access["mask"])
+            for expression in access.get("pointer_checks", ()):
+                visit(expression)
+            for loop in access.get("loops", ()):
+                for field in ("lower", "upper", "step"):
+                    visit(loop[field])
         self._indices = indices = tuple(sorted(dependencies))
 
         @lru_cache(maxsize=64)

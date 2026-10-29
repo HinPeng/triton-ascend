@@ -1,0 +1,90 @@
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+import json
+import pytest
+from triton._C.libtriton import ir, ascend
+from block_batching_byte_extern_cases import case_ir
+
+pytestmark = pytest.mark.backend("native")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def assign_npu():
+    yield
+
+
+def parse(tmp_path, text):
+    context = ir.context()
+    ir.load_dialects(context)
+    ascend.ir.load_dialects(context)
+    path = tmp_path / "byte-extern.ttir"
+    path.write_text(text)
+    module = ir.parse_mlir_module(str(path), context)
+    module.context = context
+    assert module.verify()
+    return module
+
+
+@pytest.mark.parametrize("kind", ["bool", "byte", "pow", "tanh"])
+@pytest.mark.parametrize("factor", [3, 6])
+def test_new_subsets_keep_lane_mapping_and_memory_contract(tmp_path, kind, factor):
+    module = parse(tmp_path, case_ir(kind))
+    report = ascend.passes.ttir.rewrite_block_batching(module, factor, 0)
+    assert report["compile_status"] == "REWRITTEN", report
+    assert report["implementation_version"] == 14
+    assert module.verify()
+    text = str(module)
+    assert f"tensor<{factor}x8xf32>" in text
+    if kind in ("bool", "byte"):
+        assert 1 in {access["bytes"] for access in json.loads(report["guard_json"])["accesses"]}
+        if kind == "bool": assert "was_bool_to_int8 = true" in text
+    else:
+        assert "tt.extern_elementwise" in text
+        assert "arith.select" in text  # inputs sanitized before the external call
+        assert ("__hmf_pow_fp32" if kind == "pow" else "__hmf_tanhf") in text
+
+
+@pytest.mark.parametrize(
+    "kwargs", [dict(symbol="__hmf_unknown"),
+               dict(symbol="__hmf_tanhf"),
+               dict(pure=False),
+               dict(libpath="custom.bc")])
+def test_unknown_external_contracts_are_rejected_without_changes(tmp_path, kwargs):
+    module = parse(tmp_path, case_ir("pow", **kwargs))
+    before = str(module)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 3, 0)
+    assert report["reason"] == "UNSUPPORTED_EXTERNAL_FUNCTION", report
+    assert str(module) == before
+
+
+@pytest.mark.parametrize("marker", ["", " {was_bool_to_int8 = false}"])
+def test_bool_byte_layout_requires_exact_normalization_marker(tmp_path, marker):
+    text = case_ir().replace(" {was_bool_to_int8 = true}", marker)
+    module = parse(tmp_path, text)
+    before = str(module)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 3, 0)
+    assert report["compile_status"] == "REJECTED"
+    assert report["reason"] == "UNSUPPORTED_BYTE_OPERATION"
+    assert str(module) == before
+
+
+def test_i8_arithmetic_is_not_opened_by_byte_load_support(tmp_path):
+    text = case_ir("byte").replace("%condition = arith.cmpi",
+                                   "%sum8 = arith.addi %bytes, %bytezero : tensor<8xi8>\n    %condition = arith.cmpi")
+    module = parse(tmp_path, text)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 3, 0)
+    assert report["reason"] == "UNSUPPORTED_BYTE_OPERATION", report
+
+
+def test_external_f16_remains_outside_the_signature_subset(tmp_path):
+    module = parse(tmp_path, case_ir("pow").replace("f32", "f16"))
+    report = ascend.passes.ttir.rewrite_block_batching(module, 3, 0)
+    assert report["reason"] == "UNSUPPORTED_EXTERNAL_FUNCTION", report
+
+
+def test_address_division_still_has_an_explicit_rejection(tmp_path):
+    text = case_ir("tanh").replace(
+        "%xp = tt.addptr %xs, %idx",
+        "%quotient = arith.divsi %idx, %ns : tensor<8xi32>\n    %xp = tt.addptr %xs, %quotient")
+    module = parse(tmp_path, text)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 3, 0)
+    assert report["reason"] == "UNSUPPORTED_ADDRESS_EXPRESSION", report

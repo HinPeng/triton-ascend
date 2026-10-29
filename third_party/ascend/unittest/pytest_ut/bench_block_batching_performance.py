@@ -1,9 +1,16 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""Compare original kernels with a fixed manual factor, retaining raw profiler data."""
+"""Compare fixed factors using MSPTI device timestamps, retaining per-task samples.
+
+Requires mspti and libmspti.so in LD_PRELOAD before Python starts. Collection
+follows torch_npu._inductor.profiler.mspti_batch_benchmark; the caller performs
+five warmup launches before collecting active samples here.
+"""
 import argparse
 import csv
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
 import statistics
 import time
@@ -16,26 +23,46 @@ from bench_block_batching import prepare_case, TOLERANCES
 
 
 def profile_kernel(launch, destination, samples):
-    """Read device task duration, with no host-submission interval in the metric."""
-    from torch_npu import profiler as p
-    with p.profile(activities=[p.ProfilerActivity.NPU],
-                   on_trace_ready=p.tensorboard_trace_handler(str(destination)),
-                   record_shapes=False, profile_memory=False, with_stack=False) as prof:
+    """Collect active device tasks with MSPTI after the caller's warmup."""
+    from mspti import KernelMonitor
+
+    if "libmspti.so" not in os.getenv("LD_PRELOAD", ""):
+        raise RuntimeError("Set libmspti.so in LD_PRELOAD before starting Python to use MSPTI.")
+    rows = []
+
+    def callback(data):
+        rows.append({
+            "Name": data.name, "Start(ns)": data.start, "End(ns)": data.end, "Duration(us)":
+            (data.end - data.start) / 1000
+        })
+
+    monitor = KernelMonitor()
+    torch.npu.synchronize()
+    monitor.start(callback)
+    try:
         for _ in range(samples):
             launch()
+    finally:
+        try:
             torch.npu.synchronize()
-    files = list(destination.rglob("kernel_details.csv"))
-    if len(files) != 1:
-        raise RuntimeError(f"expected one kernel_details.csv in {destination}, got {files}")
-    with files[0].open() as source:
-        rows = list(csv.DictReader(source))
+        finally:
+            monitor.stop()
+    destination.mkdir(parents=True, exist_ok=True)
+    raw_csv = destination / "mspti_kernel_details.csv"
+    with raw_csv.open("w", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=["Name", "Start(ns)", "End(ns)", "Duration(us)"])
+        writer.writeheader()
+        writer.writerows(rows)
     if len(rows) != samples:
-        raise RuntimeError(f"expected {samples} device tasks, got {len(rows)}: {files[0]}")
+        raise RuntimeError(f"expected exactly one device task per launch ({samples}), got {len(rows)}: {raw_csv}")
     durations = [float(row["Duration(us)"]) for row in rows]
-    if not all(t > 0 for t in durations):
+    if not all(math.isfinite(t) and t > 0 for t in durations):
         raise RuntimeError("invalid device duration")
-    return {"device_kernel_us": durations, "median_us": statistics.median(durations),
-            "kernel_names": sorted({row["Name"] for row in rows}), "raw_csv": str(files[0])}
+    return {
+        "device_kernel_us": durations, "median_us": statistics.median(durations), "mean_us": statistics.mean(durations),
+        "measurement_backend": "mspti", "kernel_names": sorted({row["Name"]
+                                                                for row in rows}), "raw_csv": str(raw_csv)
+    }
 
 
 def measure_host(launch, samples):
@@ -47,8 +74,10 @@ def measure_host(launch, samples):
         launch()
         enqueue.append((time.perf_counter_ns() - start) / 1000)
     torch.npu.synchronize()
-    return {"enqueue_us": enqueue, "median_enqueue_us": statistics.median(enqueue),
-            "synchronized_batch_per_call_us": (time.perf_counter_ns() - begin) / 1000 / samples}
+    return {
+        "enqueue_us": enqueue, "median_enqueue_us": statistics.median(enqueue), "synchronized_batch_per_call_us":
+        (time.perf_counter_ns() - begin) / 1000 / samples
+    }
 
 
 def run(kind, rows, cols, dtype, factor, axis, destination, rounds, samples):
@@ -63,16 +92,16 @@ def run(kind, rows, cols, dtype, factor, axis, destination, rounds, samples):
     for output, expected in zip(case["outputs"], case["expected"]):
         rtol, atol = TOLERANCES[output.dtype]
         torch.testing.assert_close(output, expected, rtol=rtol, atol=atol)
-    results = {"kind": kind, "shape": [rows, cols], "dtype": str(dtype), "factor": factor, "axis": axis,
-               "launch": dict(actual), "candidate_hash": candidate.hash,
-               "bundle_baseline_hash": candidate.baseline.hash,
-               "backend_report": candidate.block_batching, "rounds": [], "seed": 42,
-               "torch": torch.__version__, "torch_npu": torch_npu.__version__,
-               "triton": triton.__version__, "triton_path": triton.__file__,
-               "device": torch.npu.get_device_name(0), "taskqueue": knobs.ascend.enable_taskqueue,
-               "fixture_sha256": hashlib.sha256(Path(__file__).with_name("block_batching_kernels.py").read_bytes()).hexdigest(),
-               "samples_per_variant_per_round": samples,
-               "bundle_baseline_ttir_sha256": hashlib.sha256(candidate.baseline.asm["ttir"].encode()).hexdigest()}
+    results = {
+        "kind": kind, "shape": [rows, cols], "dtype": str(dtype), "factor": factor, "axis": axis, "launch":
+        dict(actual), "candidate_hash": candidate.hash, "bundle_baseline_hash": candidate.baseline.hash,
+        "backend_report": candidate.block_batching, "rounds": [], "seed": 42, "torch": torch.__version__, "torch_npu":
+        torch_npu.__version__, "triton": triton.__version__, "triton_path": triton.__file__, "device":
+        torch.npu.get_device_name(0), "taskqueue": knobs.ascend.enable_taskqueue, "fixture_sha256":
+        hashlib.sha256(Path(__file__).with_name("block_batching_kernels.py").read_bytes()).hexdigest(),
+        "samples_per_variant_per_round": samples, "warmup_per_variant_per_round": 5, "measurement_backend": "mspti",
+        "bundle_baseline_ttir_sha256": hashlib.sha256(candidate.baseline.asm["ttir"].encode()).hexdigest()
+    }
     for index in range(rounds):
         order = [1, factor] if index % 2 == 0 else [factor, 1]
         record = {}
@@ -88,8 +117,8 @@ def run(kind, rows, cols, dtype, factor, axis, destination, rounds, samples):
             else:
                 results["standalone_baseline_hash"] = compiled.hash
                 results["standalone_baseline_ttir_sha256"] = hashlib.sha256(compiled.asm["ttir"].encode()).hexdigest()
-                results["baseline_ttir_identical"] = (results["standalone_baseline_ttir_sha256"] ==
-                                                     results["bundle_baseline_ttir_sha256"])
+                results["baseline_ttir_identical"] = (
+                    results["standalone_baseline_ttir_sha256"] == results["bundle_baseline_ttir_sha256"])
             prefix = destination / f"round{index}_factor{selected_factor}"
             measured = profile_kernel(launch, prefix, samples)
             measured["host"] = measure_host(launch, samples)
@@ -126,10 +155,13 @@ def main():
     for kind in args.kinds:
         destination = args.output / kind
         destination.mkdir(parents=True, exist_ok=True)
-        result = run(kind, args.rows, args.cols, getattr(torch, args.dtype), args.factor, args.axis,
-                     destination, args.rounds, args.samples)
-        print(json.dumps({"kind": kind, "median_speedup": result["median_speedup"],
-                          "round_speedups": [r["speedup"] for r in result["rounds"]]}), flush=True)
+        result = run(kind, args.rows, args.cols, getattr(torch, args.dtype), args.factor, args.axis, destination,
+                     args.rounds, args.samples)
+        print(
+            json.dumps({
+                "kind": kind, "median_speedup": result["median_speedup"], "round_speedups":
+                [r["speedup"] for r in result["rounds"]]
+            }), flush=True)
 
 
 if __name__ == "__main__":

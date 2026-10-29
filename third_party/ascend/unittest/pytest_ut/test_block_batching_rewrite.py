@@ -50,55 +50,63 @@ def pointwise(axis):
 }'''.replace('AXIS', 'xyz'[axis])
 
 
-@pytest.mark.parametrize('axis', [0,1,2])
-@pytest.mark.parametrize('factor', [2,3,6])
-def test_generic_pointwise_v3(tmp_path,axis,factor):
-    module=parse(tmp_path,pointwise(axis))
-    report=ascend.passes.ttir.rewrite_block_batching(module,factor,axis)
-    assert report['compile_status']=='REWRITTEN',report
-    assert report['lane_width']==1 << (factor-1).bit_length()
+@pytest.mark.parametrize('axis', [0, 1, 2])
+@pytest.mark.parametrize('factor', [2, 3, 6])
+def test_generic_pointwise_v3(tmp_path, axis, factor):
+    module = parse(tmp_path, pointwise(axis))
+    report = ascend.passes.ttir.rewrite_block_batching(module, factor, axis)
+    assert report['compile_status'] == 'REWRITTEN', report
+    assert report['lane_width'] == factor
     assert module.verify()
-    text=str(module)
+    text = str(module)
     assert 'tt.get_num_programs' not in text
-    assert text.count('tt.get_program_id')==1
+    assert text.count('tt.get_program_id') == 1
     assert 'hacc.block_mapping_owner = "block_batching"' in text
-    contract=normalize_program_grid_transforms(ascend.ir.get_program_grid_transforms(module))
-    assert contract['version']==3 and contract['hidden_extent_axes']==[0,1,2]
-    assert contract['transforms'][0]['axis']==axis
-    assert contract['transforms'][0]['factor']==factor
-    assert module.get_function('arbitrary_name').get_num_args()==6
-    guard=json.loads(report['guard_json'])
-    assert len(guard['accesses'])==2
-    before=str(module)
-    assert ascend.passes.ttir.rewrite_block_batching(module,factor,axis)['reason']=='ALREADY_MAPPED'
-    assert str(module)==before
+    contract = normalize_program_grid_transforms(ascend.ir.get_program_grid_transforms(module))
+    assert contract['version'] == 3 and contract['hidden_extent_axes'] == [0, 1, 2]
+    assert contract['transforms'][0]['axis'] == axis
+    assert contract['transforms'][0]['factor'] == factor
+    assert module.get_function('arbitrary_name').get_num_args() == 6
+    guard = json.loads(report['guard_json'])
+    assert len(guard['accesses']) == 2
+    before = str(module)
+    assert ascend.passes.ttir.rewrite_block_batching(module, factor, axis)['reason'] == 'ALREADY_MAPPED'
+    assert str(module) == before
 
 
 def test_auto_axis_uses_mask_structure(tmp_path):
-    module=parse(tmp_path,pointwise(2))
-    report=ascend.passes.ttir.rewrite_block_batching(module,3,-1)
-    assert report['selected_axis']==2 and report['compile_status']=='REWRITTEN'
+    module = parse(tmp_path, pointwise(2))
+    report = ascend.passes.ttir.rewrite_block_batching(module, 3, -1)
+    assert report['selected_axis'] == 2 and report['compile_status'] == 'REWRITTEN'
 
 
-@pytest.mark.parametrize('factor,axis',[(True,0),(2,False),(0,0),(-2,0),(2,3)])
-def test_rewriter_checks_python_configuration(tmp_path,factor,axis):
-    module=parse(tmp_path,pointwise(0))
-    before=str(module)
-    with pytest.raises(ValueError):ascend.passes.ttir.rewrite_block_batching(module,factor,axis)
-    assert str(module)==before
+@pytest.mark.parametrize('factor,axis', [(True, 0), (2, False), (0, 0), (-2, 0), (2, 3)])
+def test_rewriter_checks_python_configuration(tmp_path, factor, axis):
+    module = parse(tmp_path, pointwise(0))
+    before = str(module)
+    with pytest.raises(ValueError):
+        ascend.passes.ttir.rewrite_block_batching(module, factor, axis)
+    assert str(module) == before
 
 
 def test_rejection_is_transactional(tmp_path):
-    module=parse(tmp_path,pointwise(0).replace('%result = arith.addf %v, %gv', '%result = arith.maximumf %v, %gv'))
-    before=str(module)
-    report=ascend.passes.ttir.rewrite_block_batching(module,3,0)
-    assert report['compile_status']=='REJECTED'
-    assert report['reason']=='BASIC_OP_NOT_IMPLEMENTED'
-    assert str(module)==before and module.verify()
+    module = parse(
+        tmp_path,
+        pointwise(0).replace(
+            '%result = arith.addf %v, %gv : tensor<4xf32>',
+            '%result = "arith.addf"(%v, %gv) {unknown_batch_semantics = true} '
+            ': (tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>'))
+    before = str(module)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 3, 0)
+    assert report['compile_status'] == 'REJECTED'
+    assert report['reason'] == 'UNSUPPORTED_OPERATION_ATTRIBUTE'
+    assert report['location'] and report['operation'] == 'arith.addf'
+    assert str(module) == before and module.verify()
 
 
 def test_sum_reduce_and_shared_weight(tmp_path):
-    module=parse(tmp_path,'''module {
+    module = parse(
+        tmp_path, '''module {
   tt.func public @row(%x: !tt.ptr<f32>, %y: !tt.ptr<f32>, %r: !tt.ptr<f32>,
                       %w: !tt.ptr<f32>, %n: i32, %stride: i32) {
     %p = tt.get_program_id x : i32
@@ -130,12 +138,12 @@ def test_sum_reduce_and_shared_weight(tmp_path):
     tt.return
   }
 }''')
-    report=ascend.passes.ttir.rewrite_block_batching(module,3,0)
-    assert report['compile_status']=='REWRITTEN',report
+    report = ascend.passes.ttir.rewrite_block_batching(module, 3, 0)
+    assert report['compile_status'] == 'REWRITTEN', report
     assert module.verify()
-    text=str(module)
-    assert 'tensor<4x4xf32>' in text
+    text = str(module)
+    assert 'tensor<3x4xf32>' in text
     assert 'axis = 1 : i32' in text
-    assert text.count('tt.load')==2
+    assert text.count('tt.load') == 2
     assert 'originalGridZ' in text
-    assert module.get_function('row').get_num_args()==9
+    assert module.get_function('row').get_num_args() == 9

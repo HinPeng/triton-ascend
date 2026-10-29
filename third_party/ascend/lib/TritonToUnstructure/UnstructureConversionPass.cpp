@@ -704,6 +704,10 @@ LogicalResult
 UnstructuredMemAccessConverter<triton::LoadOp>::splatAndLoadScenario<
     triton::LoadOp>(triton::LoadOp op, const PtrOffsetInfo &ptrOffsetInfo,
                     PatternRewriter &rewriter) const {
+  // A scalar read followed by select still reads memory when every lane is
+  // masked out. Keep masked loads on the per-element guarded fallback path.
+  if (op.getMask())
+    return failure();
   auto loc = op.getLoc();
   if (!ptrOffsetInfo.isPointerDescriptorOwned()) {
     // Preserve the legacy scalar-like path for unmarked pointer tensors. The

@@ -4,6 +4,7 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LogicalResult.h"
+#include "llvm/ADT/StringRef.h"
 #include <cstdint>
 #include <map>
 #include <string>
@@ -15,6 +16,7 @@ enum class BlockMappingOwner { None, BlockBatching, Legacy };
 struct BatchRequest {
   int64_t factor = 1;
   int32_t axis = -1;
+  bool semanticOnly = false;
   bool isValid() const { return factor > 0 && axis >= -1 && axis <= 2; }
 };
 
@@ -24,6 +26,9 @@ struct BatchAnalysisReport {
   std::string status = "REJECTED";
   std::string reason;
   std::string location;
+  std::string operation;
+  std::string context;
+  std::string layoutJSON;
   std::map<std::string, unsigned> operations;
 };
 
@@ -32,9 +37,13 @@ struct BatchRewriteReport : BatchAnalysisReport {
   int selectedAxis = -1;
   int64_t laneWidth = 1;
 };
-FailureOr<BatchRewriteReport> rewriteBlockBatching(ModuleOp module, BatchRequest request);
+void setBatchDiagnostic(BatchAnalysisReport &report, Operation *op,
+                        llvm::StringRef reason);
+
+FailureOr<BatchRewriteReport> rewriteBlockBatching(ModuleOp module,
+                                                   BatchRequest request);
 
 FailureOr<BatchAnalysisReport> analyzeBlockBatching(ModuleOp module,
-                                                  BatchRequest request);
+                                                    BatchRequest request);
 } // namespace mlir::triton::cfg
 #endif

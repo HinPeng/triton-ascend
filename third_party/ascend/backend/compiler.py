@@ -71,7 +71,7 @@ from triton.backends.ascend.utils import (
 )
 from triton.backends.ascend.driver import (NPUUtils)
 from triton.backends.ascend.compiler_capabilities import optimized_metaop_options
-from triton.backends.ascend.block_batching import BatchRequest, analyze_request, BatchingRejected
+from triton.backends.ascend.block_batching import BatchRequest, analyze_request, BatchingRejected, IMPLEMENTATION_VERSION
 from triton.backends.ascend.block_batching_report import VALIDATION_POLICY, validate_compilation_result
 from triton.backends.ascend.program_grid import (
     DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK,
@@ -361,9 +361,16 @@ def make_ttir(mod, metadata, opt):
         rewrite = getattr(ascend.passes.ttir, "rewrite_block_batching", None)
         if rewrite is None:
             raise RuntimeError("block batching requires the matching rebuilt C++ rewriter")
-        report = dict(rewrite(mod, opt.block_batching_factor, opt.block_batching_axis))
+        report = dict(rewrite(mod, opt.block_batching_factor, opt.block_batching_axis, opt.block_batching_layout))
+        if report.get("implementation_version") != opt.block_batching_implementation:
+            raise BatchingRejected("REWRITER_IMPLEMENTATION_MISMATCH")
+        if report.get("lane_width") != opt.block_batching_factor and report["compile_status"] == "REWRITTEN":
+            raise BatchingRejected("CANDIDATE_LAYOUT_MISMATCH")
         if report["compile_status"] != "REWRITTEN":
             raise BatchingRejected(report["reason"])
+        report["layout"] = json.loads(report.pop("layout_json"))
+        report["layout"]["requested_policy"] = opt.block_batching_layout
+        report["layout"]["selected_policy"] = opt.block_batching_layout
         report["guard"] = json.loads(report.pop("guard_json"))
         report["guard"]["axis"] = report["selected_axis"]
         report["owner"] = "block_batching"
@@ -377,7 +384,8 @@ def make_ttir(mod, metadata, opt):
         if opt.block_batching_factor > 1:
             # Mapping ownership is reserved before any legacy graph rule runs.
             # RowCoalescing also owns DotRow's special tail scheduling.
-            graph_kwargs["rule_mask"] = graph_kwargs.get("rule_mask", DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK) & ~((1 << 3) | (1 << 9) | (1 << 11))
+            graph_kwargs["rule_mask"] = graph_kwargs.get("rule_mask", DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK) & ~(
+                (1 << 3) | (1 << 9) | (1 << 11))
         ascend.passes.ttir.add_graph_optimize(pm, **graph_kwargs)
     pm.run(mod, 'make_ttir')
     if opt.debug:
@@ -506,6 +514,20 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
                 raise BatchingRejected("MAPPING_OWNER_LOST")
 
         linalg_text = _serialize_module(mod, opt)
+        if "block_batching" in metadata:
+            # Observations describe the module, not individual source accesses.
+            # They never authorize a layout or reject valid internal SIMT code.
+            metadata["block_batching"]["layout"]["lowering_observation"] = {
+                "scope": "module",
+                "stage": "ttadapter",
+                "indirect_load_ops":
+                len(re.findall(r"\b(?:func\.)?call\s+@triton_indirect_load(?:_\d+)?\b", linalg_text)),
+                "indirect_store_ops":
+                len(re.findall(r"\b(?:func\.)?call\s+@triton_indirect_store(?:_\d+)?\b", linalg_text)),
+                "memref_copy_ops": len(re.findall(r"\bmemref\.copy\b", linalg_text)),
+                "linalg_transpose_ops": len(re.findall(r"\blinalg\.transpose\b", linalg_text)),
+            }
+
         if opt.debug:
             dump_manager = get_dump_manager(metadata["hash"])
             dump_manager.put(linalg_text, "kernel.ttadapter.mlir", binary=False)
@@ -769,8 +791,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
         ]
 
-        _compile_option_list += optimized_metaop_options(
-            _get_npucompiler_path()[0], is_cann_version_at_least(9, 2, 0))
+        _compile_option_list += optimized_metaop_options(_get_npucompiler_path()[0], is_cann_version_at_least(9, 2, 0))
 
         npu_utils = NPUUtils()
         if npu_utils.has_device_limit():
@@ -926,6 +947,13 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         except subprocess.CalledProcessError as e:
             if opt.debug:
                 _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
+            diagnostic = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else str(e.stderr or "")
+            layout = metadata.get("block_batching", {}).get("layout", {})
+            applied = any(row.get("rewritten") for row in layout.get("accesses", ()))
+            from .block_batching import LayoutTargetRejected, _layout_resource_refusal
+            if (opt.block_batching_layout == "auto" and applied and _layout_resource_refusal(e.returncode, diagnostic)):
+                raise LayoutTargetRejected(opt.block_batching_factor, opt.block_batching_axis,
+                                           diagnostic[-16000:]) from e
             raise
 
         if opt.debug:
@@ -1022,8 +1050,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
         ]
 
-        _compile_option_list += optimized_metaop_options(
-            _get_npucompiler_path()[0], is_cann_version_at_least(9, 2, 0))
+        _compile_option_list += optimized_metaop_options(_get_npucompiler_path()[0], is_cann_version_at_least(9, 2, 0))
 
         if _is_ascend_sanitizer_enabled():
             _compile_option_list += ["--enable-sanitizer=true"]
@@ -1146,6 +1173,18 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         except subprocess.CalledProcessError as e:
             if opt.debug:
                 _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
+            diagnostic = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else str(e.stderr or "")
+            layout = metadata.get("block_batching", {}).get("layout", {})
+            applied = any(row.get("rewritten") for row in layout.get("accesses", ()))
+            crash = e.returncode < 0 or e.returncode in (134, 139) or any(
+                marker in diagnostic for marker in ("PLEASE submit a bug report", "LLVM ERROR:", "Assertion"))
+            resource_refusal = re.search(
+                r"(?:UB|unified buffer)[^\n]*(?:exceed|overflow|insufficient)|"
+                r"(?:insufficient|not enough|failed to allocate)[^\n]*(?:UB|unified buffer)", diagnostic, re.IGNORECASE)
+            if opt.block_batching_layout == "auto" and applied and not crash and resource_refusal:
+                from .block_batching import LayoutTargetRejected
+                raise LayoutTargetRejected(opt.block_batching_factor, opt.block_batching_axis,
+                                           diagnostic[-16000:]) from e
             raise
 
         if opt.debug:
@@ -1252,7 +1291,8 @@ class NPUOptions:
     enable_graph_optimize: bool = True
     block_batching_factor: int = 1
     block_batching_axis: int = -1
-    block_batching_implementation: int = field(default=2, init=False)
+    block_batching_layout: str = "auto"
+    block_batching_implementation: int = field(default=IMPLEMENTATION_VERSION, init=False)
     block_batching_backend_revision: str = field(default="", init=False)
     supported_fp8_dtypes: Tuple[str] = ("fp8e5", "fp8e4b15", "fp8e4nv", "fp8e4b8", "fp8e5b16")
     deprecated_fp8_dtypes: Tuple[str] = ()
@@ -1376,6 +1416,10 @@ class NPUOptions:
 
     def __post_init__(self, arch, rule_mask):
         BatchRequest(self.block_batching_factor, self.block_batching_axis)
+        if self.block_batching_layout not in ("auto", "semantic_only"):
+            raise ValueError("block_batching_layout must be auto or semantic_only")
+        if self.block_batching_factor == 1:
+            object.__setattr__(self, "block_batching_layout", "semantic_only")
         if self.block_batching_factor > 1:
             compiler_path, _ = _get_npucompiler_path()
             object.__setattr__(self, "block_batching_backend_revision", _batching_backend_revision(compiler_path))

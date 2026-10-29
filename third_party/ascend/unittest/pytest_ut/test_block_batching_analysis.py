@@ -45,15 +45,16 @@ def test_cpp_checks_request_independently(tmp_path, factor, axis):
         ascend.passes.ttir.analyze_block_batching(parse(tmp_path), factor, axis)
 
 
-def test_loop_has_diagnostic(tmp_path):
-    module = parse(tmp_path, """
+def test_loop_without_a_program_axis_has_diagnostic(tmp_path):
+    module = parse(
+        tmp_path, """
       %zero = arith.constant 0 : i32
       %one = arith.constant 1 : i32
       scf.for %iv = %zero to %arg step %one : i32 { scf.yield }
       tt.return
     """)
     report = ascend.passes.ttir.analyze_block_batching(module, 4, 0)
-    assert report["reason"] == "BASIC_CONTROL_FLOW_NOT_IMPLEMENTED"
+    assert report["reason"] == "UNUSED_BATCH_AXIS"
     assert report["location"]
 
 

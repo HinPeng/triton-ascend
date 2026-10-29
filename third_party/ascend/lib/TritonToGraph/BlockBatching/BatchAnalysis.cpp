@@ -5,8 +5,40 @@
 #include <limits>
 
 namespace mlir::triton::cfg {
+void setBatchDiagnostic(BatchAnalysisReport &report, Operation *op,
+                        llvm::StringRef reason) {
+  report.reason = reason.str();
+  report.operation = op->getName().getStringRef().str();
+  report.context = "BlockBody";
+  Operation *child = op;
+  for (Operation *parent = op->getParentOp(); parent;
+       child = parent, parent = parent->getParentOp()) {
+    if (parent->getName().getStringRef() == "tt.reduce") {
+      report.context = "ReduceCombiner";
+      break;
+    }
+    if (parent->getName().getStringRef() == "tt.scan") {
+      report.context = "ScanCombiner";
+      break;
+    }
+    if (parent->getName().getStringRef() == "scf.for") {
+      report.context = "ForBody";
+      break;
+    }
+    if (parent->getName().getStringRef() == "scf.if") {
+      report.context = child->getParentRegion() == &parent->getRegion(0)
+                           ? "IfThen"
+                           : "IfElse";
+      break;
+    }
+  }
+  report.location.clear();
+  llvm::raw_string_ostream stream(report.location);
+  op->getLoc().print(stream);
+}
+
 FailureOr<BatchAnalysisReport> analyzeBlockBatching(ModuleOp module,
-                                                  BatchRequest request) {
+                                                    BatchRequest request) {
   if (!request.isValid())
     return failure();
   BatchAnalysisReport report;
@@ -30,29 +62,22 @@ FailureOr<BatchAnalysisReport> analyzeBlockBatching(ModuleOp module,
   module.walk([&](Operation *op) {
     const auto name = op->getName().getStringRef();
     ++report.operations[name.str()];
-    if (!report.reason.empty())
-      return;
-    if (name.starts_with("scf."))
-      report.reason = "BASIC_CONTROL_FLOW_NOT_IMPLEMENTED";
-    else if (name == "tt.call" || name == "tt.extern_elementwise")
-      report.reason = "UNSUPPORTED_CALL";
-    else if (name.starts_with("tt.atomic") || name == "tt.print" ||
-             name == "tt.assert")
-      report.reason = "UNSUPPORTED_EFFECT";
-    if (!report.reason.empty()) {
-      llvm::raw_string_ostream stream(report.location);
-      op->getLoc().print(stream);
-    }
   });
   if (report.reason.empty()) {
     // Analyze with the same registry and verifier on a private clone. This
     // report never authorizes a launch: alias/resource/mode proofs remain.
     OwningOpRef<ModuleOp> sandbox(module.clone());
+    request.semanticOnly = true;
     auto rewrite = rewriteBlockBatching(sandbox.get(), request);
     if (failed(rewrite))
       return failure();
-    report.status = rewrite->status == "REWRITTEN" ? "ANALYZED" : rewrite->status;
+    report.status =
+        rewrite->status == "REWRITTEN" ? "ANALYZED" : rewrite->status;
     report.reason = rewrite->reason;
+    report.location = rewrite->location;
+    report.operation = rewrite->operation;
+    report.context = rewrite->context;
+    report.layoutJSON = rewrite->layoutJSON;
   }
   return report;
 }

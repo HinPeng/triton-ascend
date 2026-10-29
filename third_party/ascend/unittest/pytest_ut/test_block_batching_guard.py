@@ -21,21 +21,38 @@ batching = importlib.import_module(PACKAGE + ".block_batching")
 check_guard = guard_module.check_guard
 
 
-def arg(index, bits=64): return ["arg", index, bits]
-def const(value, bits=64): return ["const", value, bits]
-def pid(axis): return ["pid", axis, 32]
-def add(a, b, bits=64): return ["addi", bits, a, b]
-def mul(a, b, bits=64): return ["muli", bits, a, b]
+def arg(index, bits=64):
+    return ["arg", index, bits]
+
+
+def const(value, bits=64):
+    return ["const", value, bits]
+
+
+def pid(axis):
+    return ["pid", axis, 32]
+
+
+def add(a, b, bits=64):
+    return ["addi", bits, a, b]
+
+
+def mul(a, b, bits=64):
+    return ["muli", bits, a, b]
 
 
 def rows_guard(block=8, column_axis=1):
     lane = ["range", 0, block, 32]
     column = lane if column_axis is None else add(mul(pid(column_axis), const(block)), lane)
     offset = add(mul(pid(0), arg(3)), column)
-    return {"version": 1, "axis": 0, "accesses": [
-        {"root": 0, "offset": offset, "mask": ["lt", column, arg(2)], "write": False, "bytes": 4},
-        {"root": 1, "offset": offset, "mask": ["lt", column, arg(2)], "write": True, "bytes": 4},
-    ]}
+    return {
+        "version":
+        1, "axis":
+        0, "accesses": [
+            {"root": 0, "offset": offset, "mask": ["lt", column, arg(2)], "write": False, "bytes": 4},
+            {"root": 1, "offset": offset, "mask": ["lt", column, arg(2)], "write": True, "bytes": 4},
+        ]
+    }
 
 
 @pytest.mark.parametrize("factor", [2, 3, 4, 6, 16])
@@ -51,8 +68,10 @@ def test_masked_rows_and_tail_groups(factor, rows, cols, block):
 def test_shared_weight_and_scalar_rrms_output():
     guard = rows_guard(256, None)
     guard["accesses"] += [
-        {"root": 4, "offset": ["range", 0, 256, 32],
-         "mask": ["lt", ["range", 0, 256, 32], arg(2)], "write": False, "bytes": 4},
+        {
+            "root": 4, "offset": ["range", 0, 256, 32], "mask": ["lt", ["range", 0, 256, 32],
+                                                                 arg(2)], "write": False, "bytes": 4
+        },
         {"root": 5, "offset": pid(0), "mask": None, "write": True, "bytes": 4},
     ]
     args = [1 << 32, 1 << 40, 129, 129, 1 << 44, 1 << 48]
@@ -80,8 +99,12 @@ def test_stride_must_separate_all_original_rows():
 
 
 def test_empty_grid_does_not_touch_pointers():
+
     class BadPointer:
-        def data_ptr(self): raise AssertionError("empty launch examined a pointer")
+
+        def data_ptr(self):
+            raise AssertionError("empty launch examined a pointer")
+
     assert check_guard(rows_guard(), [BadPointer(), BadPointer(), 7, 7], (0, 1, 1), 4)[1] == "EMPTY_GRID"
 
 
@@ -186,22 +209,32 @@ def test_ub_usage_is_optional_diagnostic(ub):
 def bundle_environment(monkeypatch):
     from collections import namedtuple
     modules = {}
-    for name in ('triton', 'triton.runtime', 'triton.runtime.cache', 'triton.runtime.errors', 'triton.compiler', 'triton.compiler.errors'):
-        module = types.ModuleType(name); module.__path__ = []
-        monkeypatch.setitem(sys.modules, name, module); modules[name] = module
+    for name in ('triton', 'triton.runtime', 'triton.runtime.cache', 'triton.runtime.errors', 'triton.compiler',
+                 'triton.compiler.errors'):
+        module = types.ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+        modules[name] = module
     knobs = types.SimpleNamespace(ascend=types.SimpleNamespace(compile_only=False))
     modules['triton'].knobs = knobs
+
     class Cache:
-        def put(self, data, name, **kwargs): return '/tmp/' + name
+
+        def put(self, data, name, **kwargs):
+            return '/tmp/' + name
+
     modules['triton.runtime.cache'].get_cache_manager = lambda key: Cache()
-    modules['triton.compiler.errors'].MLIRCompilationError = type('MLIRCompilationError', (RuntimeError,), {})
-    modules['triton.runtime.errors'].OutOfResources = type('OutOfResources', (RuntimeError,), {})
-    utils = types.ModuleType(PACKAGE + '.utils'); utils.backend_policy = 'torch_npu'
+    modules['triton.compiler.errors'].MLIRCompilationError = type('MLIRCompilationError', (RuntimeError, ), {})
+    modules['triton.runtime.errors'].OutOfResources = type('OutOfResources', (RuntimeError, ), {})
+    utils = types.ModuleType(PACKAGE + '.utils')
+    utils.backend_policy = 'torch_npu'
     monkeypatch.setitem(sys.modules, PACKAGE + '.utils', utils)
     monkeypatch.setattr(batching, '_capture_state', lambda: False)
     monkeypatch.setattr(batching, '_freeze_source', lambda backend, src, opts, revision: src)
     launches = []
+
     class Kernel:
+
         def __init__(self, name, report=None):
             self.name = self.hash = name
             fields = {'name': name}
@@ -209,36 +242,47 @@ def bundle_environment(monkeypatch):
             self.metadata = namedtuple('Metadata', fields)(**fields)
             self.function = 101 if name == 'baseline' else 202
             self.packed_metadata = {'hash': name}
-            self._run = None; self.initializations = 0
+            self._run = None
+            self.initializations = 0
+
         def _init_handles(self):
             if self._run is None:
-                self.initializations += 1; self._run = True
-        def launch_metadata(self, grid, stream, *args): return {'selected': self.name}
+                self.initializations += 1
+                self._run = True
+
+        def launch_metadata(self, grid, stream, *args):
+            return {'selected': self.name}
+
         def run(self, *launch):
             assert launch[4] == self.function
             assert launch[5]['hash'] == self.name
             assert launch[6]['selected'] == self.name
             if not knobs.ascend.compile_only: launches.append((self.name, launch))
-    report = {'compile_status':'COMPILED_GUARDED','selected_axis':0, 'owner':'block_batching',
-              'guard':rows_guard(4,None), 'candidate_factor':3}
+
+    report = {
+        'compile_status': 'COMPILED_GUARDED', 'selected_axis': 0, 'owner': 'block_batching', 'guard':
+        rows_guard(4, None), 'candidate_factor': 3, 'implementation_version': batching.IMPLEMENTATION_VERSION,
+        'lane_width': 3
+    }
     base, candidate = Kernel('baseline'), Kernel('candidate', report)
-    wrapper = batching.BatchKernel(base, candidate, batching.BatchRequest(3,0), report, [0,1,2,3])
-    launch = (2,1,1,42,-999,{},None,None,None,10000,100000,4,4)
-    return types.SimpleNamespace(wrapper=wrapper, base=base, candidate=candidate, report=report,
-                                 launch=launch, launches=launches, knobs=knobs, Kernel=Kernel)
+    wrapper = batching.BatchKernel(base, candidate, batching.BatchRequest(3, 0), report, [0, 1, 2, 3])
+    launch = (2, 1, 1, 42, -999, {}, None, None, None, 10000, 100000, 4, 4)
+    return types.SimpleNamespace(wrapper=wrapper, base=base, candidate=candidate, report=report, launch=launch,
+                                 launches=launches, knobs=knobs, Kernel=Kernel)
 
 
 def test_bundle_selects_complete_variant_and_rechecks_alias(bundle_environment):
     env = bundle_environment
     env.wrapper.run(*env.launch)
     assert env.wrapper.last_launch['runtime_status'] == 'APPLIED'
-    assert env.wrapper.last_launch['batch_grid'] == (1,1,1)
-    alias = list(env.launch); alias[10] = alias[9]
+    assert env.wrapper.last_launch['batch_grid'] == (1, 1, 1)
+    alias = list(env.launch)
+    alias[10] = alias[9]
     env.wrapper.run(*alias)
     assert env.wrapper.last_launch['runtime_status'] == 'BASELINE_SELECTED'
     assert env.wrapper.last_launch['reason'] == 'WRITE_ALIAS'
     env.wrapper.run(*env.launch)
-    assert [name for name,_ in env.launches] == ['candidate','baseline','candidate']
+    assert [name for name, _ in env.launches] == ['candidate', 'baseline', 'candidate']
     assert env.base.initializations == env.candidate.initializations == 1
 
 
@@ -248,10 +292,12 @@ def test_bundle_capture_and_empty_choose_safe_paths(bundle_environment, monkeypa
     monkeypatch.setattr(batching, '_capture_state', lambda: True)
     env.wrapper.run(*env.launch)
     assert env.wrapper.last_launch['reason'] == 'CAPTURE_BASELINE'
-    empty = list(env.launch); empty[0] = 0; empty[9] = None
+    empty = list(env.launch)
+    empty[0] = 0
+    empty[9] = None
     env.wrapper.run(*empty)
     assert env.wrapper.last_launch['runtime_status'] == 'EMPTY_GRID'
-    assert [name for name,_ in env.launches] == ['candidate','baseline']
+    assert [name for name, _ in env.launches] == ['candidate', 'baseline']
 
 
 def test_capture_requires_prior_loading(bundle_environment, monkeypatch):
@@ -261,7 +307,8 @@ def test_capture_requires_prior_loading(bundle_environment, monkeypatch):
 
 
 def test_compile_only_never_reports_applied(bundle_environment):
-    env = bundle_environment; env.knobs.ascend.compile_only = True
+    env = bundle_environment
+    env.knobs.ascend.compile_only = True
     env.wrapper.run(*env.launch)
     assert env.wrapper.last_launch['runtime_status'] == 'NOT_LAUNCHED'
     assert not env.launches
@@ -269,59 +316,73 @@ def test_compile_only_never_reports_applied(bundle_environment):
 
 def test_bundle_compile_rejection_preserves_baseline_options(bundle_environment):
     env = bundle_environment
-    backend = types.SimpleNamespace(target=types.SimpleNamespace(arch='Ascend950'),
-        parse_options=lambda options: types.SimpleNamespace(is_pure_simt=False,compile_mode='simd',block_batching_backend_revision='test-toolchain'))
-    src = types.SimpleNamespace(fn=types.SimpleNamespace(arg_names=['x','y','n','stride']),
-        signature={'x':'*fp32','y':'*fp32','n':'i32','stride':'i32'}, constants={})
-    seen=[]
+    backend = types.SimpleNamespace(
+        target=types.SimpleNamespace(arch='Ascend950'), parse_options=lambda options: types.SimpleNamespace(
+            is_pure_simt=False, compile_mode='simd', block_batching_backend_revision='test-toolchain'))
+    src = types.SimpleNamespace(fn=types.SimpleNamespace(arg_names=['x', 'y', 'n', 'stride']),
+                                signature={'x': '*fp32', 'y': '*fp32', 'n': 'i32', 'stride': 'i32'}, constants={})
+    seen = []
+
     def compile_variant(options, frozen):
         seen.append(options)
         if options['block_batching_factor'] == 1: return env.base
         raise batching.BatchingRejected('RESOURCE_LIMIT')
-    kernel = batching.compile_bundle(backend,src,
-        {'block_batching_factor':3,'block_batching_axis':0,'enable_graph_optimize':False},compile_variant)
+
+    kernel = batching.compile_bundle(
+        backend, src, {'block_batching_factor': 3, 'block_batching_axis': 0, 'enable_graph_optimize': False},
+        compile_variant)
     assert kernel.candidate is None
     assert kernel.block_batching['reason'] == 'RESOURCE_LIMIT'
-    assert [x['block_batching_factor'] for x in seen] == [1,3]
+    assert [x['block_batching_factor'] for x in seen] == [1, 3]
     assert all(x['enable_graph_optimize'] is False for x in seen)
     kernel.run(*env.launch)
     assert env.launches[-1][0] == 'baseline'
 
 
 def test_bundle_does_not_swallow_internal_errors(bundle_environment):
-    env=bundle_environment
-    backend=types.SimpleNamespace(target=types.SimpleNamespace(arch='Ascend950'),
-        parse_options=lambda options: types.SimpleNamespace(is_pure_simt=False,compile_mode='simd',block_batching_backend_revision='test-toolchain'))
-    src=types.SimpleNamespace(fn=types.SimpleNamespace(arg_names=['x']),signature={'x':'*fp32'},constants={})
+    env = bundle_environment
+    backend = types.SimpleNamespace(
+        target=types.SimpleNamespace(arch='Ascend950'), parse_options=lambda options: types.SimpleNamespace(
+            is_pure_simt=False, compile_mode='simd', block_batching_backend_revision='test-toolchain'))
+    src = types.SimpleNamespace(fn=types.SimpleNamespace(arg_names=['x']), signature={'x': '*fp32'}, constants={})
+
     def compile_variant(options, frozen):
-        if options['block_batching_factor']==1:return env.base
+        if options['block_batching_factor'] == 1: return env.base
         raise RuntimeError('internal invariant broken')
-    with pytest.raises(RuntimeError,match='internal invariant'):
-        batching.compile_bundle(backend,src,{'block_batching_factor':3},compile_variant)
+
+    with pytest.raises(RuntimeError, match='internal invariant'):
+        batching.compile_bundle(backend, src, {'block_batching_factor': 3}, compile_variant)
 
 
 @pytest.mark.parametrize("returncode,diagnostic", [(-11, b""), (134, b""), (1, b"LLVM ERROR: invalid IR")])
 def test_bundle_does_not_hide_compiler_crashes(bundle_environment, returncode, diagnostic):
     import subprocess
     env = bundle_environment
-    backend = types.SimpleNamespace(target=types.SimpleNamespace(arch='Ascend950'),
-        parse_options=lambda options: types.SimpleNamespace(is_pure_simt=False, compile_mode='simd',
-            block_batching_backend_revision='test-toolchain'))
-    src = types.SimpleNamespace(fn=types.SimpleNamespace(arg_names=['x']), signature={'x':'*fp32'}, constants={})
+    backend = types.SimpleNamespace(
+        target=types.SimpleNamespace(arch='Ascend950'), parse_options=lambda options: types.SimpleNamespace(
+            is_pure_simt=False, compile_mode='simd', block_batching_backend_revision='test-toolchain'))
+    src = types.SimpleNamespace(fn=types.SimpleNamespace(arg_names=['x']), signature={'x': '*fp32'}, constants={})
+
     def compile_variant(options, frozen):
         if options['block_batching_factor'] == 1:
             return env.base
         raise subprocess.CalledProcessError(returncode, ['compiler'], stderr=diagnostic)
+
     with pytest.raises(subprocess.CalledProcessError):
         batching.compile_bundle(backend, src, {'block_batching_factor': 3}, compile_variant)
 
 
 def test_cached_proof_rechecks_all_current_dependencies():
+
     class Pointer:
-        def __init__(self, address): self.address, self.reads = address, 0
+
+        def __init__(self, address):
+            self.address, self.reads = address, 0
+
         def data_ptr(self):
             self.reads += 1
             return self.address
+
     source, output = Pointer(10000), Pointer(100000)
     guard = guard_module.RuntimeGuard(rows_guard(4, None), 3)
     arguments = [source, output, 4, 4]
@@ -339,16 +400,24 @@ def test_cached_proof_rechecks_all_current_dependencies():
 
 
 def test_cached_proof_empty_grid_does_not_read_pointers():
+
     class NoAddress:
-        def data_ptr(self): raise AssertionError("empty launch read a pointer")
+
+        def data_ptr(self):
+            raise AssertionError("empty launch read a pointer")
+
     guard = guard_module.RuntimeGuard(rows_guard(), 3)
     assert guard([NoAddress(), NoAddress(), 4, 4], (0, 1, 1)) == (False, "EMPTY_GRID")
 
 
 def test_cached_proof_does_not_retain_tensor_owners():
     import weakref
+
     class Pointer:
-        def data_ptr(self): return 10000
+
+        def data_ptr(self):
+            return 10000
+
     source = Pointer()
     owner = weakref.ref(source)
     guard = guard_module.RuntimeGuard(rows_guard(4, None), 3)
@@ -374,25 +443,29 @@ def test_bundle_rejects_cached_candidate_from_old_policy(bundle_environment, pol
     import hashlib
     from collections import namedtuple
     env = bundle_environment
-    backend = types.SimpleNamespace(target=types.SimpleNamespace(arch="Ascend950"),
-        parse_options=lambda options: types.SimpleNamespace(is_pure_simt=False,
-            compile_mode="simd_simt_template", block_batching_backend_revision="test-toolchain"))
+    backend = types.SimpleNamespace(
+        target=types.SimpleNamespace(arch="Ascend950"), parse_options=lambda options: types.SimpleNamespace(
+            is_pure_simt=False, compile_mode="simd_simt_template", block_batching_backend_revision="test-toolchain"))
     src = types.SimpleNamespace(fn=types.SimpleNamespace(arg_names=["x", "y", "n", "stride"]),
-        signature={"x": "*fp32", "y": "*fp32", "n": "i32", "stride": "i32"}, constants={})
+                                signature={"x": "*fp32", "y": "*fp32", "n": "i32", "stride": "i32"}, constants={})
     report = dict(env.report)
     if policy is not None:
         report["validation_policy"] = policy
     env.candidate.kernel = b"candidate binary"
-    fields = {"name": "candidate", "block_batching": report,
-              "block_batching_binary_sha256": hashlib.sha256(env.candidate.kernel).hexdigest()}
+    fields = {
+        "name": "candidate", "block_batching": report, "block_batching_binary_sha256":
+        hashlib.sha256(env.candidate.kernel).hexdigest()
+    }
     env.candidate.metadata = namedtuple("Metadata", fields)(**fields)
     seen = []
+
     def compile_variant(options, frozen):
         seen.append(options)
         return env.base if options["block_batching_factor"] == 1 else env.candidate
-    kernel = batching.compile_bundle(backend, src,
-        {"block_batching_factor": 3, "block_batching_axis": 0,
-         "compile_mode": "simd_simt_template"}, compile_variant)
+
+    kernel = batching.compile_bundle(
+        backend, src, {"block_batching_factor": 3, "block_batching_axis": 0, "compile_mode": "simd_simt_template"},
+        compile_variant)
     assert all(x["compile_mode"] == "simd_simt_template" for x in seen)
     if policy == "ta_only_v1":
         assert kernel.candidate is env.candidate
@@ -406,19 +479,63 @@ def test_bundle_rejects_cached_candidate_from_old_policy(bundle_environment, pol
 def test_ub_compile_failure_selects_complete_baseline(bundle_environment):
     import subprocess
     env = bundle_environment
-    backend = types.SimpleNamespace(target=types.SimpleNamespace(arch="Ascend950"),
-        parse_options=lambda options: types.SimpleNamespace(is_pure_simt=False,
-            compile_mode="simd", block_batching_backend_revision="test-toolchain"))
-    src = types.SimpleNamespace(fn=types.SimpleNamespace(arg_names=["x"]),
-        signature={"x": "*fp32"}, constants={})
+    backend = types.SimpleNamespace(
+        target=types.SimpleNamespace(arch="Ascend950"), parse_options=lambda options: types.SimpleNamespace(
+            is_pure_simt=False, compile_mode="simd", block_batching_backend_revision="test-toolchain"))
+    src = types.SimpleNamespace(fn=types.SimpleNamespace(arg_names=["x"]), signature={"x": "*fp32"}, constants={})
+
     def compile_variant(options, frozen):
         if options["block_batching_factor"] == 1:
             return env.base
         raise subprocess.CalledProcessError(1, ["bishengir-compile"],
-            stderr=b"ub overflow, requires 2134016 bits while 2031616 bits available!")
+                                            stderr=b"ub overflow, requires 2134016 bits while 2031616 bits available!")
+
     kernel = batching.compile_bundle(backend, src, {"block_batching_factor": 64}, compile_variant)
     assert kernel.candidate is None
     assert kernel.block_batching["reason"] == "BACKEND_COMPILE_REJECTED"
     assert "ub overflow" in kernel.block_batching["backend_diagnostic"]
     kernel.run(*env.launch)
     assert env.launches[-1][0] == "baseline"
+
+
+@pytest.mark.parametrize("version,lane_width", [(2, 3), (3, 4), (None, 3)])
+def test_bundle_rejects_old_or_padded_layout(bundle_environment, version, lane_width):
+    import hashlib
+    env = bundle_environment
+    report = dict(env.report, validation_policy="ta_only_v1", implementation_version=version, lane_width=lane_width)
+    env.candidate.metadata = env.candidate.metadata._replace(block_batching=report)
+    env.candidate.kernel = b"candidate-binary"
+    from collections import namedtuple
+    fields = dict(env.candidate.metadata._asdict(),
+                  block_batching_binary_sha256=hashlib.sha256(env.candidate.kernel).hexdigest())
+    env.candidate.metadata = namedtuple("Metadata", fields)(**fields)
+    backend = types.SimpleNamespace(
+        target=types.SimpleNamespace(arch="Ascend950"), parse_options=lambda opts: types.SimpleNamespace(
+            is_pure_simt=False, compile_mode="simd", block_batching_backend_revision="test"))
+    src = types.SimpleNamespace(fn=types.SimpleNamespace(arg_names=["x"]), signature={"x": "*fp32"}, constants={})
+    kernel = batching.compile_bundle(
+        backend, src, {"block_batching_factor": 3}, lambda opts, frozen: env.base
+        if opts["block_batching_factor"] == 1 else env.candidate)
+    assert kernel.candidate is None
+    assert kernel.block_batching["reason"] == "CANDIDATE_LAYOUT_MISMATCH"
+    kernel.run(*env.launch)
+    assert env.launches[-1][0] == "baseline"
+
+
+def test_mask_cannot_hide_its_own_i32_wraparound():
+    lane = ["range", 0, 4, 32]
+    narrow = add(mul(pid(0), const(4, 32), 32), lane, 32)
+    wide = add(mul(["extsi", 64, pid(0)], const(4)), ["extui", 64, lane])
+    specification = {
+        "version":
+        1, "axis":
+        0, "accesses": [
+            {"root": 0, "offset": wide, "mask": ["lt", narrow, arg(2, 32)], "write": False, "bytes": 4},
+            {"root": 1, "offset": wide, "mask": ["lt", narrow, arg(2, 32)], "write": True, "bytes": 4},
+        ]
+    }
+    # In the original domain p=2**29 makes the signed mask index negative.
+    # Proving only the p=0 domain inferred from mask<1 would miss this wrap.
+    values, grid = [1 << 40, 1 << 45, 1], ((1 << 30) + 1, 1, 1)
+    assert check_guard(specification, values, grid, 3) == (False, "INDEX_OVERFLOW")
+    assert guard_module.RuntimeGuard(specification, 3)(values, grid) == (False, "INDEX_OVERFLOW")

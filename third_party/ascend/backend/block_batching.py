@@ -7,6 +7,8 @@ compiler artifacts; rejected or guarded calls select the complete baseline.
 """
 from dataclasses import dataclass
 
+IMPLEMENTATION_VERSION = 14
+
 
 @dataclass(frozen=True)
 class BatchRequest:
@@ -23,15 +25,17 @@ class BatchRequest:
 def analyze_request(mod, request, binding):
     """Read-only preflight. Never suppress legacy optimizations on the baseline."""
     if request.factor == 1:
-        return {"report_version": 1, "compile_status": "DISABLED",
-                "requested_factor": 1, "requested_axis": request.axis,
-                "applied_factor": 1, "owner": "none", "reason": "DISABLED"}
+        return {
+            "report_version": 1, "compile_status": "DISABLED", "requested_factor": 1, "requested_axis": request.axis,
+            "applied_factor": 1, "owner": "none", "reason": "DISABLED"
+        }
     # MLIR shapes and the future native launch contract use signed i32 extents.
     # A positive Python integer outside that capability is not a config error.
     if request.factor > 2147483647:
-        return {"report_version": 1, "compile_status": "REJECTED",
-                "requested_factor": request.factor, "requested_axis": request.axis,
-                "applied_factor": 1, "owner": "none", "reason": "FACTOR_OUT_OF_RANGE"}
+        return {
+            "report_version": 1, "compile_status": "REJECTED", "requested_factor": request.factor, "requested_axis":
+            request.axis, "applied_factor": 1, "owner": "none", "reason": "FACTOR_OUT_OF_RANGE"
+        }
     analyze = getattr(binding, "analyze_block_batching", None)
     if analyze is None:
         raise RuntimeError("block_batching requires a matching rebuilt Ascend C++ extension")
@@ -42,6 +46,59 @@ class BatchingRejected(RuntimeError):
     """A modeled capability/proof rejection, not an internal compiler error."""
 
 
+class LayoutTargetRejected(BatchingRejected):
+    """A resource refusal of an actually rewritten layout at the NPUIR stage."""
+
+    def __init__(self, factor, axis, diagnostic):
+        super().__init__("LAYOUT_TARGET_RESOURCE_REJECTED")
+        self.factor, self.axis = factor, axis
+        self.diagnostic = diagnostic
+        self.stage = "npubin"
+
+
+def _internal_backend_error(returncode, diagnostic):
+    return returncode < 0 or returncode in (134, 139) or any(
+        marker in diagnostic for marker in ("PLEASE submit a bug report", "LLVM ERROR:", "Assertion", "Sanitizer",
+                                            "runtime error:", "failed to verify", "verification failed"))
+
+
+def _layout_resource_refusal(returncode, diagnostic):
+    import re
+    if _internal_backend_error(returncode, diagnostic):
+        return False
+    # Match the standard backend's resource diagnostic, not an arbitrary
+    # occurrence of "UB" and "overflow" in an internal compiler failure.
+    return re.search(r"\bub overflow,\s*requires\s+\d+\s+bits\s+while\s+\d+\s+bits\s+available\b", diagnostic,
+                     re.IGNORECASE) is not None
+
+
+def _compile_layout_candidate(compile_variant, options, frozen, request):
+    from triton.compiler.errors import MLIRCompilationError
+    policy = options.get("block_batching_layout", "auto")
+    try:
+        return compile_variant(dict(options), frozen), None
+    except (LayoutTargetRejected, MLIRCompilationError) as error:
+        cause = error
+        while isinstance(cause, MLIRCompilationError) and cause.__cause__ is not None:
+            cause = cause.__cause__
+        if not isinstance(cause, LayoutTargetRejected):
+            raise
+        if (policy != "auto" or cause.factor != request.factor or cause.axis != request.axis
+                or cause.stage != "npubin"):
+            raise
+        # Re-enter compilation from the SAME frozen frontend source. A distinct
+        # option identity prevents reusing auto IR, metadata or failed attempts.
+        fallback = dict(options, block_batching_layout="semantic_only")
+        detail = {"reason": str(cause), "stage": cause.stage, "diagnostic": cause.diagnostic}
+        import subprocess
+        try:
+            candidate = compile_variant(fallback, frozen)
+        except (BatchingRejected, subprocess.CalledProcessError, MLIRCompilationError) as fallback_error:
+            fallback_error.block_batching_layout_fallback = detail
+            raise
+        return candidate, detail
+
+
 def _runtime_positions(src):
     constants = getattr(src, "constants", {})
     result = []
@@ -49,7 +106,7 @@ def _runtime_positions(src):
         signature = src.signature.get(name, src.signature.get(index))
         if not isinstance(signature, str):
             raise BatchingRejected("NESTED_SIGNATURE_NOT_SUPPORTED")
-        if signature != "constexpr" and (index,) not in constants and index not in constants and name not in constants:
+        if signature != "constexpr" and (index, ) not in constants and index not in constants and name not in constants:
             result.append(index)
     return result
 
@@ -63,6 +120,7 @@ def _capture_state():
 
 class BatchKernel:
     """CompiledKernel-compatible facade selecting a complete variant per call."""
+
     def __init__(self, baseline, candidate, request, report, positions):
         import hashlib
         import json
@@ -78,13 +136,16 @@ class BatchKernel:
         self._ready = False
         self._local = threading.local()
         self.hash = candidate.hash if candidate is not None else hashlib.sha256(
-            f"{baseline.hash}:block_batching:{request.factor}:{request.axis}:2".encode()).hexdigest()
+            f"{baseline.hash}:block_batching:{request.factor}:{request.axis}:{IMPLEMENTATION_VERSION}".encode(
+            )).hexdigest()
         fields = dict(self._primary.metadata._asdict(), block_batching=report)
         self.metadata = namedtuple("BatchKernelMetadata", sorted(fields))(**fields)
         from triton.runtime.cache import get_cache_manager
-        manifest = {"version": 1, "baseline_hash": baseline.hash,
-                    "candidate_hash": candidate.hash if candidate is not None else None,
-                    "request": {"factor": request.factor, "axis": request.axis}, "report": report}
+        manifest = {
+            "version": 1, "baseline_hash": baseline.hash, "candidate_hash":
+            candidate.hash if candidate is not None else None, "request":
+            {"factor": request.factor, "axis": request.axis}, "report": report
+        }
         get_cache_manager(self.hash).put(json.dumps(manifest, sort_keys=True), "block_batching.bundle.json")
 
     def __getattr__(self, name):
@@ -157,27 +218,28 @@ class BatchKernel:
         if accepted:
             axis = self.block_batching["selected_axis"]
             batch_grid[axis] = (grid[axis] + factor - 1) // factor
-        self._local.launch = {"runtime_status": "APPLIED" if accepted else "BASELINE_SELECTED",
-                              "owner": "block_batching" if accepted else "baseline",
-                              "requested_factor": self.request.factor, "applied_factor": factor,
-                              "selected_axis": self.block_batching.get("selected_axis"),
-                              "original_grid": grid, "batch_grid": tuple(batch_grid),
-                              "reason": reason, "plan_id": self.hash}
+        self._local.launch = {
+            "runtime_status": "APPLIED" if accepted else "BASELINE_SELECTED", "owner":
+            "block_batching" if accepted else "baseline", "requested_factor": self.request.factor, "applied_factor":
+            factor, "selected_axis": self.block_batching.get("selected_axis"), "original_grid": grid, "batch_grid":
+            tuple(batch_grid), "reason": reason, "plan_id": self.hash
+        }
         if knobs.ascend.compile_only:
             self._local.launch.update(runtime_status="NOT_LAUNCHED", reason="COMPILE_ONLY")
         return result
 
     def __getitem__(self, grid):
+
         def runner(*args, stream=None):
             from triton import knobs
             from triton.runtime import driver
             self._init_handles()
             if stream is None:
                 stream = driver.active.get_current_stream(driver.active.get_current_device())
-            return self.run(*grid, stream, self.function, self.packed_metadata, None,
-                            knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *args)
-        return runner
+            return self.run(*grid, stream, self.function, self.packed_metadata, None, knobs.runtime.launch_enter_hook,
+                            knobs.runtime.launch_exit_hook, *args)
 
+        return runner
 
 
 def _freeze_source(backend, src, baseline_options, backend_revision):
@@ -193,11 +255,10 @@ def _freeze_source(backend, src, baseline_options, backend_revision):
     context = ir.context()
     ir.load_dialects(context)
     backend.load_dialects(context)
-    module = src.make_ir(backend.target, options, backend.get_codegen_implementation(options),
-                         backend.get_module_map(), context)
+    module = src.make_ir(backend.target, options, backend.get_codegen_implementation(options), backend.get_module_map(),
+                         context)
     text = str(module)
-    fingerprint = hashlib.sha256(
-        (src.hash() + "\n" + backend_revision + "\n" + text).encode()).hexdigest()
+    fingerprint = hashlib.sha256((src.hash() + "\n" + backend_revision + "\n" + text).encode()).hexdigest()
     from triton.runtime.cache import FileCacheManager
     cache = get_cache_manager(fingerprint)
     if type(cache) is not FileCacheManager:
@@ -205,6 +266,7 @@ def _freeze_source(backend, src, baseline_options, backend_revision):
     path = cache.put(text, "block_batching.original.ttir", binary=False)
 
     class FrozenSource(ASTSource):
+
         def __init__(self):
             self.__dict__.update(src.__dict__)
             self.block_batching_source_hash = fingerprint
@@ -219,6 +281,7 @@ def _freeze_source(backend, src, baseline_options, backend_revision):
 
     return FrozenSource()
 
+
 def compile_bundle(backend, src, options, compile_variant):
     import subprocess
     import hashlib
@@ -232,8 +295,10 @@ def compile_bundle(backend, src, options, compile_variant):
     except BatchingRejected as error:
         frozen, freeze_rejection = src, str(error)
     baseline = compile_variant(baseline_options, frozen)
-    report = {"report_version": 1, "compile_status": "REJECTED", "owner": "none",
-              "requested_factor": request.factor, "requested_axis": request.axis, "applied_factor": 1}
+    report = {
+        "report_version": 1, "compile_status": "REJECTED", "owner": "none", "requested_factor": request.factor,
+        "requested_axis": request.axis, "applied_factor": 1
+    }
     candidate, positions = None, []
     try:
         if freeze_rejection:
@@ -248,26 +313,37 @@ def compile_bundle(backend, src, options, compile_variant):
         if not hasattr(src, "fn"):
             raise BatchingRejected("AST_SOURCE_REQUIRED")
         positions = _runtime_positions(src)
-        candidate = compile_variant(dict(options), frozen)
+        candidate, layout_fallback = _compile_layout_candidate(compile_variant, options, frozen, request)
         from .block_batching_report import VALIDATION_POLICY
         native_report = getattr(candidate.metadata, "block_batching", {})
-        if (native_report.get("compile_status") != "COMPILED_GUARDED" or
-                native_report.get("validation_policy") != VALIDATION_POLICY):
+        if (native_report.get("compile_status") != "COMPILED_GUARDED"
+                or native_report.get("validation_policy") != VALIDATION_POLICY):
             raise BatchingRejected("CANDIDATE_VALIDATION_MISSING")
+        if (native_report.get("implementation_version") != IMPLEMENTATION_VERSION
+                or native_report.get("lane_width") != request.factor):
+            raise BatchingRejected("CANDIDATE_LAYOUT_MISMATCH")
         expected = getattr(candidate.metadata, "block_batching_binary_sha256", None)
         if expected != hashlib.sha256(candidate.kernel).hexdigest():
             raise BatchingRejected("CANDIDATE_BINARY_CHANGED")
         report = dict(native_report)
+        if layout_fallback:
+            report["layout"] = dict(report["layout"], requested_policy="auto", selected_policy="semantic_only",
+                                    compile_fallback=layout_fallback)
     except (BatchingRejected, subprocess.CalledProcessError, MLIRCompilationError) as error:
+        if hasattr(error, "block_batching_layout_fallback"):
+            report["layout"] = {
+                "requested_policy": "auto", "selected_policy": "baseline", "compile_fallback":
+                error.block_batching_layout_fallback
+            }
         cause = error
         while isinstance(cause, MLIRCompilationError) and cause.__cause__ is not None:
             cause = cause.__cause__
         if isinstance(cause, BatchingRejected):
             report["reason"] = str(cause)
         elif isinstance(cause, subprocess.CalledProcessError):
-            detail = cause.stderr.decode(errors="replace") if isinstance(cause.stderr, bytes) else str(cause.stderr or "")
-            if (cause.returncode < 0 or cause.returncode in (134, 139) or
-                    any(marker in detail for marker in ("PLEASE submit a bug report", "LLVM ERROR:", "Assertion"))):
+            detail = cause.stderr.decode(
+                errors="replace") if isinstance(cause.stderr, bytes) else str(cause.stderr or "")
+            if _internal_backend_error(cause.returncode, detail):
                 raise
             report.update(reason="BACKEND_COMPILE_REJECTED", backend_returncode=cause.returncode,
                           backend_diagnostic=detail[-16000:])
