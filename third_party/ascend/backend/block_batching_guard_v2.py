@@ -263,6 +263,57 @@ class ByteDomain:
         return start, end, self.access["write"]
 
 
+def check_layout_guards(guard, arguments, grid, factor):
+    """Check emitted wide arithmetic before masks trim any padded batch lane.
+
+    Program coordinates use the physical grid; `grid` leaves still denote the
+    original hidden extents. The original access guard remains responsible for
+    effects/aliases and source-width arithmetic.
+    """
+    layouts = guard.get("layout_checks", [])
+    if not isinstance(layouts, list) or len(layouts) > min(1024, len(guard["accesses"])):
+        raise GuardFailure("INVALID_LAYOUT_GUARD")
+    fields = {
+        "version", "access_id", "axis", "factor", "root", "bytes", "shape", "positive", "checks", "pointer_checks"
+    }
+    seen = set()
+    physical = list(grid)
+    physical[guard["axis"]] = (grid[guard["axis"]] + factor - 1) // factor
+    for layout in layouts:
+        if (not isinstance(layout, dict) or set(layout) != fields or type(layout["version"]) is not int
+                or layout["version"] != 1 or type(layout["axis"]) is not int or layout["axis"] != guard["axis"]
+                or type(layout["factor"]) is not int or layout["factor"] != factor):
+            raise GuardFailure("INVALID_LAYOUT_GUARD")
+        identity = layout["access_id"]
+        root = layout["root"]
+        if (type(identity) is not int or not 0 <= identity < len(guard["accesses"]) or identity in seen
+                or type(root) is not int or root < 0 or root != guard["accesses"][identity]["root"]
+                or type(layout["bytes"]) is not int or layout["bytes"] != guard["accesses"][identity]["bytes"]):
+            raise GuardFailure("INVALID_LAYOUT_GUARD")
+        seen.add(identity)
+        for key, minimum, maximum in (("positive", 1, 1), ("checks", 1, 16), ("pointer_checks", 2, 2)):
+            if not isinstance(layout[key], list) or not minimum <= len(layout[key]) <= maximum:
+                raise GuardFailure("INVALID_LAYOUT_GUARD")
+        if not isinstance(layout["shape"], list) or not layout["shape"]:
+            raise GuardFailure("INVALID_LAYOUT_GUARD")
+        domain = ByteDomain(arguments, grid, {"shape": layout["shape"]})
+        domain.full = (*physical, *domain.shape)
+        for expr in layout["positive"]:
+            value = domain.expression(expr)
+            if not value.uniform or value.offset <= 0:
+                raise GuardFailure("NON_POSITIVE_LAYOUT_STRIDE")
+        for expr in layout["checks"]:
+            domain.expression(expr)
+        pointers = [domain.expression(expr) for expr in layout["pointer_checks"]]
+        for value, bits in domain.checks:
+            checked(*domain.bounds(value, domain.full), bits)
+        value = arguments[root]
+        pointer = integer(value.data_ptr()) if hasattr(value, "data_ptr") else integer(value)
+        for expr in pointers:
+            lo, hi = domain.bounds(expr, domain.full)
+            checked(pointer + lo, pointer + hi + layout["bytes"] - 1, 64, unsigned=True)
+
+
 def check_guard_v2(guard, arguments, grid, factor):
     try:
         if type(guard.get("version")) is not int or guard["version"] != 2 or not guard.get("accesses"):
@@ -289,6 +340,7 @@ def check_guard_v2(guard, arguments, grid, factor):
             result = ByteDomain(arguments, grid, access).interval(pointer)
             if result is not None:
                 ranges.append(result)
+        check_layout_guards(guard, arguments, grid, factor)
         for i, (lo, hi, write) in enumerate(ranges):
             for a, b, other_write in ranges[:i]:
                 if (write or other_write) and lo < b and a < hi:

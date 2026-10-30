@@ -6,10 +6,83 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/FormatVariadic.h"
 #include <functional>
 namespace mlir::triton::cfg {
 namespace {
 using K = BatchExpr;
+bool isConstant(BatchExprRef expression, int64_t value) {
+  return expression && expression->kind == K::Constant &&
+         expression->value == value;
+}
+
+// Describe the newly emitted wide arithmetic over the FULL physical tile,
+// including inactive lanes. The source guard cannot authorize these new
+// intermediates. Only actually rewritten plans publish this extra guard.
+std::string layoutRuntimeGuard(const BatchLayoutPlan &plan,
+                               const BatchAccessFact &fact,
+                               ArrayRef<int64_t> targetShape,
+                               ArrayRef<int64_t> coordinateMap,
+                               unsigned fusedTarget, int axis, int64_t factor) {
+  using E = BatchExprRef;
+  auto constant = [](int64_t n) { return K::leaf(K::Constant, n, 64); };
+  auto add = [](E a, E b) { return K::node(K::Add, 64, a, b); };
+  auto mul = [](E a, E b) { return K::node(K::Mul, 64, a, b); };
+  E base =
+      mul(K::leaf(K::Program, axis, 32), constant(factor * plan.tileExtent));
+  E range = K::leaf(K::Coordinate, fusedTarget, 32, targetShape[fusedTarget]);
+  E logicalBase = plan.origin ? add(base, constant(plan.origin)) : base;
+  E endpoint = mul(K::leaf(K::Grid, axis, 32), constant(plan.tileExtent));
+  if (plan.origin)
+    endpoint = add(endpoint, constant(plan.origin));
+  E offsetBase = base, offset = range;
+  if (!isConstant(plan.elementStride, 1)) {
+    offsetBase = mul(offsetBase, plan.elementStride);
+    offset = mul(offset, plan.elementStride);
+  }
+  if (!isConstant(plan.elementOrigin, 0))
+    offsetBase = add(offsetBase, plan.elementOrigin);
+  for (const auto &term : plan.restTerms) {
+    E value;
+    bool tensor = term.kind == K::Coordinate;
+    if (tensor) {
+      int64_t id = coordinateMap[term.id];
+      value = K::leaf(K::Coordinate, id, 32, targetShape[id]);
+    } else
+      value = K::leaf(term.kind, term.id, 32);
+    if (!isConstant(term.coefficient, 1))
+      value = mul(value, term.coefficient);
+    if (tensor)
+      offset = add(offset, value);
+    else
+      offsetBase = add(offsetBase, value);
+  }
+  E byteBase = mul(offsetBase, constant(fact.bytes));
+  E byteOffset = mul(add(offsetBase, offset), constant(fact.bytes));
+  llvm::json::Array shape, checks;
+  for (int64_t n : targetShape)
+    shape.push_back(n);
+  for (E expression : {logicalBase, add(logicalBase, range), endpoint,
+                       K::node(K::MinSI, 64, plan.upper, endpoint), offsetBase,
+                       offset, byteBase, byteOffset})
+    checks.push_back(batchExprJSON(expression));
+  return llvm::formatv(
+             "{0}", llvm::json::Value(llvm::json::Object{
+                        {"version", 1},
+                        {"axis", axis},
+                        {"factor", factor},
+                        {"access_id", plan.accessID},
+                        {"root", fact.root},
+                        {"bytes", fact.bytes},
+                        {"shape", std::move(shape)},
+                        {"positive",
+                         llvm::json::Array{batchExprJSON(plan.elementStride)}},
+                        {"checks", std::move(checks)},
+                        {"pointer_checks",
+                         llvm::json::Array{batchExprJSON(byteBase),
+                                           batchExprJSON(byteOffset)}}}))
+      .str();
+}
 // Upper bounds must remain scalar. Rebuild only exact signed arithmetic
 // already covered by the original guard, never an unmodeled predicate.
 bool supportedUpper(BatchExprRef e) {
@@ -423,22 +496,22 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
       mask =
           rewriter.create<arith::AndIOp>(e.loc, mask, e.predicate(predicate));
     Value offsetBase = base, offsetRange = t;
-    if (plan.elementStride != 1) {
-      offsetBase = rewriter.create<arith::MulIOp>(
-          e.loc, offsetBase, e.constant(plan.elementStride));
-      offsetRange = rewriter.create<arith::MulIOp>(
-          e.loc, offsetRange, e.splat(e.constant(plan.elementStride)));
+    if (!isConstant(plan.elementStride, 1)) {
+      Value stride = e.upper(plan.elementStride);
+      offsetBase = rewriter.create<arith::MulIOp>(e.loc, offsetBase, stride);
+      offsetRange =
+          rewriter.create<arith::MulIOp>(e.loc, offsetRange, e.splat(stride));
     }
-    if (plan.elementOrigin)
-      offsetBase = rewriter.create<arith::AddIOp>(
-          e.loc, offsetBase, e.constant(plan.elementOrigin));
+    if (!isConstant(plan.elementOrigin, 0))
+      offsetBase = rewriter.create<arith::AddIOp>(e.loc, offsetBase,
+                                                  e.upper(plan.elementOrigin));
     Value offset = offsetRange;
     for (const auto &term : plan.restTerms) {
       Value value = e.expression(K::leaf(term.kind, term.id, 32));
-      Value scale = e.constant(term.coefficient);
+      Value scale = e.upper(term.coefficient);
       if (isa<RankedTensorType>(value.getType()))
         scale = e.splat(scale);
-      if (term.coefficient != 1)
+      if (!isConstant(term.coefficient, 1))
         value = rewriter.create<arith::MulIOp>(e.loc, value, scale);
       if (isa<RankedTensorType>(value.getType()))
         offset = rewriter.create<arith::AddIOp>(e.loc, offset, value);
@@ -496,6 +569,9 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
                                        store.getCache(), store.getEvict());
       rewriter.eraseOp(op);
     }
+    if (plan.symbolic)
+      plan.runtimeGuardJSON = layoutRuntimeGuard(
+          plan, fact, targetShape, coordinateMap, fusedTarget, axis, factor);
     plan.rewritten = true;
     changed = true;
   }

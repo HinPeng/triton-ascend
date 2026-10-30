@@ -714,6 +714,27 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
     return failure();
   report.layoutJSON = serializeBatchLayouts(layouts);
   report.status = "REWRITTEN";
+  llvm::json::Array layoutChecks;
+  for (const auto &plan : layouts)
+    if (plan.rewritten && !plan.runtimeGuardJSON.empty()) {
+      auto parsed = llvm::json::parse(plan.runtimeGuardJSON);
+      if (!parsed) {
+        llvm::consumeError(parsed.takeError());
+        return module.emitError("invalid generated layout guard"), failure();
+      }
+      layoutChecks.push_back(std::move(*parsed));
+    }
+  if (!layoutChecks.empty()) {
+    auto parsed = llvm::json::parse(report.guardJSON);
+    if (!parsed) {
+      llvm::consumeError(parsed.takeError());
+      return module.emitError("invalid original access guard"), failure();
+    }
+    if (!parsed->getAsObject())
+      return module.emitError("invalid original access guard"), failure();
+    (*parsed->getAsObject())["layout_checks"] = std::move(layoutChecks);
+    report.guardJSON = llvm::formatv("{0}", *parsed).str();
+  }
   report.reason = "";
   return report;
 }

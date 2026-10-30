@@ -3,10 +3,11 @@
 #define TRITON_TO_GRAPH_BLOCK_BATCHING_LAYOUT_PLAN_H
 #include "TritonToGraph/BlockBatching/BatchAccessAnalysis.h"
 namespace mlir::triton::cfg {
-inline constexpr unsigned kBatchLayoutPlannerVersion = 1;
+inline constexpr unsigned kBatchLayoutPlannerVersion = 2;
 struct BatchLayoutTerm {
   BatchExpr::Kind kind;
-  int64_t id, coefficient;
+  int64_t id;
+  BatchExprRef coefficient;
 };
 struct BatchLayoutPlan {
   enum Action { Keep, MemoryView, PointwiseRegion };
@@ -15,7 +16,11 @@ struct BatchLayoutPlan {
   int gridAxis = -1;
   SmallVector<int64_t> localAxes, shape;
   int64_t tileExtent = 0, origin = 0;
-  int64_t elementOrigin = 0, elementStride = 0;
+  // Uniform integer expressions, independent of all program/local coordinates.
+  // Owned DAGs survive the original IR, unlike an MLIR Value captured here.
+  BatchExprRef elementOrigin, elementStride;
+  bool symbolic = false;
+  std::string runtimeGuardJSON;
   bool linearMemoryView = false;
   SmallVector<BatchLayoutTerm> restTerms;
   SmallVector<BatchExprRef> residualMasks;

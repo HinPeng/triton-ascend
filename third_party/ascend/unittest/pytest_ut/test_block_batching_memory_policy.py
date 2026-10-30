@@ -29,7 +29,7 @@ def test_memory_policies_survive_semantic_and_layout_rewrite(tmp_path, layout, l
     module = parse(tmp_path, source)
     report = ascend.passes.ttir.rewrite_block_batching(module, 3, 0, layout)
     assert report["compile_status"] == "REWRITTEN", report
-    assert report["implementation_version"] == 14
+    assert report["implementation_version"] == 15
     assert module.verify()
     text = str(module)
     loads = [line for line in text.splitlines() if " = tt.load " in line]

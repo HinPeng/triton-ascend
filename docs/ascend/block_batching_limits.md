@@ -1,6 +1,8 @@
 # Block batching 当前能力与限制
 
-实现版本 14：通用SeededReduceConverter已移除；644个独立native、29个设备用例通过，原后端maxnum全NaN参考问题单列为1个strict XFAIL。性能结果另见本轮任务报告。版本13历史结果：本次属性增量已在 A5-37 / torch-271 验证：643项native、27项设备用例、5个Liger kernel各F=2/3共10个实际合并候选；设备使用taskqueue=1，下文既有双任务队列结果仍属于版本12。固定 factor 的资源可行性由标准后端编译判断；保留运行时 guard、完整 baseline 回退及 binary/ABI/缓存一致性。仅在 Triton-Ascend 实现，不依赖定制 NPUIR 补丁或资源报告。
+实现版本 15，布局规划版本 2：新增受限参数化地址分析与动态行 stride 的 MemoryView；符号关系在编译期证明，新增地址运算与正 stride 条件在运行时检查。候选身份随版本更新；不需要将 stride 特化为具体值。
+
+版本14历史：通用SeededReduceConverter已移除；644个独立native、29个设备用例通过，原后端maxnum全NaN参考问题单列为1个strict XFAIL。性能结果另见本轮任务报告。版本13历史结果：本次属性增量已在 A5-37 / torch-271 验证：643项native、27项设备用例、5个Liger kernel各F=2/3共10个实际合并候选；设备使用taskqueue=1，下文既有双任务队列结果仍属于版本12。固定 factor 的资源可行性由标准后端编译判断；保留运行时 guard、完整 baseline 回退及 binary/ABI/缓存一致性。仅在 Triton-Ascend 实现，不依赖定制 NPUIR 补丁或资源报告。
 
 - **地址表达式中的除法暂不支持。** `arith.divsi` 等整数除法在逐元素计算中已有 Basic 模型，但不能因此用于地址证明。当前地址摘要/guard 只接收已建模的仿射运算及转换；例如 `row = offset / n_cols` 用于 load 地址时，返回 `UNSUPPORTED_ADDRESS_EXPRESSION` 并使用完整 baseline。该限制本版保留。
 - **新增 i8 为受限字节数据闭包。** 允许常量、普通 load/store、cmp/select、已支持的 shape 操作及 byte-pointer 地址计算；不开放一般 i8 算术、转换、归约、scalar i8 host ABI 或 inttoptr。标准 bool 读取仅接受 `ptr<i1>→ptr<i8>` 后直接带 `was_bool_to_int8=true` 的 load，按该规范化链的一个存储字节解释地址，保留属性。未标记的任意 i1 访存布局仍拒绝。
@@ -29,11 +31,21 @@
 F>1 默认使用 `block_batching_layout="auto"`；`semantic_only` 保留统一前置 F 的语义表示，用于同构建对照和一次编译期降级。F=1 归一为关闭，不进入布局规划。策略和实现版本参与缓存身份，logical lane_width 仍为 F，原 grid、pid/num_programs 与完整 baseline 不变。
 
 - 从带边界的原始逻辑坐标绑定方向，再证明每访问的字节 stride 链。不会仅因两个轴 stride 相等而跨方向合并。方向不明、孔洞 mask、未知转换或超过分析预算时 KEEP。
-- 支持一维线性前缀、静态 stride 的二维行视图，以及由单一原始 range 经有序 reshape 得到的同方向分解轴。生成 `index < min(N, origin + G*B)`，保留不足/过量 grid、两类尾部、非零逻辑起点、load other 和计算分组；不要求 N=G*B。原 scalar signed min/max/clamp 上界由同一 guard 精确求值，原地址中的 min/div 等未建模表达式仍不因此放开。
-- 列方向仅传播通过验证的单基本块逐元素闭包，直接生成目标布局，不插入大转置再假设它会消失。统一 scalar 计算保持原域；共享/每 lane 小域值、reduce/scan、控制流或非兼容接口需要桥接时，本版保守 KEEP。二维/三维有限覆盖不等于任意 rank/encoding 支持；动态地址 stride 的符号消去尚未覆盖。
-- load/store 独立证明后以有序 view 恢复语义形状。RMSNorm 的 X/Y、共享 W、独立行标量继续分别 KEEP，无 kernel 名称特判。
+- 支持一维线性前缀、静态 stride 的二维行视图，受支持的动态 stride 领先行轴视图，以及由单一原始 range 经有序 reshape 得到的同方向分解轴。生成 `index < min(N, origin + G*B)`，保留不足/过量 grid、两类尾部、非零逻辑起点、load other 和计算分组；不要求 N=G*B。原 scalar signed min/max/clamp 上界由同一 guard 精确求值，原地址中的 min/div 等未建模表达式仍不因此放开。
+- 列方向仅传播通过验证的单基本块逐元素闭包，直接生成目标布局，不插入大转置再假设它会消失。统一 scalar 计算保持原域；共享/每 lane 小域值、reduce/scan、控制流或非兼容接口需要桥接时，本版保守 KEEP。二维/三维有限覆盖不等于任意 rank/encoding 支持；符号 stride 的列方向桥接仍返回 SYMBOLIC_LAYOUT_BRIDGE_UNSUPPORTED。
+- load/store 独立证明后以有序 view 恢复语义形状。单行 RMSNorm 的已结构化 X/Y 与共享 W 继续 KEEP；多行 block RMSNorm 的动态 X/Y 行 stride 可在证明后使用 MemoryView，W 保持共享，各访问独立规划，无 kernel 名称特判。
 - 只有实际采用新布局且标准 NPUIR 明确报告 UB 资源拒绝时，才从同一 frozen source、相同 F/axis 以 `semantic_only` 重编一次。该候选也失败则保留完整 baseline；内部 verifier、断言、崩溃和未知错误不借布局重试掩盖。首版不缓存失败尝试的负结果。
 - metadata 的 `layout` 报告每访问的计划、来源、轴组、应用状态、桥接方式，以及整个 TA adapter 的 indirect/copy/transpose 观察计数。模块级计数不是逐访问归因，也不因合法内部 SIMT 统一拒绝候选。
+
+## 参数化地址与动态 stride（版本15）
+
+- 将程序/局部坐标与uniform标量参数分开：地址表示为参数化偏移加各坐标乘参数化系数。首批标量系数支持i32/i64参数、常量、加减与常数倍；有界规范化不调用通用求解器，不支持参数乘参数、未证明的截断或坐标乘坐标。
+- 在原方向绑定之后证明 `coef(pid)=tileExtent*coef(local)`。例如 `(pid*M+r)*S+c` 对任意受guard接受的正S均能保持该关系；X/Y可采用不同的动态stride。独立参数之间需要额外等式条件的布局（例如P与M*S）仍KEEP，本版不生成这种关系的条件特化。
+- 首批动态布局仅限已支持的领先行轴组、rank≤3、无循环的访存view；非合并轴的动态系数、复杂列方向桥接仍KEEP。共享值、计算域、reduce/scan分组、load other和访存属性不因布局改写扩大。
+- 新pointer保留scalar基址，以动态stride缩放局部range；mask在一维完成比较后再广播，保留 `min(N, origin+G*B)`。load后保序恢复语义形状，store的值按相同映射折叠。
+- 实际改写的符号布局在原v2 guard上追加版本1的 `layout_checks`。原guard继续检查源表达式位宽、内存效果和别名；附加guard检查正stride、新增宽整数/字节运算与指针范围，覆盖补齐的inactive lane。程序坐标使用合并后的grid，`grid`表达式仍读取原始hidden extents。不得用mask掩盖新增算术溢出。
+- guard缓存包含原访问及新增布局检查的标量依赖；stride/边界/地址/grid变化重新验证。新增guard失败选择完整baseline。`semantic_only`不附加未实际应用布局的guard；编译期KEEP也不携带这些条件。
+- 每访问报告增加 `symbolic_stride`、`element_stride` 与 `original_and_layout_runtime_guard` 证明范围。符号恒等式成功记为 PROVEN_SYMBOLIC_STRIDE_CHAIN。read-only分析报告不能授权执行；实际重写、标准后端编译和runtime guard仍分别确认。
 
 ## 任务队列配置
 

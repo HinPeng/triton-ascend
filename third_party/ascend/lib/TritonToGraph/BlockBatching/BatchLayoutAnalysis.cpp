@@ -5,6 +5,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <map>
 #include <optional>
+#include <tuple>
 namespace mlir::triton::cfg {
 namespace {
 using E = BatchExprRef;
@@ -60,6 +61,138 @@ std::optional<Linear> linear(E e, unsigned &budget) {
     if (llvm::AddOverflow(a->terms[key], value, a->terms[key]))
       return std::nullopt;
   return a;
+}
+
+// Parameter-affine addresses: coordinates vary inside the batch; scalar
+// arguments/grid extents are uniform parameters of their coefficients. Keep
+// scalar algebra bounded to affine parameter expressions (no parameter products
+// or solver). This proves (p*M+r)*S structurally without specializing S.
+struct Scalar {
+  using Atom = std::tuple<K::Kind, int64_t, unsigned>;
+  int64_t constant = 0;
+  std::map<Atom, int64_t> parameters;
+  bool isZero() const { return constant == 0 && parameters.empty(); }
+  bool operator==(const Scalar &other) const {
+    return constant == other.constant && parameters == other.parameters;
+  }
+  bool addScaled(const Scalar &other, int64_t scale) {
+    int64_t value;
+    if (llvm::MulOverflow(other.constant, scale, value) ||
+        llvm::AddOverflow(constant, value, constant))
+      return false;
+    for (auto [atom, coefficient] : other.parameters) {
+      if (llvm::MulOverflow(coefficient, scale, value) ||
+          llvm::AddOverflow(parameters[atom], value, parameters[atom]))
+        return false;
+      if (!parameters[atom])
+        parameters.erase(atom);
+    }
+    return parameters.size() <= 32;
+  }
+  std::optional<Scalar> multiply(const Scalar &other) const {
+    if (!parameters.empty() && !other.parameters.empty())
+      return std::nullopt;
+    Scalar result;
+    bool ok = parameters.empty() ? result.addScaled(other, constant)
+                                 : result.addScaled(*this, other.constant);
+    return ok ? std::optional<Scalar>(result) : std::nullopt;
+  }
+  std::optional<Scalar> divide(int64_t divisor) const {
+    if (constant % divisor)
+      return std::nullopt;
+    Scalar result{constant / divisor, {}};
+    for (auto [atom, coefficient] : parameters) {
+      if (coefficient % divisor)
+        return std::nullopt;
+      result.parameters[atom] = coefficient / divisor;
+    }
+    return result;
+  }
+  E expression() const {
+    E result = K::leaf(K::Constant, constant, 64);
+    for (auto [atom, coefficient] : parameters) {
+      auto [kind, id, bits] = atom;
+      E term = K::leaf(kind, id, bits);
+      if (bits != 64)
+        term = K::node(K::ExtSI, 64, term, {}, bits);
+      if (coefficient != 1)
+        term = K::node(K::Mul, 64, term, K::leaf(K::Constant, coefficient, 64));
+      if (result->kind == K::Constant && result->value == 0)
+        result = term;
+      else
+        result = K::node(K::Add, 64, result, term);
+    }
+    return result;
+  }
+};
+struct ParameterAffine {
+  Scalar offset;
+  std::map<Key, Scalar> terms;
+  bool symbolic() const {
+    return !offset.parameters.empty() ||
+           llvm::any_of(terms, [](const auto &term) {
+             return !term.second.parameters.empty();
+           });
+  }
+};
+std::optional<ParameterAffine> parameterAffine(E e, unsigned &budget) {
+  if (!e || !budget)
+    return std::nullopt;
+  --budget;
+  if (e->kind == K::Constant)
+    return ParameterAffine{Scalar{e->value, {}}, {}};
+  if (e->kind == K::Argument) {
+    if (e->bits != 32 && e->bits != 64)
+      return std::nullopt;
+    Scalar value;
+    value.parameters[{e->kind, e->value, e->bits}] = 1;
+    return ParameterAffine{value, {}};
+  }
+  if (e->kind == K::Coordinate || e->kind == K::Program || e->kind == K::Grid) {
+    ParameterAffine value;
+    value.terms[{e->kind, e->value}] = Scalar{1, {}};
+    return value;
+  }
+  if (e->kind == K::ExtSI)
+    return parameterAffine(e->lhs, budget);
+  if (e->kind != K::Add && e->kind != K::Sub && e->kind != K::Mul)
+    return std::nullopt;
+  auto a = parameterAffine(e->lhs, budget);
+  auto b = parameterAffine(e->rhs, budget);
+  if (!a || !b)
+    return std::nullopt;
+  if (e->kind == K::Mul) {
+    if (!a->terms.empty() && !b->terms.empty())
+      return std::nullopt;
+    if (b->terms.empty())
+      std::swap(a, b);
+    auto offset = b->offset.multiply(a->offset);
+    if (!offset)
+      return std::nullopt;
+    b->offset = *offset;
+    for (auto &[key, coefficient] : b->terms) {
+      auto product = coefficient.multiply(a->offset);
+      if (!product)
+        return std::nullopt;
+      coefficient = *product;
+    }
+    for (auto it = b->terms.begin(); it != b->terms.end();)
+      if (it->second.isZero())
+        it = b->terms.erase(it);
+      else
+        ++it;
+    return b;
+  }
+  int64_t sign = e->kind == K::Sub ? -1 : 1;
+  if (!a->offset.addScaled(b->offset, sign))
+    return std::nullopt;
+  for (const auto &[key, coefficient] : b->terms) {
+    if (!a->terms[key].addScaled(coefficient, sign))
+      return std::nullopt;
+    if (a->terms[key].isZero())
+      a->terms.erase(key);
+  }
+  return a->terms.size() <= 32 ? a : std::nullopt;
 }
 bool contains(E e, K::Kind kind, int64_t id = -1) {
   if (!e)
@@ -170,23 +303,23 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
     } else if (bound && !unknown) {
       // Direction is established above. Check the byte-stride chain only now.
       unsigned budget = 512;
-      auto address = linear(fact.byteOffset, budget);
+      auto address = parameterAffine(fact.byteOffset, budget);
       bool strides = bool(address);
       if (address) {
         int64_t weight = 1;
-        int64_t stride = address->terms[{K::Coordinate, plan.localAxes.back()}];
-        strides = stride > 0;
+        Scalar stride = address->terms[{K::Coordinate, plan.localAxes.back()}];
+        // Positive dynamic stride is checked at launch, never sampled here.
+        strides = !stride.parameters.empty() || stride.constant > 0;
         for (int64_t local : llvm::reverse(plan.localAxes)) {
-          int64_t expected;
-          if (llvm::MulOverflow(weight, stride, expected) ||
-              address->terms[{K::Coordinate, local}] != expected)
+          auto expected = stride.multiply(Scalar{weight, {}});
+          if (!expected ||
+              !(address->terms[{K::Coordinate, local}] == *expected))
             strides = false;
           if (llvm::MulOverflow(weight, fact.shape[local], weight))
             strides = false;
         }
-        int64_t expected;
-        if (llvm::MulOverflow(weight, stride, expected) ||
-            address->terms[{K::Program, axis}] != expected)
+        auto expected = stride.multiply(Scalar{weight, {}});
+        if (!expected || !(address->terms[{K::Program, axis}] == *expected))
           strides = false;
       }
       bool extraMask = false;
@@ -223,44 +356,73 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
             fact.shape.size() == 2 && plan.localAxes == SmallVector<int64_t>{1};
         bool simple = (leading || columnRegion) && fact.shape.size() <= 3 &&
                       fact.loops.empty();
-        simple &= address->constant % fact.bytes == 0;
-        int64_t stride = address->terms[{K::Coordinate, plan.localAxes.back()}];
-        simple &= stride % fact.bytes == 0;
-        plan.elementOrigin = address->constant / fact.bytes;
-        plan.elementStride = stride / fact.bytes;
+        auto origin = address->offset.divide(fact.bytes);
+        auto stride =
+            address->terms[{K::Coordinate, plan.localAxes.back()}].divide(
+                fact.bytes);
+        if (!origin || !stride) {
+          plan.action = BatchLayoutPlan::Keep;
+          plan.reason = "NON_ELEMENT_ALIGNED_LAYOUT";
+          plans.push_back(std::move(plan));
+          continue;
+        }
+        plan.symbolic = address->symbolic();
+        plan.elementOrigin = origin->expression();
+        plan.elementStride = stride->expression();
+        // First symbolic emitter supports leading (row) groups only. Column
+        // region propagation remains on the previously verified constant path.
+        if (plan.symbolic && !leading) {
+          plan.action = BatchLayoutPlan::Keep;
+          plan.reason = "SYMBOLIC_LAYOUT_BRIDGE_UNSUPPORTED";
+          plans.push_back(std::move(plan));
+          continue;
+        }
         __int128 maxCoordinate =
             (__int128(INT32_MAX) + factor) * plan.tileExtent;
-        __int128 magnitude = maxCoordinate * plan.elementStride;
-        magnitude += plan.elementOrigin < 0 ? -__int128(plan.elementOrigin)
-                                            : plan.elementOrigin;
-        for (auto [key, coefficient] : address->terms) {
-          if (!coefficient || key == Key{K::Program, axis} ||
+        __int128 magnitude = maxCoordinate * stride->constant;
+        magnitude += origin->constant < 0 ? -__int128(origin->constant)
+                                          : origin->constant;
+        for (const auto &[key, coefficient] : address->terms) {
+          if (coefficient.isZero() || key == Key{K::Program, axis} ||
               (key.first == K::Coordinate &&
                llvm::is_contained(plan.localAxes, key.second)))
             continue;
-          if (coefficient % fact.bytes)
+          auto scaled = coefficient.divide(fact.bytes);
+          if (!scaled) {
             simple = false;
-          // The first row emitter supports original program/coordinate axes.
-          // Dynamic address arguments require symbolic-stride planning.
+            continue;
+          }
           if (key.first != K::Coordinate && key.first != K::Program &&
               key.first != K::Grid)
             simple = false;
-          int64_t c = coefficient / fact.bytes;
-          plan.restTerms.push_back({key.first, key.second, c});
+          // Defer nonfused dynamic strides until their target lowering has a
+          // dedicated contract; this slice is the dynamic row-stride model.
+          if (!scaled->parameters.empty())
+            simple = false;
+          int64_t c = scaled->constant;
+          plan.restTerms.push_back(
+              {key.first, key.second, scaled->expression()});
           magnitude += (__int128(INT32_MAX) + 1) * (c < 0 ? -__int128(c) : c);
         }
         for (auto predicate : predicates)
           if (predicate->lhs != plan.coordinate || predicate->rhs != plan.upper)
             plan.residualMasks.push_back(predicate);
         __int128 maxIndex = maxCoordinate + plan.origin;
-        bool endpoints = magnitude * fact.bytes <= INT64_MAX &&
-                         maxIndex <= INT64_MAX && maxIndex >= INT64_MIN;
+        bool endpoints =
+            (plan.symbolic || magnitude * fact.bytes <= INT64_MAX) &&
+            maxIndex <= INT64_MAX && maxIndex >= INT64_MIN;
         simple &= endpoints;
         if (!endpoints) {
           plan.action = BatchLayoutPlan::Keep;
           plan.reason = "NEW_BYTE_ENDPOINT_UNPROVEN";
         }
         plan.linearMemoryView = simple;
+        if (simple && plan.symbolic)
+          plan.reason = "PROVEN_SYMBOLIC_STRIDE_CHAIN";
+        else if (plan.symbolic && !simple && endpoints) {
+          plan.action = BatchLayoutPlan::Keep;
+          plan.reason = "SYMBOLIC_LAYOUT_BRIDGE_UNSUPPORTED";
+        }
       }
     } else if (unknown)
       plan.reason = "MASK_NOT_INTERVAL_OR_RECTANGLE";
@@ -297,7 +459,10 @@ std::string serializeBatchLayouts(ArrayRef<BatchLayoutPlan> plans) {
                        : "ordered_view"},
         {"expected_memory_form",
          plan.rewritten ? "strided_block_candidate" : "semantic"},
-        {"proof_scope", "existing_guard_no_wrap"}});
+        {"symbolic_stride", plan.symbolic},
+        {"element_stride", batchExprJSON(plan.elementStride)},
+        {"proof_scope", plan.symbolic ? "original_and_layout_runtime_guard"
+                                      : "existing_guard_no_wrap"}});
   }
   return llvm::formatv("{0}",
                        llvm::json::Value(llvm::json::Object{

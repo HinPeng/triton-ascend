@@ -248,6 +248,10 @@ class RuntimeGuard:
             for loop in access.get("loops", ()):
                 for field in ("lower", "upper", "step"):
                     visit(loop[field])
+        for layout in specification.get("layout_checks", ()):
+            for field in ("positive", "checks", "pointer_checks"):
+                for expression in layout[field]:
+                    visit(expression)
         self._indices = indices = tuple(sorted(dependencies))
 
         @lru_cache(maxsize=64)

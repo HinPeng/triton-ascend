@@ -36,7 +36,7 @@ def test_registered_elementwise_combinations(tmp_path, op, factor, variant):
     module = parse(tmp_path, case_ir(op, variant))
     report = ascend.passes.ttir.rewrite_block_batching(module, factor, 0)
     assert report["compile_status"] == "REWRITTEN", report
-    assert report["implementation_version"] == 14
+    assert report["implementation_version"] == 15
     assert report["lane_width"] == factor
     assert report["operations"][op] >= 1
     assert module.verify()

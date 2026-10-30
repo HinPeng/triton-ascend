@@ -21,7 +21,7 @@ def analyze(tmp_path, text, factor=3, axis=0):
     assert module.verify()
     assert result["compile_status"] == "ANALYZED", result
     layout = json.loads(result["layout_json"])
-    assert layout["planner_version"] == 1
+    assert layout["planner_version"] == 2
     assert not any(row["rewritten"] for row in layout["accesses"])
     return layout["accesses"]
 
@@ -64,9 +64,9 @@ def test_per_use_projection_of_reused_range(tmp_path):
     assert all(row["local_axes"] == [1] and row["action"] == "PointwiseRegion" for row in rows)
 
 
-def test_dynamic_stride_is_not_sampled(tmp_path):
+def test_dynamic_stride_is_proven_symbolically(tmp_path):
     rows = analyze(tmp_path, memory_ir("nd_reused_range"))
-    assert all(row["action"] == "Keep" and row["reason"] == "STRIDE_CHAIN_UNPROVEN" for row in rows)
+    assert all(row["action"] == "MemoryView" and row["reason"] == "PROVEN_SYMBOLIC_STRIDE_CHAIN" for row in rows)
 
 
 def test_rectangular_row_and_shared_column_keep(tmp_path):
