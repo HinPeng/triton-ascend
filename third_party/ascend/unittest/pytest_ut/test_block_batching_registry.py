@@ -71,4 +71,4 @@ def test_native_manifest_matches_admission_catalog():
     for row in native:
         expected = entries[row["op_name"]]
         assert all(row[key] == value for key, value in expected.items())
-        assert row["implementation_version"] == 15
+        assert row["implementation_version"] == 17

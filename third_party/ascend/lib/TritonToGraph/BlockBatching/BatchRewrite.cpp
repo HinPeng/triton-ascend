@@ -99,6 +99,28 @@ bool attrsSupported(Operation *op) {
   const auto *descriptor = lookupBatchOp(op->getName().getStringRef());
   return descriptor && succeeded(verifyBatchAttributes(op, *descriptor));
 }
+
+// axis=None reductions flatten even rank-one inputs with allow_reorder.
+// Choosing identity is legal; carrying that permission into the lifted type
+// would instead permit permutations across independent program lanes.
+void normalizeIdentityReductionReshapes(triton::FuncOp function) {
+  SmallVector<triton::ReshapeOp> identities;
+  function.walk([&](triton::ReshapeOp reshape) {
+    auto type = dyn_cast<RankedTensorType>(reshape.getType());
+    if (!type || type.getRank() != 1 || type.getEncoding() ||
+        !type.hasStaticShape() || type != reshape.getSrc().getType() ||
+        !reshape.getAllowReorder() || reshape->hasAttr("efficient_layout") ||
+        !attrsSupported(reshape) || !reshape->hasOneUse())
+      return;
+    auto reduce = dyn_cast<triton::ReduceOp>(*reshape->getUsers().begin());
+    if (reduce && reduce.getAxis() == 0)
+      identities.push_back(reshape);
+  });
+  for (auto reshape : identities) {
+    reshape.getResult().replaceAllUsesWith(reshape.getSrc());
+    reshape.erase();
+  }
+}
 } // namespace
 
 static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
@@ -149,6 +171,7 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   std::string normalizationReason;
   if (failed(normalizeBatchMemory(module, diagnosticOp, normalizationReason)))
     return reject(normalizationReason);
+  normalizeIdentityReductionReshapes(function);
   auto &block = function.getBody().front();
   SmallVector<Operation *> originals;
   bool axes[3] = {};

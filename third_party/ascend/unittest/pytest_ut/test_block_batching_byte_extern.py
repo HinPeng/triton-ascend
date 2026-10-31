@@ -30,7 +30,7 @@ def test_new_subsets_keep_lane_mapping_and_memory_contract(tmp_path, kind, facto
     module = parse(tmp_path, case_ir(kind))
     report = ascend.passes.ttir.rewrite_block_batching(module, factor, 0)
     assert report["compile_status"] == "REWRITTEN", report
-    assert report["implementation_version"] == 15
+    assert report["implementation_version"] == 17
     assert module.verify()
     text = str(module)
     assert f"tensor<{factor}x8xf32>" in text

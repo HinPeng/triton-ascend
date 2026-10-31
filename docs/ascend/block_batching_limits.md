@@ -55,3 +55,11 @@ F>1 默认使用 `block_batching_layout="auto"`；`semantic_only` 保留统一�
 - `TRITON_ENABLE_TASKQUEUE=0` 且 `TASK_QUEUE_ENABLE=0`，两端均采用同步提交配置；环境变量需在 Python 启动前设置。
 
 仅关闭 Triton 队列、同时保留 PyTorch 默认异步队列时，观察到初始化值未被覆盖的间歇性输出异常；扩展前版本也有复现。直接 CANN launch 后的 stream synchronize 不能替代框架待提交任务的顺序保证。该混合配置本次未作为通过验收的组合，相关运行时互操作问题未在此次 i8/extern 增量中修复。需要同步模式时使用两端一致的配置；性能报告使用 taskqueue=1。
+
+## 同类型归约 reshape 与连续标量写摘要（版本17）
+
+- 仅在候选副本中消除 rank=1、完整输入/输出类型相同、无 encoding/efficient_layout、属性已验证且只有一个 axis=0 reduce 消费者的 allow_reorder reshape。选择 identity 排列，不将重排许可传播到新增 lane 维；一般 reshape、多消费者和布局提示继续保守拒绝。F=1 与拒绝后的原始模块不变。
+- 对入口基本块中无 mask 的 scalar stores，识别同一 SSA pointer 的连续常量字段偏移0..K-1（2≤K≤64），生成一个逻辑[K]联合写效果。只改变guard的访问摘要，不合并实际store、不新增设备指令、不增加运行时guard种类。
+- 联合效果保留在偏移0的原access ID；其余成员保留原slot、offset、pointer_checks，仅在效果摘要中设false mask。现有guard在应用mask前检查原算术；联合单射性继续拒绝短stride/重复grid写，跨根和额外访问仍检查真实alias。原layout规划与access ID、缓存标量依赖保持一致。
+- 动态stride不假设等于字段数；孔洞、重复偏移、条件store、循环store或不同SSA基址不合组。循环控制流和数据相关gather的支持范围未扩大。
+- Python/native实现版本同步为17，避免与既有v16独立循环实现归档混用；本版本基于本地v15范围，不包含v16循环支持。

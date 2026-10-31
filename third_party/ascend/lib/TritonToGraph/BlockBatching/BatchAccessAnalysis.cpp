@@ -4,6 +4,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -98,6 +99,63 @@ E add(E lhs, E rhs) {
 }
 E scale(E value, int64_t factor) {
   return K::node(K::Mul, 64, std::move(value), constant(factor));
+}
+
+// One convex hull per scalar column falsely aliases interleaved row fields.
+// Group only unconditional, adjacent fields of the same scalar SSA pointer.
+// The IR and layout access IDs remain unchanged; only the proof is normalized.
+SmallVector<BatchAccessFact>
+jointScalarStoreEffects(triton::FuncOp function,
+                        ArrayRef<BatchAccessFact> accesses) {
+  SmallVector<BatchAccessFact> effects(accesses.begin(), accesses.end());
+  llvm::DenseMap<Value, SmallVector<std::pair<int64_t, unsigned>>> groups;
+  for (auto [id, fact] : llvm::enumerate(accesses)) {
+    auto store = dyn_cast<triton::StoreOp>(fact.operation);
+    if (!store || store->getParentOp() != function.getOperation() ||
+        store.getMask() || !fact.shape.empty() || !fact.loops.empty() ||
+        fact.isVolatile)
+      continue;
+    Value base = store.getPtr();
+    int64_t column = 0;
+    if (auto addptr = base.getDefiningOp<triton::AddPtrOp>()) {
+      auto op = addptr.getOffset().getDefiningOp<arith::ConstantOp>();
+      auto attr = op ? dyn_cast<IntegerAttr>(op.getValue()) : IntegerAttr{};
+      if (attr) {
+        column = attr.getInt();
+        base = addptr.getPtr();
+      }
+    }
+    groups[base].push_back({column, static_cast<unsigned>(id)});
+  }
+  for (auto &entry : groups) {
+    auto &members = entry.second;
+    if (members.size() < 2 || members.size() > 64)
+      continue;
+    llvm::sort(members);
+    unsigned first = members.front().second;
+    const auto &leader = accesses[first];
+    bool contiguous = true;
+    for (auto [column, member] : llvm::enumerate(members)) {
+      const auto &fact = accesses[member.second];
+      contiguous &= member.first == static_cast<int64_t>(column) &&
+                    fact.root == leader.root && fact.bytes == leader.bytes;
+    }
+    if (!contiguous)
+      continue;
+    // Existing ByteDomain joint injectivity still rejects short row strides,
+    // repeated grid axes and aliases with all other read/write effects.
+    auto &joint = effects[first];
+    int64_t count = members.size();
+    joint.shape = {count};
+    joint.byteOffset = add(leader.byteOffset,
+                          scale(K::leaf(K::Coordinate, 0, 32, count),
+                                leader.bytes));
+    // Keep member slots and original address/pointer checks. False suppresses
+    // only redundant alias hulls, after the guard checks their arithmetic.
+    for (auto member : llvm::drop_begin(members))
+      effects[member.second].mask = K::leaf(K::False);
+  }
+  return effects;
 }
 struct Pointer {
   int root = -1;
@@ -501,7 +559,8 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
     analysis.report.reason = "NO_MEMORY_ACCESSES";
   if (analysis.report.reason.empty()) {
     A accesses;
-    for (const auto &fact : analysis.report.accesses) {
+    for (const auto &fact :
+         jointScalarStoreEffects(function, analysis.report.accesses)) {
       A checks, shape;
       for (const auto &step : fact.pointerChecks)
         checks.push_back(batchExprJSON(step));
