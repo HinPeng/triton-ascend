@@ -28,7 +28,7 @@ def test_fixed_spec_catalog_is_complete_and_unique():
     assert len(entries) == len(rows) == 185
     assert Counter(row[1] for row in rows) == {"B": 87, "E": 66, "R": 20, "S": 12}
     assert sum(r[1] == "B" and r[-1] == "true" for r in rows) == 87
-    assert all(r[-1] == "false" for r in rows if r[1] in ("E", "R") and r[0] != "tt.extern_elementwise")
+    assert all(r[-1] == "false" for r in rows if r[1] in ("E", "R") and r[0] not in ("tt.extern_elementwise",))
     assert entries["tt.extern_elementwise"]["spec_level"] == "E"
     assert entries["tt.extern_elementwise"]["attribute_policy"] == "External"
 
@@ -71,4 +71,4 @@ def test_native_manifest_matches_admission_catalog():
     for row in native:
         expected = entries[row["op_name"]]
         assert all(row[key] == value for key, value in expected.items())
-        assert row["implementation_version"] == 17
+        assert row["implementation_version"] == 20

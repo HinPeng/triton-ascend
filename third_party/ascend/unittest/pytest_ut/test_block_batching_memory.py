@@ -31,10 +31,10 @@ def test_byte_provenance_and_explicit_scalar_index(tmp_path, kind, factor):
     module = parse(tmp_path, memory_ir(kind))
     report = ascend.passes.ttir.rewrite_block_batching(module, factor, 0)
     assert report["compile_status"] == "REWRITTEN", report
-    assert report["implementation_version"] == 17
+    assert report["implementation_version"] == 20
     assert module.verify()
     guard = json.loads(report["guard_json"])
-    assert guard["version"] == 2
+    assert guard["version"] == 3
     if kind == "nd_reused_range":
         assert guard["accesses"][0]["shape"] == [4, 4]
         serialized = json.dumps(guard["accesses"][0]["offset"])

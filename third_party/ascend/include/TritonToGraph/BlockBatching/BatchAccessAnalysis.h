@@ -60,6 +60,9 @@ struct BatchAccessFact {
   SmallVector<BatchExprRef> pointerChecks;
   llvm::json::Array loops;
   bool isVolatile = false;
+  // Missing summaries retain a real device SSA effect, never an empty domain.
+  bool deviceAddress = false;
+  bool normalizedPointer = false;
 };
 struct BatchAccessReport {
   std::string guardJSON;

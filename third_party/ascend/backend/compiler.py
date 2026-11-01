@@ -361,6 +361,7 @@ def make_ttir(mod, metadata, opt):
         rewrite = getattr(ascend.passes.ttir, "rewrite_block_batching", None)
         if rewrite is None:
             raise RuntimeError("block batching requires the matching rebuilt C++ rewriter")
+        batch_source = str(mod)
         report = dict(rewrite(mod, opt.block_batching_factor, opt.block_batching_axis, opt.block_batching_layout))
         if report.get("implementation_version") != opt.block_batching_implementation:
             raise BatchingRejected("REWRITER_IMPLEMENTATION_MISMATCH")
@@ -373,6 +374,8 @@ def make_ttir(mod, metadata, opt):
         report["layout"]["selected_policy"] = opt.block_batching_layout
         report["guard"] = json.loads(report.pop("guard_json"))
         report["guard"]["axis"] = report["selected_axis"]
+        from .block_batching_guard_v3 import bind_plan
+        bind_plan(report["guard"], batch_source)
         report["owner"] = "block_batching"
         report["plan_id"] = metadata["hash"]
         report["candidate_factor"] = opt.block_batching_factor
@@ -987,6 +990,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
                 raise BatchingRejected("BACKEND_CHANGED_DURING_COMPILE")
             validate_compilation_result(metadata)
             metadata["block_batching_binary_sha256"] = hashlib.sha256(Path(bin_path).read_bytes()).hexdigest()
+            metadata["block_batching_plan_sha256"] = metadata["block_batching"]["guard"]["plan_fingerprint"]
         return Path(bin_path).read_bytes()
 
 

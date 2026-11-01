@@ -73,7 +73,7 @@ def test_memory_models_are_applied_without_source_or_abi_changes(kind, factor):
         kernel[grid](x, result, n, k)
         torch.npu.synchronize()
         assert kernel.last_launch["runtime_status"] == "APPLIED", kernel.last_launch
-        assert kernel.block_batching["guard"]["version"] == 2
+        assert kernel.block_batching["guard"]["version"] == 3
         if expected.dtype in (torch.int32, torch.int64):
             assert torch.equal(result.cpu(), expected)
             assert torch.equal(baseline.cpu(), expected)

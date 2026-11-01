@@ -3,6 +3,8 @@
 #define TRITON_TO_GRAPH_BLOCK_BATCHING_BATCH_PLAN_H
 
 #include "mlir/IR/BuiltinOps.h"
+#include "TritonToGraph/BlockBatching/BatchLayoutPlan.h"
+#include "TritonToGraph/BlockBatching/ControlFlowModels.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/StringRef.h"
 #include <cstdint>
@@ -10,6 +12,13 @@
 #include <string>
 
 namespace mlir::triton::cfg {
+
+struct BatchPlan {
+  BatchAccessReport effects;
+  BatchControlFlowPlan values;
+  SmallVector<BatchLayoutPlan, 0> layouts;
+  llvm::DenseSet<Operation *> replicatedLoads;
+};
 
 enum class BlockMappingOwner { None, BlockBatching, Legacy };
 

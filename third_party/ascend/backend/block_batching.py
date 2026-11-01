@@ -7,7 +7,7 @@ compiler artifacts; rejected or guarded calls select the complete baseline.
 """
 from dataclasses import dataclass
 
-IMPLEMENTATION_VERSION = 17
+IMPLEMENTATION_VERSION = 20
 
 
 @dataclass(frozen=True)
@@ -325,6 +325,11 @@ def compile_bundle(backend, src, options, compile_variant):
         expected = getattr(candidate.metadata, "block_batching_binary_sha256", None)
         if expected != hashlib.sha256(candidate.kernel).hexdigest():
             raise BatchingRejected("CANDIDATE_BINARY_CHANGED")
+        from .block_batching_guard_v3 import validate_plan_binding
+        guard = native_report.get("guard", {})
+        if (not validate_plan_binding(guard)
+                or getattr(candidate.metadata, "block_batching_plan_sha256", None) != guard.get("plan_fingerprint")):
+            raise BatchingRejected("CANDIDATE_PLAN_CHANGED")
         report = dict(native_report)
         if layout_fallback:
             report["layout"] = dict(report["layout"], requested_policy="auto", selected_policy="semantic_only",

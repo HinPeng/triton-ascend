@@ -24,7 +24,10 @@ def test_linear_memory_view_and_semantic_control(tmp_path, factor, axis):
     report = ascend.passes.ttir.rewrite_block_batching(auto, factor, axis, "auto")
     control = ascend.passes.ttir.rewrite_block_batching(semantic, factor, axis, "semantic_only")
     assert report['compile_status'] == control['compile_status'] == 'REWRITTEN'
-    assert report['guard_json'] == control['guard_json']
+    automatic, semantic_guard = json.loads(report['guard_json']), json.loads(control['guard_json'])
+    assert automatic['accesses'] == semantic_guard['accesses']
+    assert automatic['obligations'][0]['proof'] == 'byte_domain'
+    assert semantic_guard['obligations'][0]['proof'] == 'lane_correspondence'
     assert auto.verify() and semantic.verify()
     assert 'arith.minsi' in str(auto)
     assert f'tensor<{factor * 4}x!tt.ptr<f32>>' in str(auto)

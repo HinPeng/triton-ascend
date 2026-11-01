@@ -30,7 +30,7 @@ def test_new_subsets_keep_lane_mapping_and_memory_contract(tmp_path, kind, facto
     module = parse(tmp_path, case_ir(kind))
     report = ascend.passes.ttir.rewrite_block_batching(module, factor, 0)
     assert report["compile_status"] == "REWRITTEN", report
-    assert report["implementation_version"] == 17
+    assert report["implementation_version"] == 20
     assert module.verify()
     text = str(module)
     assert f"tensor<{factor}x8xf32>" in text
@@ -81,10 +81,11 @@ def test_external_f16_remains_outside_the_signature_subset(tmp_path):
     assert report["reason"] == "UNSUPPORTED_EXTERNAL_FUNCTION", report
 
 
-def test_address_division_still_has_an_explicit_rejection(tmp_path):
+def test_read_address_division_preserves_device_ssa(tmp_path):
     text = case_ir("tanh").replace(
         "%xp = tt.addptr %xs, %idx",
         "%quotient = arith.divsi %idx, %ns : tensor<8xi32>\n    %xp = tt.addptr %xs, %quotient")
     module = parse(tmp_path, text)
     report = ascend.passes.ttir.rewrite_block_batching(module, 3, 0)
-    assert report["reason"] == "UNSUPPORTED_ADDRESS_EXPRESSION", report
+    assert report["compile_status"] == "REWRITTEN", report
+    assert module.verify()

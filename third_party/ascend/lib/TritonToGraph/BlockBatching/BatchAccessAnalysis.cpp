@@ -157,6 +157,10 @@ jointScalarStoreEffects(triton::FuncOp function,
   }
   return effects;
 }
+bool hasUnknown(E expression) {
+  return expression && (expression->kind == K::Unknown ||
+         hasUnknown(expression->lhs) || hasUnknown(expression->rhs));
+}
 struct Pointer {
   int root = -1;
   E offset;
@@ -169,6 +173,8 @@ struct Analysis {
   unsigned indexBits;
   unsigned budget = 1024;
   bool scalarBounds = false;
+  bool allowDeviceAddress = false;
+  bool normalizedPointer = false;
   llvm::DenseMap<Value, unsigned> inductionVariables;
   BatchAccessReport report;
   explicit Analysis(triton::FuncOp function, unsigned indexBits)
@@ -319,8 +325,29 @@ struct Analysis {
                        before);
       }
     }
+    if (allowDeviceAddress)
+      return K::leaf(K::Unknown);
     fail(value, "UNSUPPORTED_ADDRESS_EXPRESSION");
     return nullptr;
+  }
+  // Root provenance does not depend on an integer/coordinate summary.
+  // Keep pointer normalization on its separately proved path.
+  int rootOnly(Value value, unsigned &remaining) {
+    if (!remaining)
+      return -1;
+    --remaining;
+    if (auto arg = dyn_cast<BlockArgument>(value))
+      return arg.getOwner() == &function.getBody().front() &&
+                     isa<triton::PointerType>(arg.getType())
+                 ? static_cast<int>(arg.getArgNumber()) : -1;
+    auto *op = value.getDefiningOp();
+    if (!op)
+      return -1;
+    if (isa<triton::AddPtrOp, triton::SplatOp, triton::ExpandDimsOp,
+            triton::BroadcastOp, triton::ReshapeOp, triton::TransOp,
+            triton::UnsplatOp, triton::BitcastOp>(op))
+      return rootOnly(op->getOperand(0), remaining);
+    return -1;
   }
   Pointer pointer(Value value, const Axes &axes, bool normalizedBool = false) {
     if (!spend(value))
@@ -355,8 +382,14 @@ struct Analysis {
         isa<triton::PointerType>(element(op->getOperand(0).getType())))
       return pointer(op->getOperand(0), axes,
                      normalizedBool || isBatchBoolToByteCast(op));
-    if (isa<triton::IntToPtrOp>(op))
-      return addressInteger(op->getOperand(0), axes);
+    if (isa<triton::IntToPtrOp>(op)) {
+      normalizedPointer = true;
+      bool previous = allowDeviceAddress;
+      allowDeviceAddress = false;
+      auto result = addressInteger(op->getOperand(0), axes);
+      allowDeviceAddress = previous;
+      return result;
+    }
     return {};
   }
   Pointer addressInteger(Value value, const Axes &axes) {
@@ -521,7 +554,30 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
         shape.push_back(extent);
       }
     }
+    analysis.normalizedPointer = false;
+    analysis.allowDeviceAddress = !write && !isVolatile;
     Pointer base = analysis.pointer(ptr, axes);
+    analysis.allowDeviceAddress = false;
+    bool summaryUnavailable = false;
+    if (!write && !isVolatile && !analysis.normalizedPointer &&
+        (!base || !analysis.report.reason.empty()) &&
+        analysis.report.reason != "ANALYSIS_BUDGET_EXCEEDED" &&
+        analysis.report.reason != "UNSUPPORTED_POINTER_TYPE" &&
+        analysis.report.reason != "INDEX_LAYOUT_NOT_PROVEN") {
+      unsigned remaining = 1024;
+      int root = analysis.rootOnly(ptr, remaining);
+      if (root >= 0) {
+        base = {root, nullptr, {}};
+        analysis.report.reason.clear();
+        analysis.report.operation = nullptr;
+        summaryUnavailable = true;
+      }
+    }
+    bool deviceAddress = summaryUnavailable || hasUnknown(base.offset);
+    if (deviceAddress) {
+      base.offset = nullptr;
+      base.checks.clear();
+    }
     if (!base && analysis.report.reason.empty())
       analysis.fail(ptr, "UNKNOWN_POINTER_ROOT");
     unsigned bytes = analysis.width(ptr);
@@ -553,7 +609,7 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
     analysis.report.accesses.push_back(
         {op, base.root, bytes, write, std::move(shape), std::move(base.offset),
          std::move(mask), std::move(base.checks), std::move(loops),
-         isVolatile});
+         isVolatile, deviceAddress, analysis.normalizedPointer});
   });
   if (analysis.report.reason.empty() && analysis.report.accesses.empty())
     analysis.report.reason = "NO_MEMORY_ACCESSES";
@@ -575,7 +631,8 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
                              {"bytes", fact.bytes},
                              {"pointer_checks", std::move(checks)},
                              {"loops", A(fact.loops)},
-                             {"volatile", fact.isVolatile}});
+                             {"volatile", fact.isVolatile},
+                             {"device_address", fact.deviceAddress}});
     }
     analysis.report.guardJSON =
         llvm::formatv("{0}",

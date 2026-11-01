@@ -407,8 +407,13 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
   });
   if (columnRegion) {
     region.block = &function.getBody().front();
-    bool compatible = !plans.empty();
+    const auto first = llvm::find_if(plans, [](const BatchLayoutPlan &plan) {
+      return plan.action == BatchLayoutPlan::PointwiseRegion;
+    });
+    bool compatible = first != plans.end();
     for (const auto &plan : plans) {
+      if (plan.action != BatchLayoutPlan::PointwiseRegion)
+        continue;
       compatible &= plan.linearMemoryView && supportedUpper(plan.upper) &&
                     llvm::all_of(plan.residualMasks,
                                  [&](BatchExprRef predicate) {
@@ -416,7 +421,7 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
                                                              plan.localAxes);
                                  }) &&
                     plan.action == BatchLayoutPlan::PointwiseRegion &&
-                    plan.shape == plans.front().shape &&
+                    plan.shape == first->shape &&
                     plan.localAxes == SmallVector<int64_t>{1};
       Operation *op = mapping.lookupOrNull(semanticAccesses[plan.accessID]);
       if (!op || op->getBlock() != region.block) {
@@ -429,10 +434,8 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
         region.stores.insert(op);
     }
     if (compatible) {
-      region.semanticShape = {factor, plans.front().shape[0],
-                              plans.front().shape[1]};
-      region.targetShape = {plans.front().shape[0],
-                            factor * plans.front().shape[1]};
+      region.semanticShape = {factor, first->shape[0], first->shape[1]};
+      region.targetShape = {first->shape[0], factor * first->shape[1]};
       compatible = region.verify();
     }
     if (!compatible) {
@@ -452,6 +455,8 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
           return !supportedPredicate(predicate, axis, plan.localAxes);
         }))
       continue;
+    bool inColumnRegion = columnRegion &&
+                          plan.action == BatchLayoutPlan::PointwiseRegion;
     const auto &fact = accesses.accesses[plan.accessID];
     Operation *semantic = semanticAccesses[plan.accessID];
     if (!semantic)
@@ -543,7 +548,7 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
       if (originalType.getShape() != ArrayRef<int64_t>(semanticShape))
         return module.emitError("invalid semantic load shape for memory view"),
                failure();
-      Value other = columnRegion ? region.materialize(load.getOther(), rewriter)
+      Value other = inColumnRegion ? region.materialize(load.getOther(), rewriter)
                                  : e.reshape(load.getOther(), targetShape);
       auto replacement = rewriter.create<triton::LoadOp>(
           e.loc, pointer, mask, other, load.getBoundaryCheck(),
@@ -551,7 +556,7 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
           load.getIsVolatile());
       if (auto marker = load->getAttr("was_bool_to_int8"))
         replacement->setAttr("was_bool_to_int8", marker);
-      if (columnRegion)
+      if (inColumnRegion)
         region.values[load.getResult()] = replacement.getResult();
       else
         rewriter.replaceOp(op, e.reshape(replacement, originalType.getShape()));
@@ -561,7 +566,7 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
       if (originalType.getShape() != ArrayRef<int64_t>(semanticShape))
         return module.emitError("invalid semantic store shape for memory view"),
                failure();
-      Value stored = columnRegion
+      Value stored = inColumnRegion
                          ? region.materialize(store.getValue(), rewriter)
                          : e.reshape(store.getValue(), targetShape);
       rewriter.create<triton::StoreOp>(e.loc, pointer, stored, mask,

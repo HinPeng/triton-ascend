@@ -467,13 +467,11 @@ def test_bundle_rejects_cached_candidate_from_old_policy(bundle_environment, pol
         backend, src, {"block_batching_factor": 3, "block_batching_axis": 0, "compile_mode": "simd_simt_template"},
         compile_variant)
     assert all(x["compile_mode"] == "simd_simt_template" for x in seen)
-    if policy == "ta_only_v1":
-        assert kernel.candidate is env.candidate
-    else:
-        assert kernel.candidate is None
-        assert kernel.block_batching["reason"] == "CANDIDATE_VALIDATION_MISSING"
+    assert kernel.candidate is None
+    assert kernel.block_batching["reason"] == (
+        "CANDIDATE_PLAN_CHANGED" if policy == "ta_only_v1" else "CANDIDATE_VALIDATION_MISSING")
     kernel.run(*env.launch)
-    assert env.launches[-1][0] == ("candidate" if policy == "ta_only_v1" else "baseline")
+    assert env.launches[-1][0] == "baseline"
 
 
 def test_ub_compile_failure_selects_complete_baseline(bundle_environment):
@@ -498,7 +496,7 @@ def test_ub_compile_failure_selects_complete_baseline(bundle_environment):
     assert env.launches[-1][0] == "baseline"
 
 
-@pytest.mark.parametrize("version,lane_width", [(2, 3), (3, 4), (None, 3)])
+@pytest.mark.parametrize("version,lane_width", [(2, 3), (3, 4), (18, 3), (19, 3), (None, 3)])
 def test_bundle_rejects_old_or_padded_layout(bundle_environment, version, lane_width):
     import hashlib
     env = bundle_environment

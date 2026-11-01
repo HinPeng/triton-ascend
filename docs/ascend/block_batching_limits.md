@@ -1,10 +1,25 @@
 # Block batching 当前能力与限制
 
-实现版本 15，布局规划版本 2：新增受限参数化地址分析与动态行 stride 的 MemoryView；符号关系在编译期证明，新增地址运算与正 stride 条件在运行时检查。候选身份随版本更新；不需要将 stride 特化为具体值。
+实现版本 20，布局规划版本 2，runtime guard schema 3、语义契约版本 4。使用统一效果、控制流值域与布局计划。标准后端决定固定 factor 的资源可行性；只修改 TA。
+
+## 访存依赖与保守回退（版本20）
+
+- `tt.gather` 暂不支持，候选返回 `UNSUPPORTED_BATCH_OP`，选择完整 baseline。通用 `TritonOpConverter.cpp` 保持原实现，既有 gather lowering 问题不在本功能中修复。
+- TTIR 改写不引入 HIVM 或 `PIPE_ALL`。guard 使用 `memory_policy="disjoint_or_terminal_store"`，已知地址访问对中只要有写，就继续要求实际字节区间不相交，同 root 与不同 root 均检查。
+- 普通 device SSA 地址读取与写共存时，不再一律拒绝：若只有一个普通 store，所有 opaque load 与该 store 都在入口基本块中、load 在 store 之前，且输出值通过无 region、无内存效果的 SSA 计算依赖每条 opaque load 的结果，可沿既有数据依赖写回。该证明不通过其他 load、指针相同或源码顺序猜测依赖；存在 volatile 效果时不使用此放宽。
+- native 计划用 `terminal_read_ids` 记录上述已证明的读取，绑定源/计划指纹及 binary 身份。guard 校验它完整覆盖 opaque 读取、唯一 store 及先后关系，再放行该读取的 device SSA 地址；不扫描 ids、不增加范围/唯一性或 allocation 容量查询。其余已知地址的读写、写写和布局条件仍逐调用检查。
+- LK31 在 `MASK=None、LSE=None` 时，最后的 logits 间接读取经减去 lse 得到 logp，再写入唯一 LOG_P 输出，符合这条通用规则；embedding 的直接依赖写回也可使用。没有 kernel 名称或 shape 特判。
+- 写后间接读、独立输出值、多个 store、region 内 opaque load（含 loop-carried index）及 volatile 混合仍返回 `UNPROVEN_MEMORY_NONINTERFERENCE`。LK31 的非空 LSE 会增加独立写回，暂未证明；非空 MASK 的 varying early return 仍受既有控制模型限制。
+- `ShareInvariantLoad`、MemoryView/PointwiseRegion、动态 stride、uniform 控制、pointer roundtrip、访存属性和尾部保护继续使用原有模型。共享读取不会额外产生同步。已知地址原地/交错别名仍通过 guard 回退，完整 baseline 继承原编译器能力。
+- Python/native 实现版本同步提升到20，语义契约版本为4，防止 v18 屏障计划或 v19 全拒绝计划被复用。完整 baseline 与 original-grid ABI 保留，候选执行失败不重跑 baseline。
+- scatter、间接 volatile、循环 store、未知 pointer root、varying 控制流、一般 masked-load-without-other 及未建模 call/asm 仍不支持。
+- v20 已在 A5-37 / torch-213 / 物理 NPU 5 完成重编与验证：820项 native、38项产品设备回归通过；原始 LK31 的 F=2/3、axis=1、图优化开/关共4个候选均实际 APPLIED，独立 CPU 参考最大绝对误差1.90735e-6。历史 v18/v19 性能数据仍属于各自构建，本轮未测性能。
+
+以下版本条目为历史增量；与上述 v20 更新冲突的限制以 v20 为准。
 
 版本14历史：通用SeededReduceConverter已移除；644个独立native、29个设备用例通过，原后端maxnum全NaN参考问题单列为1个strict XFAIL。性能结果另见本轮任务报告。版本13历史结果：本次属性增量已在 A5-37 / torch-271 验证：643项native、27项设备用例、5个Liger kernel各F=2/3共10个实际合并候选；设备使用taskqueue=1，下文既有双任务队列结果仍属于版本12。固定 factor 的资源可行性由标准后端编译判断；保留运行时 guard、完整 baseline 回退及 binary/ABI/缓存一致性。仅在 Triton-Ascend 实现，不依赖定制 NPUIR 补丁或资源报告。
 
-- **地址表达式中的除法暂不支持。** `arith.divsi` 等整数除法在逐元素计算中已有 Basic 模型，但不能因此用于地址证明。当前地址摘要/guard 只接收已建模的仿射运算及转换；例如 `row = offset / n_cols` 用于 load 地址时，返回 `UNSUPPORTED_ADDRESS_EXPRESSION` 并使用完整 baseline。该限制本版保留。
+- **普通读取的地址摘要可以缺省。** 已知 root 的未建模整数 SSA 可保留设备表达式；与写共存时需上述末尾依赖写回证明，否则回退。普通 store 不新增 scatter，pointer roundtrip 仍需已有证明。
 - **新增 i8 为受限字节数据闭包。** 允许常量、普通 load/store、cmp/select、已支持的 shape 操作及 byte-pointer 地址计算；不开放一般 i8 算术、转换、归约、scalar i8 host ABI 或 inttoptr。标准 bool 读取仅接受 `ptr<i1>→ptr<i8>` 后直接带 `was_bool_to_int8=true` 的 load，按该规范化链的一个存储字节解释地址，保留属性。未标记的任意 i1 访存布局仍拒绝。
 - **外部逐元素函数仍属于 E 类，只有已知子集开放。** 当前只接受空 libname/libpath、pure=true 的 `__hmf_pow_fp32(f32,f32)->f32` 和 `__hmf_tanhf(f32)->f32`。保留原 symbol、精度与逐元素语义；新无效 lane 的输入填 1，以保证 pow/tanh 在安全域求值。其他 symbol、库路径、签名、impure 调用及调用型归约 combiner 均不开放。
 - 有效 factor 上限为 64；候选可能因 UB 等标准后端资源限制失败。支持某 op/dtype 不保证所有组合可编译，也不保证比 baseline 更快。

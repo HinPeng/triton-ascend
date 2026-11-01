@@ -15,10 +15,12 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MathExtras.h"
@@ -120,6 +122,27 @@ void normalizeIdentityReductionReshapes(triton::FuncOp function) {
     reshape.getResult().replaceAllUsesWith(reshape.getSrc());
     reshape.erase();
   }
+}
+
+// This proof authorizes no reordering or synchronization: the store's value
+// already consumes the read through ordinary SSA dataflow. Do not infer a
+// dependency from source order, a shared root, another load, or a region result.
+bool hasPureDataDependency(Value value, Value read) {
+  SmallVector<Value> pending{value};
+  llvm::DenseSet<Value> visited;
+  unsigned budget = 8192;
+  while (!pending.empty() && budget--) {
+    Value current = pending.pop_back_val();
+    if (current == read)
+      return true;
+    if (!visited.insert(current).second)
+      continue;
+    Operation *producer = current.getDefiningOp();
+    if (producer && producer->getNumRegions() == 0 &&
+        isMemoryEffectFree(producer))
+      llvm::append_range(pending, producer->getOperands());
+  }
+  return false;
 }
 } // namespace
 
@@ -279,19 +302,75 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
     return reject("NO_PROGRAM_AXIS");
   if (!axes[axis])
     return reject("UNUSED_BATCH_AXIS");
-  auto control = analyzeBatchControlFlow(function, axis);
-  if (!control.reason.empty()) {
-    diagnosticOp = control.operation;
-    return reject(control.reason);
-  }
-  auto access = analyzeBatchAccesses(function, indexBits);
+  BatchPlan plan;
+  auto &access = plan.effects;
+  access = analyzeBatchAccesses(function, indexBits);
   if (!access.reason.empty()) {
     if (access.operation)
       diagnosticOp = access.operation;
     return reject(access.reason);
   }
-  report.guardJSON = access.guardJSON;
-  auto layouts = planBatchLayouts(access, axis, request.factor);
+  for (const auto &fact : access.accesses)
+    if (fact.deviceAddress)
+      plan.replicatedLoads.insert(fact.operation);
+  auto &control = plan.values;
+  control = analyzeBatchControlFlow(function, axis, plan.replicatedLoads);
+  if (!control.reason.empty()) {
+    diagnosticOp = control.operation;
+    return reject(control.reason);
+  }
+  auto guard = llvm::json::parse(access.guardJSON);
+  if (!guard || !guard->getAsObject())
+    return module.emitError("invalid generated access facts"), failure();
+  auto &object = *guard->getAsObject();
+  object["version"] = 3;
+  object["plan_kind"] = "unified";
+  object["semantic_contract_version"] = 4;
+  object["memory_policy"] = "disjoint_or_terminal_store";
+  object["factor"] = request.factor;
+  object["axis"] = axis;
+  llvm::json::Array obligations;
+  for (auto [id, fact] : llvm::enumerate(access.accesses)) {
+    const char *rule = fact.deviceAddress ? "ReplicateEffect"
+                       : fact.isVolatile ? "PreserveVolatile"
+                       : !fact.write && !control.isVarying(fact.operation->getResult(0))
+                           ? "ShareInvariantLoad"
+                       : fact.write ? "SupportedEffect" : "ReplicateEffect";
+    obligations.push_back(llvm::json::Object{
+        {"access_id", static_cast<int64_t>(id)}, {"rule", rule},
+        {"proof", (fact.write || fact.isVolatile || fact.normalizedPointer ||
+                    !control.isVarying(fact.operation->getResult(0)))
+                       ? "byte_domain" : "lane_correspondence"}});
+  }
+  // Known intervals retain the runtime disjointness proof. An opaque read
+  // needs no host range when its only observable write is a terminal store
+  // whose value consumes that read. Independent outputs, volatile effects,
+  // region-local reads and writes preceding a read require a stronger proof.
+  SmallVector<triton::StoreOp> writes;
+  bool hasVolatile = false;
+  for (const auto &fact : access.accesses) {
+    if (fact.write)
+      writes.push_back(cast<triton::StoreOp>(fact.operation));
+    hasVolatile |= fact.isVolatile;
+  }
+  llvm::json::Array terminalReads;
+  if (!writes.empty())
+    for (auto [id, fact] : llvm::enumerate(access.accesses))
+      if (fact.deviceAddress) {
+        diagnosticOp = fact.operation;
+        auto read = cast<triton::LoadOp>(fact.operation);
+        if (writes.size() != 1 || hasVolatile ||
+            read->getBlock() != &block || writes.front()->getBlock() != &block ||
+            !read->isBeforeInBlock(writes.front().getOperation()) ||
+            !hasPureDataDependency(writes.front().getValue(), read.getResult()))
+          return reject("UNPROVEN_MEMORY_NONINTERFERENCE");
+        terminalReads.push_back(static_cast<int64_t>(id));
+      }
+  object["terminal_read_ids"] = std::move(terminalReads);
+  object["obligations"] = std::move(obligations);
+  report.guardJSON = llvm::formatv("{0}", *guard).str();
+  auto &layouts = plan.layouts;
+  layouts = planBatchLayouts(access, axis, request.factor);
   report.layoutJSON = serializeBatchLayouts(layouts);
   llvm::DenseMap<Operation *, unsigned> accessIDs;
   SmallVector<Operation *> semanticAccesses(access.accesses.size(), nullptr);
@@ -526,14 +605,11 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
           values.map(old, result, control.isVarying(old));
         continue;
       }
-      bool var = llvm::any_of(op->getOperands(),
-                              [&](Value v) { return values.isVarying(v); });
-      // Never share a volatile result across original program invocations.
-      // The runtime guard rejects duplicate read addresses in its original
-      // domain.
-      if (auto load = dyn_cast<triton::LoadOp>(op);
-          load && load.getIsVolatile())
-        var = true;
+      bool var = op->getNumResults()
+                     ? control.isVarying(op->getResult(0))
+                     : llvm::any_of(op->getOperands(), [&](Value value) {
+                         return control.isVarying(value);
+                       });
       if (isa<triton::ReduceOp, triton::ScanOp>(op))
         for (Value capture : getBatchCombinerCaptures(op)) {
           if (!values.contains(capture))
@@ -696,9 +772,26 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   };
   if (failed(rewriteBody(block, nullptr, {})))
     return report;
+  // Verify effect correspondence while the original operations still exist.
+  // Sharing changes dynamic multiplicity only under its emitted proof; every
+  // source effect still owns exactly one generated operation at this stage.
+  for (auto [id, fact] : llvm::enumerate(access.accesses)) {
+    Operation *generated = semanticAccesses[id];
+    if (!generated || generated->getName() != fact.operation->getName())
+      return module.emitError("missing or invalid planned memory effect"), failure();
+    if (auto load = dyn_cast<triton::LoadOp>(generated)) {
+      auto source = cast<triton::LoadOp>(fact.operation);
+      if (load.getCache() != source.getCache() ||
+          load.getEvict() != source.getEvict() ||
+          load.getIsVolatile() != source.getIsVolatile())
+        return module.emitError("planned load policy changed"), failure();
+    }
+  }
   // All layout facts are owned expressions. Drop original operation handles
   // before erasing source IR; only the generated semantic side table survives.
   accessIDs.clear();
+  control.varying.clear();
+  plan.replicatedLoads.clear();
   for (auto &fact : access.accesses)
     fact.operation = nullptr;
   for (auto *op : llvm::reverse(originals))
@@ -747,7 +840,7 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       }
       layoutChecks.push_back(std::move(*parsed));
     }
-  if (!layoutChecks.empty()) {
+  {
     auto parsed = llvm::json::parse(report.guardJSON);
     if (!parsed) {
       llvm::consumeError(parsed.takeError());
@@ -755,7 +848,14 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
     }
     if (!parsed->getAsObject())
       return module.emitError("invalid original access guard"), failure();
-    (*parsed->getAsObject())["layout_checks"] = std::move(layoutChecks);
+    auto *proofs = parsed->getAsObject()->getArray("obligations");
+    if (!proofs || proofs->size() != layouts.size())
+      return module.emitError("invalid effect proof mapping"), failure();
+    for (const auto &layout : layouts)
+      if (layout.rewritten)
+        (*proofs)[layout.accessID].getAsObject()->operator[]("proof") = "byte_domain";
+    if (!layoutChecks.empty())
+      (*parsed->getAsObject())["layout_checks"] = std::move(layoutChecks);
     report.guardJSON = llvm::formatv("{0}", *parsed).str();
   }
   report.reason = "";

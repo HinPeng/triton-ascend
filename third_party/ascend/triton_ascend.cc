@@ -96,6 +96,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       return false;
     module.walk([](mlir::Operation *op) {
       op->removeAttr("hacc.block_mapping_owner");
+      op->removeAttr("hacc.batch_effect_order_verified");
     });
     return true;
   });
