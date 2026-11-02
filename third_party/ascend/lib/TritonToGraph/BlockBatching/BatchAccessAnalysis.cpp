@@ -38,6 +38,10 @@ llvm::json::Value BatchExpr::json() const {
     return A{"arg", value, bits};
   case Program:
     return A{"pid", value, bits};
+  case ProgramQuotient:
+  case ProgramRemainder:
+    return A{kind == ProgramQuotient ? "pid_div" : "pid_rem", value, extent,
+             bits};
   case Grid:
     return A{"grid", value, bits};
   case Coordinate:
@@ -147,9 +151,9 @@ jointScalarStoreEffects(triton::FuncOp function,
     auto &joint = effects[first];
     int64_t count = members.size();
     joint.shape = {count};
-    joint.byteOffset = add(leader.byteOffset,
-                          scale(K::leaf(K::Coordinate, 0, 32, count),
-                                leader.bytes));
+    joint.byteOffset =
+        add(leader.byteOffset,
+            scale(K::leaf(K::Coordinate, 0, 32, count), leader.bytes));
     // Keep member slots and original address/pointer checks. False suppresses
     // only redundant alias hulls, after the guard checks their arithmetic.
     for (auto member : llvm::drop_begin(members))
@@ -158,8 +162,9 @@ jointScalarStoreEffects(triton::FuncOp function,
   return effects;
 }
 bool hasUnknown(E expression) {
-  return expression && (expression->kind == K::Unknown ||
-         hasUnknown(expression->lhs) || hasUnknown(expression->rhs));
+  return expression &&
+         (expression->kind == K::Unknown || hasUnknown(expression->lhs) ||
+          hasUnknown(expression->rhs));
 }
 struct Pointer {
   int root = -1;
@@ -292,6 +297,20 @@ struct Analysis {
       return integer(op->getOperand(0), *mapped);
     } else {
       auto name = op->getName().getStringRef();
+      if (name == "arith.divsi" || name == "arith.remsi") {
+        auto pid = op->getOperand(0).getDefiningOp<triton::GetProgramIdOp>();
+        auto divisor = op->getOperand(1).getDefiningOp<arith::ConstantOp>();
+        auto amount =
+            divisor ? dyn_cast<IntegerAttr>(divisor.getValue()) : IntegerAttr{};
+        // Original program IDs are nonnegative. The runtime proof splits
+        // p = quotient * divisor + remainder only for complete rectangles.
+        // General signed division, nested quotients and tensor divisors stay
+        // outside the affine access model.
+        if (pid && amount && amount.getInt() > 0 && bitWidth == 32)
+          return K::leaf(
+              name == "arith.divsi" ? K::ProgramQuotient : K::ProgramRemainder,
+              static_cast<int64_t>(pid.getAxis()), 32, amount.getInt());
+      }
       if (scalarBounds && !isa<RankedTensorType>(value.getType()) &&
           (name == "arith.minsi" || name == "arith.maxsi"))
         return K::node(name == "arith.minsi" ? K::MinSI : K::MaxSI, bitWidth,
@@ -339,7 +358,8 @@ struct Analysis {
     if (auto arg = dyn_cast<BlockArgument>(value))
       return arg.getOwner() == &function.getBody().front() &&
                      isa<triton::PointerType>(arg.getType())
-                 ? static_cast<int>(arg.getArgNumber()) : -1;
+                 ? static_cast<int>(arg.getArgNumber())
+                 : -1;
     auto *op = value.getDefiningOp();
     if (!op)
       return -1;
@@ -608,8 +628,8 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
       return;
     analysis.report.accesses.push_back(
         {op, base.root, bytes, write, std::move(shape), std::move(base.offset),
-         std::move(mask), std::move(base.checks), std::move(loops),
-         isVolatile, deviceAddress, analysis.normalizedPointer});
+         std::move(mask), std::move(base.checks), std::move(loops), isVolatile,
+         deviceAddress, analysis.normalizedPointer});
   });
   if (analysis.report.reason.empty() && analysis.report.accesses.empty())
     analysis.report.reason = "NO_MEMORY_ACCESSES";

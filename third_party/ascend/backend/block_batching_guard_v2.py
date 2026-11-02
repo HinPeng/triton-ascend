@@ -61,7 +61,41 @@ class ByteDomain:
             self.loop_axes[identity] = (position, lower, step, bits)
             counts.append(count)
         self.loop_counts = tuple(counts)
-        self.full = (*grid, *self.shape, *counts)
+        self.program_splits = {}
+        splits = {}
+        budget = 1024
+
+        def collect(node):
+            nonlocal budget
+            budget -= 1
+            if budget < 0:
+                raise GuardFailure("ANALYSIS_BUDGET_EXCEEDED")
+            if not isinstance(node, list) or not node:
+                return
+            if node[0] in ("pid_div", "pid_rem"):
+                if len(node) != 4 or self.bits(node[3]) != 32:
+                    raise GuardFailure("INVALID_PROGRAM_SPLIT")
+                axis, divisor = integer(node[1]), integer(node[2])
+                if not 0 <= axis < 3 or not 0 < divisor <= I32_MAX:
+                    raise GuardFailure("INVALID_PROGRAM_SPLIT")
+                if axis in splits and splits[axis] != divisor:
+                    raise GuardFailure("INCOMPATIBLE_PROGRAM_SPLITS")
+                splits[axis] = divisor
+                return
+            for operand in node:
+                if isinstance(operand, list):
+                    collect(operand)
+
+        for node in (access.get("offset"), access.get("mask"), *access.get("pointer_checks", ())):
+            collect(node)
+        full = [*grid, *self.shape, *counts]
+        for axis, divisor in sorted(splits.items()):
+            if grid[axis] % divisor:
+                raise GuardFailure("NON_RECTANGULAR_PROGRAM_SPLIT")
+            self.program_splits[axis] = (divisor, len(full))
+            full[axis] //= divisor
+            full.append(divisor)
+        self.full = tuple(full)
 
     def constant(self, value):
         return AffineND(value, (0, ) * len(self.full))
@@ -114,7 +148,19 @@ class ByteDomain:
             if name == "coord" and (not 3 <= axis < 3 + len(self.shape) or self.full[axis] != integer(node[2])):
                 raise GuardFailure("INVALID_LOCAL_AXIS")
             coefficients = [0] * len(self.full)
-            coefficients[axis] = 1
+            if name == "pid" and axis in self.program_splits:
+                divisor, remainder_axis = self.program_splits[axis]
+                coefficients[axis] = divisor
+                coefficients[remainder_axis] = 1
+            else:
+                coefficients[axis] = 1
+            return AffineND(0, tuple(coefficients))
+        if name in ("pid_div", "pid_rem"):
+            axis, divisor = integer(node[1]), integer(node[2])
+            if axis not in self.program_splits or self.program_splits[axis][0] != divisor:
+                raise GuardFailure("INVALID_PROGRAM_SPLIT")
+            coefficients = [0] * len(self.full)
+            coefficients[axis if name == "pid_div" else self.program_splits[axis][1]] = 1
             return AffineND(0, tuple(coefficients))
         if name in ("minsi", "maxsi"):
             lhs, rhs = self.expression(node[2]), self.expression(node[3])
@@ -159,6 +205,133 @@ class ByteDomain:
             return [(mask[0], self.expression(mask[1]), self.expression(mask[2]), self.bits(mask[3]))]
         # No use of an unmodeled predicate to shrink the original domain.
         return []
+
+    def require_full_mask(self, mask):
+        """Prove every original predicate true before any rank-three load.
+
+        Unlike predicates(), this proof cannot ignore an unknown expression.
+        Evaluate bounds over the original full grid and local tensor box;
+        never use a mask-trimmed domain to justify deleting that same mask.
+        """
+        if mask is None or mask == ["true"]:
+            return
+        if not isinstance(mask, list) or not mask:
+            raise GuardFailure("CV_FULL_TILE_MASK_NOT_PROVEN")
+        if mask[0] == "and" and len(mask) == 3:
+            self.require_full_mask(mask[1])
+            self.require_full_mask(mask[2])
+            return
+        if mask[0] not in ("slt", "ult", "eq") or len(mask) != 4:
+            raise GuardFailure("CV_FULL_TILE_MASK_NOT_PROVEN")
+        lhs, rhs = self.expression(mask[1]), self.expression(mask[2])
+        bits = self.bits(mask[3])
+        for value, width in self.checks:
+            checked(*self.bounds(value, self.full), width)
+        if mask[0] == "ult":
+            for value in (lhs, rhs):
+                checked(*self.bounds(value, self.full), bits, unsigned=True)
+        lo, hi = self.bounds(lhs.add(rhs, -1), self.full)
+        if (mask[0] == "eq" and (lo != 0 or hi != 0)) or (mask[0] != "eq" and hi >= 0):
+            raise GuardFailure("CV_FULL_TILE_MASK_NOT_PROVEN")
+
+    def require_same_fractal_bounds(self):
+        """Allow tails only inside the final 32-byte padding quantum per axis.
+
+        Evaluate prefixes over the original program grid. Retained masks still
+        control GM access. A matching NZ allocation footprint is insufficient:
+        f32 rows 23/32 can occupy two NZ row blocks while batch DMA still leaves
+        rows 24:32 undefined. Require the stricter 32-byte extent in BOTH axes,
+        including before/after a normalized transpose. Never reduce original K.
+        """
+        mask = self.access.get("mask")
+        if self.access["write"] or mask is None or mask == ["true"]:
+            return
+        reason = "CV_BATCH_PADDING_NOT_PROVEN"
+        width = self.access["bytes"]
+        if len(self.shape) != 2 or type(width) is not int or width not in (2, 4):
+            try:
+                self.require_full_mask(mask)
+            except GuardFailure:
+                raise GuardFailure(reason)
+            return
+        address = self.expression(self.access["offset"])
+        strides = address.coefficients[3:5]
+        if any(s <= 0 for s in strides) or sum(s == width for s in strides) != 1:
+            raise GuardFailure(reason)
+        # This also implies the 16-row NZ allocation extent is unchanged.
+        # Keep both axes constrained; the physical layout alone is not enough
+        # to prove the zero-filled reduction lanes of a transposed operand.
+        quantum = (min(16, 32 // width), ) * 2
+        active = list(self.shape)
+
+        def prefix(node):
+            if node is None or node == ["true"]:
+                return
+            if not isinstance(node, list) or not node:
+                raise GuardFailure(reason)
+            if node[0] == "and" and len(node) == 3:
+                prefix(node[1])
+                prefix(node[2])
+                return
+            if node[0] not in ("slt", "ult") or len(node) != 4:
+                raise GuardFailure(reason)
+            lhs, rhs = self.expression(node[1]), self.expression(node[2])
+            if node[0] == "ult":
+                for value in (lhs, rhs):
+                    checked(*self.bounds(value, self.full), self.bits(node[3]), unsigned=True)
+            delta = lhs.add(rhs, -1)
+            local = delta.coefficients[3:5]
+            axes = [axis for axis, stride in enumerate(local) if stride]
+            if len(axes) != 1 or local[axes[0]] != 1:
+                raise GuardFailure(reason)
+            counts = list(self.full)
+            counts[3:5] = [1, 1]
+            _, highest_offset = self.bounds(delta, counts)
+            axis = axes[0]
+            active[axis] = max(0, min(active[axis], -highest_offset))
+
+        prefix(mask)
+        for value, bits in self.checks:
+            checked(*self.bounds(value, self.full), bits)
+        if any(n == 0 or (n + q - 1) // q != (full + q - 1) // q for n, full, q in zip(active, self.shape, quantum)):
+            raise GuardFailure(reason)
+
+    def require_full_axes(self, axes):
+        if len(self.shape) != 2 or not all(type(axis) is int and axis in (0, 1) for axis in axes):
+            raise GuardFailure("CV_BATCH_DOT_CONTRACT_NOT_PROVEN")
+        if not axes:
+            return
+        mask = self.access.get("mask")
+        if mask is None or mask == ["true"]:
+            return
+        reason = "CV_BATCH_REDUCTION_MASK_NOT_PROVEN"
+
+        def prove(node):
+            if node is None or node == ["true"]:
+                return
+            if not isinstance(node, list) or not node:
+                raise GuardFailure(reason)
+            if node[0] == "and" and len(node) == 3:
+                prove(node[1])
+                prove(node[2])
+                return
+            if node[0] not in ("slt", "ult") or len(node) != 4:
+                raise GuardFailure(reason)
+            lhs, rhs = self.expression(node[1]), self.expression(node[2])
+            delta = lhs.add(rhs, -1)
+            local = delta.coefficients[3:5]
+            touched = [axis for axis, stride in enumerate(local) if stride]
+            if len(touched) != 1 or local[touched[0]] != 1:
+                raise GuardFailure(reason)
+            if node[0] == "ult":
+                for value in (lhs, rhs):
+                    checked(*self.bounds(value, self.full), self.bits(node[3]), unsigned=True)
+            if touched[0] in axes and self.bounds(delta, self.full)[1] >= 0:
+                raise GuardFailure(reason)
+
+        prove(mask)
+        for value, bits in self.checks:
+            checked(*self.bounds(value, self.full), bits)
 
     def interval(self, pointer):
         if any(count == 0 for count in self.loop_counts):
@@ -314,9 +487,79 @@ def check_layout_guards(guard, arguments, grid, factor):
             checked(pointer + lo, pointer + hi + layout["bytes"] - 1, 64, unsigned=True)
 
 
+def static_cv_mask_refusal(guard):
+    """Reject a provably ineligible constant prefix before backend compilation.
+
+    This only rejects; it never authorizes a launch or substitutes fabricated
+    values for runtime arguments/grid. Unknown expressions remain the existing
+    runtime guard's responsibility. In particular JIT specialization of scalar
+    one can otherwise reach an unsupported ND2NZ shape before that guard runs.
+    """
+    if guard.get("require_same_fractal_bounds") is not True:
+        return None
+    inputs = guard.get("cv_mask_contract", {}).get("inputs", [])
+    reduction_axes = {item["access"]: item["axes"][1 if item["operand"] == 0 else 0] for item in inputs}
+    for aid, access in enumerate(guard.get("accesses", [])):
+        shape, width = access.get("shape", []), access.get("bytes")
+        if access.get("write") or len(shape) != 2 or width not in (2, 4):
+            continue
+        active = list(shape)
+        pending = [access.get("mask")]
+        budget = 256
+
+        def static_expression(node):
+            nonlocal budget
+            budget -= 1
+            if budget < 0 or not isinstance(node, list) or not node:
+                return False
+            if node[0] not in ("const", "coord", "addi", "subi", "muli", "extsi", "extui", "trunci"):
+                return False
+            return all(static_expression(x) for x in node[1:] if isinstance(x, list))
+
+        while pending and budget > 0:
+            mask = pending.pop()
+            budget -= 1
+            if not isinstance(mask, list) or not mask:
+                continue
+            if mask[0] == "and" and len(mask) == 3:
+                pending.extend(mask[1:])
+                continue
+            if (len(mask) != 4 or mask[0] not in ("slt", "ult") or not static_expression(mask[1])
+                    or not static_expression(mask[2])):
+                continue
+            try:
+                domain = ByteDomain([], (1, 1, 1), {"shape": shape})
+                lhs, rhs = domain.expression(mask[1]), domain.expression(mask[2])
+                delta = lhs.add(rhs, -1)
+                for value, bits in domain.checks:
+                    checked(*domain.bounds(value, domain.full), bits)
+                if mask[0] == "ult":
+                    for value in (lhs, rhs):
+                        checked(*domain.bounds(value, domain.full), domain.bits(mask[3]), unsigned=True)
+                local = delta.coefficients[3:5]
+                axes = [axis for axis, coefficient in enumerate(local) if coefficient]
+                if len(axes) == 1 and local[axes[0]] == 1 and not any(delta.coefficients[:3]):
+                    axis = axes[0]
+                    active[axis] = max(0, min(active[axis], -delta.offset))
+            except (GuardFailure, KeyError, IndexError, TypeError, OverflowError):
+                continue
+        quantum = min(16, 32 // width)
+        if any(n == 0 or (n + quantum - 1) // quantum != (full + quantum - 1) // quantum
+               for n, full in zip(active, shape)):
+            return "CV_BATCH_PADDING_NOT_PROVEN"
+        reduction = reduction_axes.get(aid)
+        if reduction is not None and active[reduction] < shape[reduction]:
+            return "CV_BATCH_REDUCTION_MASK_NOT_PROVEN"
+    return None
+
+
 def check_guard_v2(guard, arguments, grid, factor):
     try:
         if type(guard.get("version")) is not int or guard["version"] != 2 or not guard.get("accesses"):
+            raise GuardFailure("INVALID_GUARD_SCHEMA")
+        require_full_masks = guard.get("require_full_masks", False)
+        require_same_fractal_bounds = guard.get("require_same_fractal_bounds", False)
+        if type(require_full_masks) is not bool or type(require_same_fractal_bounds) is not bool:
             raise GuardFailure("INVALID_GUARD_SCHEMA")
         grid = tuple(integer(n) for n in grid)
         if len(grid) != 3 or any(n < 0 or n > I32_MAX for n in grid):
@@ -332,12 +575,41 @@ def check_guard_v2(guard, arguments, grid, factor):
         if tasks > I32_MAX:
             raise GuardFailure("G0_TASK_COUNT_OVERFLOW")
         ranges = []
-        for access in guard["accesses"]:
+        cv_contract = guard.get("cv_mask_contract") if require_same_fractal_bounds else None
+        if require_same_fractal_bounds:
+            if (type(cv_contract) is not dict or cv_contract.get("version") != 1
+                    or type(cv_contract.get("inputs")) is not list or len(cv_contract["inputs"]) != 2
+                    or type(cv_contract.get("outputs")) is not list or not cv_contract["outputs"]):
+                raise GuardFailure("CV_BATCH_DOT_CONTRACT_NOT_PROVEN")
+            if any(type(x) is not dict for x in cv_contract["inputs"]):
+                raise GuardFailure("CV_BATCH_DOT_CONTRACT_NOT_PROVEN")
+            if {x.get("operand") for x in cv_contract["inputs"]} != {0, 1}:
+                raise GuardFailure("CV_BATCH_DOT_CONTRACT_NOT_PROVEN")
+            input_axes = {}
+            for item in cv_contract["inputs"]:
+                aid, operand, axes = item.get("access"), item["operand"], item.get("axes")
+                if (type(aid) is not int or not 0 <= aid < len(guard["accesses"]) or type(axes) is not list
+                        or sorted(axes) != [0, 1] or guard["accesses"][aid]["write"] or aid in input_axes):
+                    raise GuardFailure("CV_BATCH_DOT_CONTRACT_NOT_PROVEN")
+                input_axes[aid] = [axes[1] if operand == 0 else axes[0]]
+            if (any(
+                    type(aid) is not int or not 0 <= aid < len(guard["accesses"]) or not guard["accesses"][aid]["write"]
+                    for aid in cv_contract["outputs"])):
+                raise GuardFailure("CV_BATCH_DOT_CONTRACT_NOT_PROVEN")
+        else:
+            input_axes = {}
+        for aid, access in enumerate(guard["accesses"]):
             value = arguments[access["root"]]
             pointer = integer(value.data_ptr()) if hasattr(value, "data_ptr") else integer(value)
             if not 0 < pointer < (1 << 64):
                 raise GuardFailure("INVALID_MEMORY_ARGUMENT")
-            result = ByteDomain(arguments, grid, access).interval(pointer)
+            domain = ByteDomain(arguments, grid, access)
+            if require_full_masks:
+                domain.require_full_mask(access.get("mask"))
+            if require_same_fractal_bounds:
+                domain.require_same_fractal_bounds()
+                domain.require_full_axes(input_axes.get(aid, []))
+            result = domain.interval(pointer)
             if result is not None:
                 ranges.append(result)
         check_layout_guards(guard, arguments, grid, factor)

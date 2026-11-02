@@ -7,8 +7,62 @@ No custom AscendNPU-IR report or transitive SIMD proof is required.
 """
 from .block_batching import BatchingRejected
 
-
 VALIDATION_POLICY = "ta_only_v1"
+CV_VALIDATION_POLICY = "ta_cv_auto_blockify_v14"
+
+
+def _validate_cv_contract(metadata):
+    from .program_grid import normalize_program_grid_transforms
+    report = metadata["block_batching"]
+    full_tile_lowerings = ("rank3_full_tile_batch_v1", "rank3_full_tile_batch_v2")
+    lowerings = {
+        "independent_batch_v1":
+        ("rank3_batch_v1", "static_masked_lanes_v1", "rank3_masked_batch_v1", *full_tile_lowerings),
+        "spatial_concat_v1": ("spatial_m_v1", "spatial_n_v1")
+    }
+    if report.get("cv_lowering") not in lowerings.get(report.get("cv_mode"), ()):
+        raise BatchingRejected("CV_LOWERING_CONTRACT_MISSING")
+    if report.get("cv_lowering") in full_tile_lowerings:
+        if (metadata.get("enable_hivm_batch_matmul") is not True
+                or report.get("guard", {}).get("require_full_masks") is not True):
+            raise BatchingRejected("CV_FULL_TILE_BATCH_CONTRACT_MISSING")
+    if report.get("cv_lowering") == "rank3_masked_batch_v1":
+        if (metadata.get("enable_hivm_batch_matmul") is not True or "require_full_masks" in report.get("guard", {})):
+            raise BatchingRejected("CV_MASKED_BATCH_CONTRACT_MISSING")
+        if (report.get("cv_memory_lowering") != "full_reduction_guard_v3"
+                or report.get("guard", {}).get("require_same_fractal_bounds") is not True):
+            raise BatchingRejected("CV_MASKED_BATCH_MEMORY_CONTRACT_MISSING")
+        contract = report["guard"].get("cv_mask_contract")
+        if (type(contract) is not dict or contract.get("version") != 1 or type(contract.get("inputs")) is not list
+                or len(contract["inputs"]) != 2 or type(contract.get("outputs")) is not list
+                or not contract["outputs"]):
+            raise BatchingRejected("CV_MASKED_BATCH_DOT_CONTRACT_MISSING")
+    if report.get("tail_policy") != "full_groups_only":
+        raise BatchingRejected("CV_TAIL_CONTRACT_MISSING")
+    contract = normalize_program_grid_transforms(metadata.get("program_grid_transforms"))
+    expected = dict(order=0, kind="ceil_div", axis=report["selected_axis"], factor=report["lane_width"],
+                    persistent_coverage=False, grid_stride_abi_verified=False)
+    if (contract is None or contract["version"] != 3 or contract["hidden_extent_axes"] != [0, 1, 2]
+            or contract["transforms"] != [expected]):
+        raise BatchingRejected("CV_GRID_CONTRACT_MISMATCH")
+    if (metadata.get("program_grid_mapping_applied") is not True
+            or any(metadata.get(key) is not False for key in ("row_coalescing_applied", "ptsm_cap_authorized"))):
+        raise BatchingRejected("CV_MAPPING_CONFLICT")
+    auto_blockify = metadata.get("auto_blockify_enabled")
+    if auto_blockify is not False and auto_blockify is not True:
+        raise BatchingRejected("CV_MAPPING_CONFLICT")
+    if auto_blockify and (report.get("cv_lowering") not in ("rank3_masked_batch_v1", "spatial_m_v1", "spatial_n_v1")
+                          or metadata.get("mix_mode") != "mix"
+                          or metadata.get("has_auto_blockify_blacklist_op") is not False):
+        raise BatchingRejected("CV_AUTO_BLOCKIFY_NOT_PROVEN")
+    # v1 validates independent programs, not cross-program synchronization.
+    # Standard MIX/AIC workspace and per-core CV synchronization are retained.
+    locks = metadata.get("sync_block_lock_layout", 0)
+    if type(locks) is not int or locks != 0:
+        raise BatchingRejected("CV_GLOBAL_SYNC_NOT_SUPPORTED")
+    task = metadata.get("bs_task_type", 0)
+    if type(task) is not int or (task != 0 and task // 10 not in (1, 2, 3, 4)):
+        raise BatchingRejected("CV_INVALID_TASK_TYPE")
 
 
 def validate_compilation_result(metadata):
@@ -17,11 +71,15 @@ def validate_compilation_result(metadata):
     workspace = metadata.get("workspace_size", 0)
     if type(workspace) is not int or workspace < 0:
         raise BatchingRejected("INVALID_WORKSPACE_SIZE")
-    if metadata.get("is_pure_simt") or metadata.get("mix_mode") != "aiv":
+    cv = metadata["block_batching"].get("cv_mode") in ("independent_batch_v1", "spatial_concat_v1")
+    if metadata.get("is_pure_simt") or metadata.get("mix_mode") not in (("mix", "aic") if cv else ("aiv", )):
         raise BatchingRejected("UNSUPPORTED_FINAL_EXECUTION_MODE")
+    if cv:
+        _validate_cv_contract(metadata)
     metadata["block_batching"].update(
-        compile_status="COMPILED_GUARDED", owner="block_batching",
-        validation_policy=VALIDATION_POLICY,
+        compile_status="COMPILED_GUARDED",
+        owner="block_batching",
+        validation_policy=CV_VALIDATION_POLICY if cv else VALIDATION_POLICY,
         resource_validation="backend_compile_success",
         execution_mode_validation="standard_backend_metadata",
         internal_simt="not_inspected",
