@@ -156,5 +156,6 @@ The [2026-11-02 AutoBlockify validation](cv_auto_blockify_validation_20261102.md
 records the later six-kernel experiment with AutoBlockify enabled on both sides.
 Those timings belong to the recorded pre-integration commit. The
 [unified-plan integration validation](cv_unified_integration_validation_20261102.md)
-records the new native build and host regression results, and the pending
-device checks.
+records the new native build, 1004 host-test passes, and 19 device cases with
+92 numerical checks for M/N, independent BH, admitted tails, fallback and
+AutoBlockify scheduling. It adds no new performance measurements.
