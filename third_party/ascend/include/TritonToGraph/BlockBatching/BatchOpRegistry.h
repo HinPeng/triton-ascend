@@ -9,7 +9,7 @@
 #include <cstdint>
 
 namespace mlir::triton::cfg {
-inline constexpr unsigned kBatchImplementationVersion = 20;
+inline constexpr unsigned kBatchImplementationVersion = 27;
 enum class BatchModel {
   Domain,
   Constant,
@@ -20,6 +20,7 @@ enum class BatchModel {
   Scan,
   ControlFlow,
   IndexCast,
+  Dot,
   Structural,
   Deferred,
   Rejected
@@ -38,7 +39,8 @@ enum class BatchAttributePolicy {
   Reshape,
   Transpose,
   Scan,
-  External
+  External,
+  Dot
 };
 enum class BatchInactivePolicy {
   Preserve,

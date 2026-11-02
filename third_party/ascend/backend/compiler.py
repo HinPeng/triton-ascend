@@ -244,6 +244,13 @@ def _finalize_program_launch_policy(metadata, opt):
     else:
         auto_blockify_enabled = (_is_auto_map_parallel_blocks_enabled() and not has_auto_blockify_blacklist_op
                                  and not ptsm_cap_authorized)
+    cv_report = metadata.get("block_batching", {})
+    if cv_report.get("cv_mode") in ("independent_batch_v1", "spatial_concat_v1"):
+        # Masked batches and shared-operand spatial concatenation retain the
+        # original-grid ABI while AutoBlockify loops over grouped programs.
+        auto_blockify_enabled &= (cv_report.get("cv_lowering")
+                                  in ("rank3_masked_batch_v1", "spatial_m_v1", "spatial_n_v1")
+                                  and metadata["mix_mode"] == "mix")
 
     if auto_blockify_enabled and ptsm_cap_authorized:
         raise RuntimeError("AutoBlockify and persistent-grid cap cannot both be enabled")
@@ -362,7 +369,9 @@ def make_ttir(mod, metadata, opt):
         if rewrite is None:
             raise RuntimeError("block batching requires the matching rebuilt C++ rewriter")
         batch_source = str(mod)
-        report = dict(rewrite(mod, opt.block_batching_factor, opt.block_batching_axis, opt.block_batching_layout))
+        report = dict(
+            rewrite(mod, opt.block_batching_factor, opt.block_batching_axis, opt.block_batching_layout,
+                    opt.block_batching_cv, opt.block_batching_cv and opt.enable_hivm_batch_matmul))
         if report.get("implementation_version") != opt.block_batching_implementation:
             raise BatchingRejected("REWRITER_IMPLEMENTATION_MISMATCH")
         if report.get("lane_width") != opt.block_batching_factor and report["compile_status"] == "REWRITTEN":
@@ -374,6 +383,12 @@ def make_ttir(mod, metadata, opt):
         report["layout"]["selected_policy"] = opt.block_batching_layout
         report["guard"] = json.loads(report.pop("guard_json"))
         report["guard"]["axis"] = report["selected_axis"]
+        if report.get("cv_lowering") == "rank3_masked_batch_v1":
+            report["guard"]["require_same_fractal_bounds"] = True
+            from .block_batching_guard_v2 import static_cv_mask_refusal
+            reason = static_cv_mask_refusal(report["guard"])
+            if reason:
+                raise BatchingRejected(reason)
         from .block_batching_guard_v3 import bind_plan
         bind_plan(report["guard"], batch_source)
         report["owner"] = "block_batching"
@@ -680,6 +695,24 @@ def _full_row_copy_compile_options(metadata, compiler_path):
     return []
 
 
+def _masked_batch_compile_options(metadata, compiler_path):
+    report = metadata.get("block_batching", {})
+    if report.get("cv_lowering") != "rank3_masked_batch_v1":
+        return []
+    # Masked ND2NZ must retain the allocation's complete fractal footprint.
+    # Its current batch libcall does not initialize extra fractal blocks when
+    # trimming a rectangle shrinks that footprint (e.g. f32 K32 -> K23).
+    # A vector-ND2NZ option alone does not fix this. Keep source masks and
+    # Require unchanged 32-byte padding quanta in both axes as well as the
+    # allocation footprint: physical 16-row NZ extents alone do not suffice
+    # for transposed f32 K tails on the packaged batch-DMA implementation.
+    if (not metadata["target"].arch.startswith("Ascend950")
+            or report.get("guard", {}).get("require_same_fractal_bounds") is not True):
+        raise BatchingRejected("CV_MASKED_BATCH_MEMORY_LOWERING_UNSUPPORTED")
+    report["cv_memory_lowering"] = "full_reduction_guard_v3"
+    return []
+
+
 def get_auto_bind_sub_block_option(metadata):
     # auto_tile_and_bind_subblock is read from the module.
     # enable_auto_bind_sub_block is set by the user and has a higher priority.
@@ -938,6 +971,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if opt.debug:
             _compile_option_list += [f"--save-temps={_get_save_temps_dir(metadata['hash'])}"]
 
+        _compile_option_list += _masked_batch_compile_options(metadata, npu_compiler_path)
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
 
         if opt.debug or knobs.autotuning.print:
@@ -953,7 +987,9 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             diagnostic = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else str(e.stderr or "")
             layout = metadata.get("block_batching", {}).get("layout", {})
             applied = any(row.get("rewritten") for row in layout.get("accesses", ()))
-            from .block_batching import LayoutTargetRejected, _layout_resource_refusal
+            from .block_batching import LayoutTargetRejected, _layout_resource_refusal, CVTargetRejected, _cv_resource_refusal
+            if opt.block_batching_cv and _cv_resource_refusal(e.returncode, diagnostic):
+                raise CVTargetRejected(diagnostic[-16000:]) from e
             if (opt.block_batching_layout == "auto" and applied and _layout_resource_refusal(e.returncode, diagnostic)):
                 raise LayoutTargetRejected(opt.block_batching_factor, opt.block_batching_axis,
                                            diagnostic[-16000:]) from e
@@ -1294,6 +1330,7 @@ class NPUOptions:
     instrumentation_mode: str = ""
     enable_graph_optimize: bool = True
     block_batching_factor: int = 1
+    block_batching_cv: bool = False
     block_batching_axis: int = -1
     block_batching_layout: str = "auto"
     block_batching_implementation: int = field(default=IMPLEMENTATION_VERSION, init=False)
@@ -1419,10 +1456,10 @@ class NPUOptions:
     use_bytecode: bool = field(default=False, init=False)
 
     def __post_init__(self, arch, rule_mask):
-        BatchRequest(self.block_batching_factor, self.block_batching_axis)
+        BatchRequest(self.block_batching_factor, self.block_batching_axis, self.block_batching_cv)
         if self.block_batching_layout not in ("auto", "semantic_only"):
             raise ValueError("block_batching_layout must be auto or semantic_only")
-        if self.block_batching_factor == 1:
+        if self.block_batching_factor == 1 or self.block_batching_cv:
             object.__setattr__(self, "block_batching_layout", "semantic_only")
         if self.block_batching_factor > 1:
             compiler_path, _ = _get_npucompiler_path()

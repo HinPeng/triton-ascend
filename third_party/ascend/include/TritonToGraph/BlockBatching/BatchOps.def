@@ -40,7 +40,7 @@ BATCH_OP("tt.map_elementwise", E, Deferred, None, Preserve, false)
 BATCH_OP("tt.map_elementwise.return", S, Structural, None, Preserve, false)
 BATCH_OP("tt.gather", E, Deferred, None, Preserve, false)
 BATCH_OP("tt.histogram", E, Deferred, None, Preserve, false)
-BATCH_OP("tt.dot", E, Deferred, None, Preserve, false)
+BATCH_OP("tt.dot", E, Dot, Dot, Preserve, true)
 BATCH_OP("tt.dot_scaled", E, Deferred, None, Preserve, false)
 // A verified f32 libdevice subset; E classification remains unchanged.
 // Positive fills all new inactive inputs with 1: safe for pow and tanh.

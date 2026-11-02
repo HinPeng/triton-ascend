@@ -7,19 +7,22 @@ compiler artifacts; rejected or guarded calls select the complete baseline.
 """
 from dataclasses import dataclass
 
-IMPLEMENTATION_VERSION = 20
+IMPLEMENTATION_VERSION = 27
 
 
 @dataclass(frozen=True)
 class BatchRequest:
     factor: int = 1
     axis: int = -1
+    cv: bool = False
 
     def __post_init__(self):
         if type(self.factor) is not int or self.factor <= 0:
             raise ValueError("block_batching_factor must be a positive integer (not bool)")
         if type(self.axis) is not int or self.axis not in (-1, 0, 1, 2):
             raise ValueError("block_batching_axis must be -1, 0, 1 or 2 (not bool)")
+        if type(self.cv) is not bool:
+            raise ValueError("block_batching_cv must be bool")
 
 
 def analyze_request(mod, request, binding):
@@ -39,7 +42,7 @@ def analyze_request(mod, request, binding):
     analyze = getattr(binding, "analyze_block_batching", None)
     if analyze is None:
         raise RuntimeError("block_batching requires a matching rebuilt Ascend C++ extension")
-    return dict(analyze(mod, request.factor, request.axis))
+    return dict(analyze(mod, request.factor, request.axis, request.cv))
 
 
 class BatchingRejected(RuntimeError):
@@ -54,6 +57,23 @@ class LayoutTargetRejected(BatchingRejected):
         self.factor, self.axis = factor, axis
         self.diagnostic = diagnostic
         self.stage = "npubin"
+
+
+class CVTargetRejected(BatchingRejected):
+    """Modeled on-chip resource refusal before any candidate submission."""
+
+    def __init__(self, diagnostic):
+        super().__init__("CV_TARGET_RESOURCE_REJECTED")
+        self.diagnostic = diagnostic
+        self.stage = "npubin"
+
+
+def _cv_resource_refusal(returncode, diagnostic):
+    import re
+    if _internal_backend_error(returncode, diagnostic):
+        return False
+    return re.search(r"\b(?:ub|cbuf|ca|cb|cc) overflow,\s*requires\s+\d+\s+bits\s+while\s+\d+\s+bits\s+available\b",
+                     diagnostic, re.IGNORECASE) is not None
 
 
 def _internal_backend_error(returncode, diagnostic):
@@ -136,15 +156,15 @@ class BatchKernel:
         self._ready = False
         self._local = threading.local()
         self.hash = candidate.hash if candidate is not None else hashlib.sha256(
-            f"{baseline.hash}:block_batching:{request.factor}:{request.axis}:{IMPLEMENTATION_VERSION}".encode(
-            )).hexdigest()
+            f"{baseline.hash}:block_batching:{request.factor}:{request.axis}:{request.cv}:{IMPLEMENTATION_VERSION}".
+            encode()).hexdigest()
         fields = dict(self._primary.metadata._asdict(), block_batching=report)
         self.metadata = namedtuple("BatchKernelMetadata", sorted(fields))(**fields)
         from triton.runtime.cache import get_cache_manager
         manifest = {
             "version": 1, "baseline_hash": baseline.hash, "candidate_hash":
             candidate.hash if candidate is not None else None, "request":
-            {"factor": request.factor, "axis": request.axis}, "report": report
+            {"factor": request.factor, "axis": request.axis, "cv": request.cv}, "report": report
         }
         get_cache_manager(self.hash).put(json.dumps(manifest, sort_keys=True), "block_batching.bundle.json")
 
@@ -201,7 +221,9 @@ class BatchKernel:
         arguments = launch[9:]
         if self.candidate is not None:
             capture = _capture_state()
-            if capture is not False:
+            if self.request.cv and grid[self.block_batching["selected_axis"]] % self.request.factor:
+                reason = "CV_GRID_NOT_DIVISIBLE"
+            elif capture is not False:
                 reason = "CAPTURE_BASELINE" if capture else "CAPTURE_QUERY_UNAVAILABLE"
             else:
                 runtime_args = [arguments[index] for index in self.positions]
@@ -286,9 +308,10 @@ def compile_bundle(backend, src, options, compile_variant):
     import subprocess
     import hashlib
     from triton.compiler.errors import MLIRCompilationError
-    request = BatchRequest(options.get("block_batching_factor", 1), options.get("block_batching_axis", -1))
+    request = BatchRequest(options.get("block_batching_factor", 1), options.get("block_batching_axis", -1),
+                           options.get("block_batching_cv", False))
     normalized = backend.parse_options(options)
-    baseline_options = dict(options, block_batching_factor=1, block_batching_axis=-1)
+    baseline_options = dict(options, block_batching_factor=1, block_batching_axis=-1, block_batching_cv=False)
     freeze_rejection = None
     try:
         frozen = _freeze_source(backend, src, baseline_options, normalized.block_batching_backend_revision)
@@ -314,14 +337,17 @@ def compile_bundle(backend, src, options, compile_variant):
             raise BatchingRejected("AST_SOURCE_REQUIRED")
         positions = _runtime_positions(src)
         candidate, layout_fallback = _compile_layout_candidate(compile_variant, options, frozen, request)
-        from .block_batching_report import VALIDATION_POLICY
+        from .block_batching_report import VALIDATION_POLICY, CV_VALIDATION_POLICY
         native_report = getattr(candidate.metadata, "block_batching", {})
-        if (native_report.get("compile_status") != "COMPILED_GUARDED"
-                or native_report.get("validation_policy") != VALIDATION_POLICY):
+        if (native_report.get("compile_status") != "COMPILED_GUARDED" or native_report.get("validation_policy")
+                != (CV_VALIDATION_POLICY if request.cv else VALIDATION_POLICY)):
             raise BatchingRejected("CANDIDATE_VALIDATION_MISSING")
         if (native_report.get("implementation_version") != IMPLEMENTATION_VERSION
                 or native_report.get("lane_width") != request.factor):
             raise BatchingRejected("CANDIDATE_LAYOUT_MISMATCH")
+        if request.cv and (native_report.get("cv_mode") not in ("independent_batch_v1", "spatial_concat_v1")
+                           or native_report.get("tail_policy") != "full_groups_only"):
+            raise BatchingRejected("CV_CONTRACT_MISMATCH")
         expected = getattr(candidate.metadata, "block_batching_binary_sha256", None)
         if expected != hashlib.sha256(candidate.kernel).hexdigest():
             raise BatchingRejected("CANDIDATE_BINARY_CHANGED")
@@ -345,6 +371,8 @@ def compile_bundle(backend, src, options, compile_variant):
             cause = cause.__cause__
         if isinstance(cause, BatchingRejected):
             report["reason"] = str(cause)
+            if isinstance(cause, CVTargetRejected):
+                report.update(backend_diagnostic=cause.diagnostic, stage=cause.stage)
         elif isinstance(cause, subprocess.CalledProcessError):
             detail = cause.stderr.decode(
                 errors="replace") if isinstance(cause.stderr, bytes) else str(cause.stderr or "")

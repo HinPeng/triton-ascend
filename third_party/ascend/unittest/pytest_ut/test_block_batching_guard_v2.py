@@ -142,6 +142,45 @@ def test_randomized_accepted_boxes_have_no_overlapping_original_writes():
     assert accepted > 40
 
 
+def split_program_guard(divisor, rows, columns):
+    q, r = ["pid_div", 0, divisor, 32], ["pid_rem", 0, divisor, 32]
+    offset = add(add(mul(q, arg(1)), mul(r, arg(2))),
+                 mul(add(mul(coord(0, rows), const(columns)), coord(1, columns)), const(4)))
+    return dict(
+        version=2, axis=0, accesses=[
+            dict(root=0, shape=[rows, columns], offset=offset, mask=None, bytes=4, write=True, pointer_checks=[offset])
+        ])
+
+
+def test_program_split_rejects_partial_rectangles_and_aliases():
+    guard = split_program_guard(4, 2, 2)
+    assert module.check_guard(guard, [1 << 32, 64, 16], (8, 1, 1), 2)[0]
+    assert module.check_guard(guard, [1 << 32, 64, 16], (7, 1, 1), 2) == (False, 'NON_RECTANGULAR_PROGRAM_SPLIT')
+    assert module.check_guard(guard, [1 << 32, 32, 16], (8, 1, 1), 2) == (False, 'OVERLAPPING_BLOCK_WRITES')
+
+
+def test_split_program_proofs_against_enumerated_original_writes():
+    rng = random.Random(10931)
+    accepted = 0
+    for _ in range(200):
+        divisor, groups = rng.randint(1, 5), rng.randint(1, 4)
+        rows, cols = rng.randint(1, 3), rng.randint(1, 4)
+        head_stride = rng.randint(0, 2 * rows * cols) * 4
+        batch_stride = rng.randint(0, 2 * divisor * rows * cols) * 4
+        spec = split_program_guard(divisor, rows, cols)
+        if not module.check_guard(spec, [1 << 32, batch_stride, head_stride], (divisor * groups, 1, 1), 2)[0]:
+            continue
+        accepted += 1
+        writes = set()
+        for p in range(divisor * groups):
+            for i in range(rows * cols):
+                address = (p // divisor) * batch_stride + (p % divisor) * head_stride + 4 * i
+                region = set(range(address, address + 4))
+                assert writes.isdisjoint(region)
+                writes.update(region)
+    assert accepted > 20
+
+
 def loop_guard():
     return {
         "version":
