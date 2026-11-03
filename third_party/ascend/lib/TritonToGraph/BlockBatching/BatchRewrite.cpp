@@ -311,6 +311,40 @@ bool structuredMaskExpr(const BatchExprRef &expr,
   return false;
 }
 
+// The byte-domain summary deliberately ignores predicates it cannot use to
+// tighten a footprint (for example a block pointer's signed lower bound).
+// That does not make an integer-coordinate predicate data-dependent. For the
+// exact rank-two clone path, prove its SSA origin separately while retaining
+// the stronger, conservative memory-domain guard. No predicate is rewritten
+// or erased, and a device-loaded value cannot enter this grammar.
+bool structuredControlMask(Value value, triton::FuncOp function,
+                           const BatchControlFlowPlan &control,
+                           unsigned &budget) {
+  if (!budget--)
+    return false;
+  if (auto arg = dyn_cast<BlockArgument>(value)) {
+    if (arg.getOwner() == &function.getBody().front())
+      return isa<IntegerType>(arg.getType());
+    auto loop = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp());
+    return loop && arg == loop.getInductionVar() && !control.isVarying(arg);
+  }
+  Operation *op = value.getDefiningOp();
+  if (!op || !isa<IntegerType>(scalar(value.getType())))
+    return false;
+  if (isa<arith::ConstantOp, triton::GetProgramIdOp,
+          triton::GetNumProgramsOp, triton::MakeRangeOp>(op))
+    return true;
+  if (!isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::ExtSIOp,
+           arith::ExtUIOp, arith::TruncIOp, arith::CmpIOp, arith::AndIOp,
+           arith::OrIOp, arith::XOrIOp, arith::MinSIOp, arith::MaxSIOp,
+           triton::SplatOp, triton::ExpandDimsOp, triton::BroadcastOp,
+           triton::TransOp, triton::ReshapeOp>(op))
+    return false;
+  return llvm::all_of(op->getOperands(), [&](Value operand) {
+    return structuredControlMask(operand, function, control, budget);
+  });
+}
+
 // First masked batch-MMA contract: a conjunction of rectangular upper bounds,
 // identical for all lanes of the merged program axis. Ragged per-batch bounds
 // need a different memory lowering and are deliberately not inferred here.
@@ -864,8 +898,12 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       if (!mask || constantTrueMask(mask))
         continue;
       diagnosticOp = fact.operation;
-      if (!fact.mask || !structuredMaskExpr(fact.mask, cvControlFlow))
-        return reject("CV_UNSTRUCTURED_MEMORY_MASK");
+      if (!fact.mask || !structuredMaskExpr(fact.mask, cvControlFlow)) {
+        unsigned budget = 1024;
+        if (!cvControlFlow ||
+            !structuredControlMask(mask, function, control, budget))
+          return reject("CV_UNSTRUCTURED_MEMORY_MASK");
+      }
       if (auto load = dyn_cast<triton::LoadOp>(fact.operation);
           load && !constantZero(load.getOther()))
         return reject("CV_MASKED_LOAD_REQUIRES_ZERO_OTHER");

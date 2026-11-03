@@ -24,7 +24,7 @@ def loop_dot():
     %zero_i = arith.constant 0 : i32
     %one_i = arith.constant 1 : i32
     %d = scf.for %iv = %zero_i to %n step %one_i
-        iter_args(%carry = %acc) -> (tensor<4x4xf32>) {
+        iter_args(%carry = %acc) -> (tensor<4x4xf32>) : i32 {
       %nested_p = tt.get_program_id x : i32
       %nested_g = tt.get_num_programs x : i32
       %s = arith.addi %nested_p, %nested_g : i32
@@ -113,7 +113,7 @@ def pointer_loop():
     %two = arith.constant 2 : i32
     %advance = arith.constant dense<16> : tensor<4xi32>
     %d:2 = scf.for %iv = %z to %two step %one
-        iter_args(%ptr = %xa, %carry = %acc) -> (tensor<4x!tt.ptr<f32>>, tensor<4x4xf32>) {
+        iter_args(%ptr = %xa, %carry = %acc) -> (tensor<4x!tt.ptr<f32>>, tensor<4x4xf32>) : i32 {
     %ivv = tt.splat %iv : i32 -> tensor<4xi32>
     %loopmask = arith.cmpi slt, %ivv, %nv : tensor<4xi32>
     """ + body.replace("tt.load %ptr :", "tt.load %ptr, %loopmask, %zero :") + """
@@ -167,5 +167,32 @@ def test_uniform_control_requires_owned_contract_and_disables_unvalidated_auto_b
     metadata["auto_blockify_enabled"] = True
     with pytest.raises(BatchingRejected, match="CV_AUTO_BLOCKIFY_NOT_PROVEN"):
         validate_compilation_result(metadata)
+    metadata['has_auto_blockify_blacklist_op'] = False
     compiler._finalize_program_launch_policy(metadata, SimpleNamespace(is_pure_simt=False))
     assert metadata["auto_blockify_enabled"] is False
+
+
+@pytest.mark.parametrize('data_dependent', [False, True])
+def test_control_lower_bound_mask_keeps_stronger_memory_guard(tmp_path, data_dependent):
+    text = loop_dot().replace('    %v = tt.load %xa :', '''
+    %zi = arith.constant dense<0> : tensor<4xi32>
+    %lower = arith.cmpi sge, %range, %zi : tensor<4xi32>
+    %both = arith.andi %lower, %mask : tensor<4xi1>
+    %v = tt.load %xa, %both, %zero :''')
+    if data_dependent:
+        text = text.replace('    %lower = arith.cmpi sge, %range, %zi : tensor<4xi32>', '''
+        %data = tt.load %xa : tensor<4x!tt.ptr<f32>>
+        %lower = arith.cmpf ogt, %data, %zero : tensor<4xf32>''')
+    module = parse(tmp_path, text)
+    before = str(module)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 2, 0, 'auto', True)
+    if data_dependent:
+        assert report['reason'] == 'CV_UNSTRUCTURED_MEMORY_MASK', report
+        assert str(module) == before
+    else:
+        assert report['compile_status'] == 'REWRITTEN', report
+        assert str(module).count('arith.cmpi sge') == 2
+        guard = json.loads(report['guard_json'])
+        assert check_guard(guard, [1 << 30, 1 << 40, 32], (4, 1, 1), 2)[0]
+        assert not check_guard(guard, [1 << 30, 1 << 30, 32], (4, 1, 1), 2)[0]
+        assert module.verify()
