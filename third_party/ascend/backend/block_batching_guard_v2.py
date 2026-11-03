@@ -422,7 +422,14 @@ class ByteDomain:
                 axis = nonzero[0]
                 counts[axis] = min(counts[axis], remaining)
             elif len(nonzero) == 2:
-                grids = [axis for axis in nonzero if axis < 3]
+                # A uniform loop tile has the same exact flattening as a
+                # program tile: j = iteration * tile + local. When the
+                # predicate/address coefficients agree, j covers precisely
+                # [0, min(limit, trip_count * tile)); padded K lanes are not
+                # part of the memory footprint. Keep all arithmetic checks
+                # above, and do not approximate non-unit/gapped recurrences.
+                loop_positions = {value[0] for value in self.loop_axes.values()}
+                grids = [axis for axis in nonzero if axis < 3 or axis in loop_positions]
                 locals_ = [axis for axis in nonzero if 3 <= axis < 3 + len(self.shape)]
                 if len(grids) != 1 or len(locals_) != 1:
                     continue
