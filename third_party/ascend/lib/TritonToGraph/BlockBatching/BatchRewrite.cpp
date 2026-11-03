@@ -320,8 +320,9 @@ bool structuredMaskExpr(const BatchExprRef &expr,
 bool structuredControlMask(Value value, triton::FuncOp function,
                            const BatchControlFlowPlan &control,
                            unsigned &budget) {
-  if (!budget--)
+  if (!budget)
     return false;
+  --budget;
   if (auto arg = dyn_cast<BlockArgument>(value)) {
     if (arg.getOwner() == &function.getBody().front())
       return isa<IntegerType>(arg.getType());
@@ -337,6 +338,7 @@ bool structuredControlMask(Value value, triton::FuncOp function,
   if (!isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::ExtSIOp,
            arith::ExtUIOp, arith::TruncIOp, arith::CmpIOp, arith::AndIOp,
            arith::OrIOp, arith::XOrIOp, arith::MinSIOp, arith::MaxSIOp,
+           arith::DivSIOp, arith::RemSIOp, arith::DivUIOp, arith::RemUIOp,
            triton::SplatOp, triton::ExpandDimsOp, triton::BroadcastOp,
            triton::TransOp, triton::ReshapeOp>(op))
     return false;
