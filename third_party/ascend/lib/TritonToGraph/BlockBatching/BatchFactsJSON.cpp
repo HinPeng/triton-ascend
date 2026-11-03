@@ -27,6 +27,10 @@ llvm::json::Value exprJSON(const BatchExpr &self) {
     return A{"arg", self.value, self.bits};
   case BatchExpr::Program:
     return A{"pid", self.value, self.bits};
+  case BatchExpr::ProgramQuotient:
+  case BatchExpr::ProgramRemainder:
+    return A{self.kind == BatchExpr::ProgramQuotient ? "pid_div" : "pid_rem",
+             self.value, self.extent, self.bits};
   case BatchExpr::Grid:
     return A{"grid", self.value, self.bits};
   case BatchExpr::Coordinate:

@@ -32,7 +32,9 @@ struct Analysis {
   BatchControlFlowPlan plan;
   int axis;
   unsigned budget = 8192;
-  explicit Analysis(int axis) : axis(axis) {}
+  const llvm::DenseSet<Operation *> &replicatedLoads;
+  Analysis(int axis, const llvm::DenseSet<Operation *> &loads)
+      : axis(axis), replicatedLoads(loads) {}
   bool reject(Operation *op, llvm::StringRef reason) {
     if (plan.reason.empty()) {
       plan.reason = reason.str();
@@ -138,7 +140,7 @@ struct Analysis {
       bool varying = llvm::any_of(op.getOperands(),
                                   [&](Value v) { return plan.isVarying(v); });
       if (auto load = dyn_cast<triton::LoadOp>(op);
-          load && load.getIsVolatile())
+          load && (load.getIsVolatile() || replicatedLoads.contains(&op)))
         varying = true;
       if (auto pid = dyn_cast<triton::GetProgramIdOp>(op))
         varying = static_cast<int>(pid.getAxis()) == axis;
@@ -150,8 +152,8 @@ struct Analysis {
 };
 } // namespace
 BatchControlFlowPlan analyzeBatchControlFlow(triton::FuncOp function,
-                                             int axis) {
-  Analysis analysis(axis);
+    int axis, const llvm::DenseSet<Operation *> &replicatedLoads) {
+  Analysis analysis(axis, replicatedLoads);
   for (Value arg : function.getArguments())
     analysis.record(arg, false);
   analysis.block(function.getBody().front());

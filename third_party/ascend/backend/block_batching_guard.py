@@ -176,6 +176,9 @@ def check_guard(guard, arguments, grid, factor):
     try:
         if type(guard.get("version")) is not int:
             raise GuardFailure("INVALID_GUARD_SCHEMA")
+        if guard["version"] == 3:
+            from .block_batching_guard_v3 import check_guard_v3
+            return check_guard_v3(guard, arguments, grid, factor)
         if guard["version"] == 2:
             from .block_batching_guard_v2 import check_guard_v2
             return check_guard_v2(guard, arguments, grid, factor)

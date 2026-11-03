@@ -18,6 +18,8 @@ struct BatchExpr {
     Constant,
     Argument,
     Program,
+    ProgramQuotient,
+    ProgramRemainder,
     Grid,
     Coordinate,
     Induction,

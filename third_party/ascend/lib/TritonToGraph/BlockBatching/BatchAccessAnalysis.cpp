@@ -6,6 +6,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -33,6 +34,68 @@ E add(E lhs, E rhs) {
 E scale(E value, int64_t factor) {
   return K::node(K::Mul, 64, std::move(value), constant(factor));
 }
+
+// One convex hull per scalar column falsely aliases interleaved row fields.
+// Group only unconditional, adjacent fields of the same scalar SSA pointer.
+// The IR and layout access IDs remain unchanged; only the proof is normalized.
+SmallVector<BatchAccessFact>
+jointScalarStoreEffects(triton::FuncOp function,
+                        ArrayRef<BatchAccessFact> accesses) {
+  SmallVector<BatchAccessFact> effects(accesses.begin(), accesses.end());
+  llvm::DenseMap<Value, SmallVector<std::pair<int64_t, unsigned>>> groups;
+  for (auto [id, fact] : llvm::enumerate(accesses)) {
+    auto store = dyn_cast<triton::StoreOp>(fact.operation);
+    if (!store || store->getParentOp() != function.getOperation() ||
+        store.getMask() || !fact.shape.empty() || !fact.loops.empty() ||
+        fact.isVolatile)
+      continue;
+    Value base = store.getPtr();
+    int64_t column = 0;
+    if (auto addptr = base.getDefiningOp<triton::AddPtrOp>()) {
+      auto op = addptr.getOffset().getDefiningOp<arith::ConstantOp>();
+      auto attr = op ? dyn_cast<IntegerAttr>(op.getValue()) : IntegerAttr{};
+      if (attr) {
+        column = attr.getInt();
+        base = addptr.getPtr();
+      }
+    }
+    groups[base].push_back({column, static_cast<unsigned>(id)});
+  }
+  for (auto &entry : groups) {
+    auto &members = entry.second;
+    if (members.size() < 2 || members.size() > 64)
+      continue;
+    llvm::sort(members);
+    unsigned first = members.front().second;
+    const auto &leader = accesses[first];
+    bool contiguous = true;
+    for (auto [column, member] : llvm::enumerate(members)) {
+      const auto &fact = accesses[member.second];
+      contiguous &= member.first == static_cast<int64_t>(column) &&
+                    fact.root == leader.root && fact.bytes == leader.bytes;
+    }
+    if (!contiguous)
+      continue;
+    // Existing ByteDomain joint injectivity still rejects short row strides,
+    // repeated grid axes and aliases with all other read/write effects.
+    auto &joint = effects[first];
+    int64_t count = members.size();
+    joint.shape = {count};
+    joint.byteOffset =
+        add(leader.byteOffset,
+            scale(K::leaf(K::Coordinate, 0, 32, count), leader.bytes));
+    // Keep member slots and original address/pointer checks. False suppresses
+    // only redundant alias hulls, after the guard checks their arithmetic.
+    for (auto member : llvm::drop_begin(members))
+      effects[member.second].mask = K::leaf(K::False);
+  }
+  return effects;
+}
+bool hasUnknown(E expression) {
+  return expression &&
+         (expression->kind == K::Unknown || hasUnknown(expression->lhs) ||
+          hasUnknown(expression->rhs));
+}
 struct Pointer {
   int root = -1;
   E offset;
@@ -45,6 +108,8 @@ struct Analysis {
   unsigned indexBits;
   unsigned budget = 1024;
   bool scalarBounds = false;
+  bool allowDeviceAddress = false;
+  bool normalizedPointer = false;
   llvm::DenseMap<Value, unsigned> inductionVariables;
   BatchAccessReport report;
   explicit Analysis(triton::FuncOp function, unsigned indexBits)
@@ -162,6 +227,20 @@ struct Analysis {
       return integer(op->getOperand(0), *mapped);
     } else {
       auto name = op->getName().getStringRef();
+      if (name == "arith.divsi" || name == "arith.remsi") {
+        auto pid = op->getOperand(0).getDefiningOp<triton::GetProgramIdOp>();
+        auto divisor = op->getOperand(1).getDefiningOp<arith::ConstantOp>();
+        auto amount =
+            divisor ? dyn_cast<IntegerAttr>(divisor.getValue()) : IntegerAttr{};
+        // Original program IDs are nonnegative. The runtime proof splits
+        // p = quotient * divisor + remainder only for complete rectangles.
+        // General signed division, nested quotients and tensor divisors stay
+        // outside the affine access model.
+        if (pid && amount && amount.getInt() > 0 && bitWidth == 32)
+          return K::leaf(
+              name == "arith.divsi" ? K::ProgramQuotient : K::ProgramRemainder,
+              static_cast<int64_t>(pid.getAxis()), 32, amount.getInt());
+      }
       if (scalarBounds && !isa<RankedTensorType>(value.getType()) &&
           (name == "arith.minsi" || name == "arith.maxsi"))
         return K::node(name == "arith.minsi" ? K::MinSI : K::MaxSI, bitWidth,
@@ -195,8 +274,30 @@ struct Analysis {
                        before);
       }
     }
+    if (allowDeviceAddress)
+      return K::leaf(K::Unknown);
     fail(value, "UNSUPPORTED_ADDRESS_EXPRESSION");
     return nullptr;
+  }
+  // Root provenance does not depend on an integer/coordinate summary.
+  // Keep pointer normalization on its separately proved path.
+  int rootOnly(Value value, unsigned &remaining) {
+    if (!remaining)
+      return -1;
+    --remaining;
+    if (auto arg = dyn_cast<BlockArgument>(value))
+      return arg.getOwner() == &function.getBody().front() &&
+                     isa<triton::PointerType>(arg.getType())
+                 ? static_cast<int>(arg.getArgNumber())
+                 : -1;
+    auto *op = value.getDefiningOp();
+    if (!op)
+      return -1;
+    if (isa<triton::AddPtrOp, triton::SplatOp, triton::ExpandDimsOp,
+            triton::BroadcastOp, triton::ReshapeOp, triton::TransOp,
+            triton::UnsplatOp, triton::BitcastOp>(op))
+      return rootOnly(op->getOperand(0), remaining);
+    return -1;
   }
   Pointer pointer(Value value, const Axes &axes, bool normalizedBool = false) {
     if (!spend(value))
@@ -231,8 +332,14 @@ struct Analysis {
         isa<triton::PointerType>(element(op->getOperand(0).getType())))
       return pointer(op->getOperand(0), axes,
                      normalizedBool || isBatchBoolToByteCast(op));
-    if (isa<triton::IntToPtrOp>(op))
-      return addressInteger(op->getOperand(0), axes);
+    if (isa<triton::IntToPtrOp>(op)) {
+      normalizedPointer = true;
+      bool previous = allowDeviceAddress;
+      allowDeviceAddress = false;
+      auto result = addressInteger(op->getOperand(0), axes);
+      allowDeviceAddress = previous;
+      return result;
+    }
     return {};
   }
   Pointer addressInteger(Value value, const Axes &axes) {
@@ -397,7 +504,30 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
         shape.push_back(extent);
       }
     }
+    analysis.normalizedPointer = false;
+    analysis.allowDeviceAddress = !write && !isVolatile;
     Pointer base = analysis.pointer(ptr, axes);
+    analysis.allowDeviceAddress = false;
+    bool summaryUnavailable = false;
+    if (!write && !isVolatile && !analysis.normalizedPointer &&
+        (!base || !analysis.report.reason.empty()) &&
+        analysis.report.reason != "ANALYSIS_BUDGET_EXCEEDED" &&
+        analysis.report.reason != "UNSUPPORTED_POINTER_TYPE" &&
+        analysis.report.reason != "INDEX_LAYOUT_NOT_PROVEN") {
+      unsigned remaining = 1024;
+      int root = analysis.rootOnly(ptr, remaining);
+      if (root >= 0) {
+        base = {root, nullptr, {}};
+        analysis.report.reason.clear();
+        analysis.report.operation = nullptr;
+        summaryUnavailable = true;
+      }
+    }
+    bool deviceAddress = summaryUnavailable || hasUnknown(base.offset);
+    if (deviceAddress) {
+      base.offset = nullptr;
+      base.checks.clear();
+    }
     if (!base && analysis.report.reason.empty())
       analysis.fail(ptr, "UNKNOWN_POINTER_ROOT");
     unsigned bytes = analysis.width(ptr);
@@ -429,8 +559,8 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
       return;
     analysis.report.accesses.push_back(
         {op, base.root, bytes, write, std::move(shape), std::move(base.offset),
-         std::move(mask), std::move(base.checks), std::move(loops),
-         isVolatile});
+         std::move(mask), std::move(base.checks), std::move(loops), isVolatile,
+         deviceAddress, analysis.normalizedPointer});
   });
   if (analysis.report.reason.empty() && analysis.report.accesses.empty())
     analysis.report.reason = "NO_MEMORY_ACCESSES";
@@ -448,7 +578,8 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
   }
   if (analysis.report.reason.empty()) {
     A accesses;
-    for (const auto &fact : analysis.report.accesses) {
+    for (const auto &fact :
+         jointScalarStoreEffects(function, analysis.report.accesses)) {
       A checks, shape, loops;
       for (const auto &step : fact.pointerChecks)
         checks.push_back(batchExprJSON(step));
@@ -465,7 +596,8 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
                              {"bytes", fact.bytes},
                              {"pointer_checks", std::move(checks)},
                              {"loops", std::move(loops)},
-                             {"volatile", fact.isVolatile}});
+                             {"volatile", fact.isVolatile},
+                             {"device_address", fact.deviceAddress}});
     }
     analysis.report.guardJSON =
         llvm::formatv("{0}",

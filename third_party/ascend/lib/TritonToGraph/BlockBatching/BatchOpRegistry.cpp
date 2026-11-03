@@ -53,6 +53,8 @@ bool allowsAttribute(BatchAttributePolicy policy, llvm::StringRef name) {
   case BatchAttributePolicy::External:
     return name == "symbol" || name == "libname" || name == "libpath" ||
            name == "pure";
+  case BatchAttributePolicy::Dot:
+    return name == "inputPrecision" || name == "maxNumImpreciseAcc";
   }
   llvm_unreachable("unknown batch attribute policy");
 }
@@ -82,7 +84,8 @@ llvm::StringRef getBatchModelName(BatchModel model) {
     MODEL(Reduction)
     MODEL(Scan)
     MODEL(ControlFlow)
-    MODEL(IndexCast) MODEL(Structural) MODEL(Deferred) MODEL(Rejected)
+    MODEL(IndexCast)
+    MODEL(Structural) MODEL(Deferred) MODEL(Rejected) MODEL(Dot)
 #undef MODEL
   }
   llvm_unreachable("unknown batch model");
@@ -102,7 +105,7 @@ llvm::StringRef getBatchAttributePolicyName(BatchAttributePolicy policy) {
     POLICY(Compare)
     POLICY(Overflow)
     POLICY(FastMath)
-    POLICY(Reshape) POLICY(Transpose) POLICY(Scan) POLICY(External)
+    POLICY(Reshape) POLICY(Transpose) POLICY(Scan) POLICY(External) POLICY(Dot)
 #undef POLICY
   }
   llvm_unreachable("unknown batch attribute policy");

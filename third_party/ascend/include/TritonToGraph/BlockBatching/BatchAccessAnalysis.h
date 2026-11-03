@@ -24,6 +24,9 @@ struct BatchAccessFact {
   // BatchAccessFact 直接撑过 SmallVector 的 256 字节门槛。
   SmallVector<BatchLoopFact, 0> loops;
   bool isVolatile = false;
+  // Missing summaries retain a real device SSA effect, never an empty domain.
+  bool deviceAddress = false;
+  bool normalizedPointer = false;
 };
 struct BatchAccessReport {
   std::string guardJSON;

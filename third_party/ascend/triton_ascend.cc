@@ -96,13 +96,23 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       return false;
     module.walk([](mlir::Operation *op) {
       op->removeAttr("hacc.block_mapping_owner");
+      op->removeAttr("hacc.batch_effect_order_verified");
     });
     return true;
   });
   m.def(
       "rewrite_block_batching",
       [](mlir::ModuleOp module, py::object factorObject, py::object axisObject,
-         std::string layoutPolicy) {
+         std::string layoutPolicy, py::object cvObject,
+         py::object batchObject) {
+        if (!PyBool_Check(cvObject.ptr()))
+          throw py::value_error("block batching cv must be bool");
+        bool cv = cvObject.cast<bool>();
+        if (!PyBool_Check(batchObject.ptr()))
+          throw py::value_error("block batching cv batch matmul must be bool");
+        bool cvBatchMatmul = batchObject.cast<bool>();
+        if (cvBatchMatmul && !cv)
+          throw py::value_error("batch matmul requires CV opt-in");
         if (!PyLong_CheckExact(factorObject.ptr()) ||
             !PyLong_CheckExact(axisObject.ptr()))
           throw py::value_error(
@@ -115,7 +125,8 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
         if (layoutPolicy != "auto" && layoutPolicy != "semantic_only")
           throw py::value_error("invalid block batching layout policy");
         auto result = mlir::triton::cfg::rewriteBlockBatching(
-            module, {factor, axis, layoutPolicy == "semantic_only"});
+            module,
+            {factor, axis, layoutPolicy == "semantic_only", cv, cvBatchMatmul});
         if (mlir::failed(result))
           throw std::runtime_error(
               "block batching rewrite failed verification");
@@ -135,13 +146,21 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
         report["guard_json"] = result->guardJSON;
         report["layout_json"] = result->layoutJSON;
         report["operations"] = result->operations;
+        report["cv_mode"] = result->cvMode;
+        report["cv_lowering"] = result->cvLowering;
+        report["structured_masks"] = result->structuredMasks;
+        report["tail_policy"] = cv ? "full_groups_only" : "masked";
         return report;
       },
       py::arg("module"), py::arg("factor"), py::arg("axis"),
-      py::arg("layout_policy") = "auto");
+      py::arg("layout_policy") = "auto", py::arg("cv") = false,
+      py::arg("cv_batch_matmul") = false);
   m.def(
       "analyze_block_batching",
-      [](mlir::ModuleOp module, py::object factor, py::object axis) {
+      [](mlir::ModuleOp module, py::object factor, py::object axis,
+         py::object cv) {
+        if (!PyBool_Check(cv.ptr()))
+          throw py::value_error("block batching cv must be bool");
         if (!PyLong_CheckExact(factor.ptr()) || !PyLong_CheckExact(axis.ptr()))
           throw py::value_error(
               "block batching factor and axis must be integers (not bool)");
@@ -149,8 +168,9 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
         const auto axisValue = axis.cast<int64_t>();
         if (factorValue <= 0 || axisValue < -1 || axisValue > 2)
           throw py::value_error("invalid block batching factor or axis");
-        mlir::triton::cfg::BatchRequest request{
-            factorValue, static_cast<int32_t>(axisValue)};
+        mlir::triton::cfg::BatchRequest request{factorValue,
+                                                static_cast<int32_t>(axisValue),
+                                                true, cv.cast<bool>()};
         auto report = mlir::triton::cfg::analyzeBlockBatching(module, request);
         if (mlir::failed(report))
           throw py::value_error("invalid block batching request");
@@ -171,7 +191,8 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
         result["operations"] = report->operations;
         return result;
       },
-      py::arg("module"), py::arg("factor"), py::arg("axis"));
+      py::arg("module"), py::arg("factor"), py::arg("axis"),
+      py::arg("cv") = false);
   m.def("add_auto_blockify", [](mlir::PassManager &pm, int autoBlockifySize) {
     AutoBlockifyOptions opts;
     opts.autoBlockifySize = autoBlockifySize;

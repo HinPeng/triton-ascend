@@ -286,6 +286,97 @@ def test_bundle_selects_complete_variant_and_rechecks_alias(bundle_environment):
     assert env.base.initializations == env.candidate.initializations == 1
 
 
+def test_cv_partial_group_selects_complete_baseline(bundle_environment):
+    env = bundle_environment
+    env.wrapper.request = batching.BatchRequest(2, 0, True)
+    env.wrapper.run(*env.launch)
+    assert env.wrapper.last_launch['runtime_status'] == 'APPLIED'
+    partial = list(env.launch)
+    partial[0] = 3
+    env.wrapper.run(*partial)
+    assert env.wrapper.last_launch['reason'] == 'CV_GRID_NOT_DIVISIBLE'
+    assert env.wrapper.last_launch['applied_factor'] == 1
+    assert [name for name, _ in env.launches] == ['candidate', 'baseline']
+
+
+@pytest.mark.parametrize('memory', ['ub', 'cbuf', 'ca', 'cb', 'cc'])
+def test_cv_resource_refusal_never_hides_crash(memory):
+    message = f'{memory} overflow, requires 8388608 bits while 4194304 bits available'
+    assert batching._cv_resource_refusal(1, message)
+    assert not batching._cv_resource_refusal(-6, message)
+    assert not batching._cv_resource_refusal(1, 'LLVM ERROR: ' + message)
+    assert not batching._cv_resource_refusal(1, 'possible overflow in ' + memory)
+
+
+def cv_metadata():
+    return dict(
+        block_batching=dict(cv_mode='independent_batch_v1', cv_lowering='rank3_batch_v1',
+                            tail_policy='full_groups_only', selected_axis=0, lane_width=4), workspace_size=0,
+        is_pure_simt=False, mix_mode='mix', program_grid_mapping_applied=True, row_coalescing_applied=False,
+        auto_blockify_enabled=False, ptsm_cap_authorized=False, program_grid_transforms=dict(
+            version=3, extent_source='runtime_original_grid', hidden_extent_axes=[0, 1, 2],
+            hidden_argument_order=['originalGridX', 'originalGridY',
+                                   'originalGridZ'], hidden_argument_types=['i32', 'i32', 'i32'], transforms=[
+                                       dict(order=0, kind='ceil_div', axis=0, factor=4, persistent_coverage=False,
+                                            grid_stride_abi_verified=False)
+                                   ]))
+
+
+def test_cv_final_artifact_requires_matching_launch_contract():
+    metadata = cv_metadata()
+    report_module.validate_compilation_result(metadata)
+    assert metadata['block_batching']['validation_policy'] == report_module.CV_VALIDATION_POLICY
+    for field, value, reason in [('sync_block_lock_layout', 1, 'CV_GLOBAL_SYNC_NOT_SUPPORTED'),
+                                 ('auto_blockify_enabled', True, 'CV_AUTO_BLOCKIFY_NOT_PROVEN'),
+                                 ('mix_mode', 'aiv', 'UNSUPPORTED_FINAL_EXECUTION_MODE'),
+                                 ('bs_task_type', 91, 'CV_INVALID_TASK_TYPE')]:
+        metadata = cv_metadata()
+        metadata[field] = value
+        with pytest.raises(batching.BatchingRejected, match=reason):
+            report_module.validate_compilation_result(metadata)
+    metadata = cv_metadata()
+    metadata['block_batching']['lane_width'] = 8
+    with pytest.raises(batching.BatchingRejected, match='CV_GRID_CONTRACT_MISMATCH'):
+        report_module.validate_compilation_result(metadata)
+
+
+def test_masked_cv_auto_blockify_requires_compatible_lowering_and_blacklist():
+    metadata = cv_metadata()
+    metadata['block_batching'].update(
+        cv_lowering='rank3_masked_batch_v1', cv_memory_lowering='full_reduction_guard_v3',
+        guard=dict(require_same_fractal_bounds=True, cv_mask_contract=dict(version=1, inputs=[{}, {}], outputs=[{}])))
+    metadata.update(auto_blockify_enabled=True, has_auto_blockify_blacklist_op=False, enable_hivm_batch_matmul=True)
+    report_module.validate_compilation_result(metadata)
+    assert metadata['block_batching']['validation_policy'] == report_module.CV_VALIDATION_POLICY
+    metadata['has_auto_blockify_blacklist_op'] = True
+    with pytest.raises(batching.BatchingRejected, match='CV_AUTO_BLOCKIFY_NOT_PROVEN'):
+        report_module.validate_compilation_result(metadata)
+    metadata['has_auto_blockify_blacklist_op'] = False
+    metadata['block_batching']['cv_lowering'] = 'rank3_batch_v1'
+    with pytest.raises(batching.BatchingRejected, match='CV_AUTO_BLOCKIFY_NOT_PROVEN'):
+        report_module.validate_compilation_result(metadata)
+
+
+@pytest.mark.parametrize('lowering', ['spatial_m_v1', 'spatial_n_v1'])
+def test_spatial_auto_blockify_preserves_mapping_and_sync_guards(lowering):
+    metadata = cv_metadata()
+    metadata['block_batching'].update(cv_mode='spatial_concat_v1', cv_lowering=lowering)
+    metadata.update(auto_blockify_enabled=True, has_auto_blockify_blacklist_op=False)
+    report_module.validate_compilation_result(metadata)
+    for key, value, reason in [
+        ('has_auto_blockify_blacklist_op', True, 'CV_AUTO_BLOCKIFY_NOT_PROVEN'),
+        ('mix_mode', 'aic', 'CV_AUTO_BLOCKIFY_NOT_PROVEN'),
+        ('row_coalescing_applied', True, 'CV_MAPPING_CONFLICT'),
+        ('ptsm_cap_authorized', True, 'CV_MAPPING_CONFLICT'),
+        ('sync_block_lock_layout', 1, 'CV_GLOBAL_SYNC_NOT_SUPPORTED'),
+    ]:
+        old = metadata.get(key)
+        metadata[key] = value
+        with pytest.raises(batching.BatchingRejected, match=reason):
+            report_module.validate_compilation_result(metadata)
+        metadata[key] = old
+
+
 def test_bundle_capture_and_empty_choose_safe_paths(bundle_environment, monkeypatch):
     env = bundle_environment
     env.wrapper.run(*env.launch)
@@ -467,13 +558,11 @@ def test_bundle_rejects_cached_candidate_from_old_policy(bundle_environment, pol
         backend, src, {"block_batching_factor": 3, "block_batching_axis": 0, "compile_mode": "simd_simt_template"},
         compile_variant)
     assert all(x["compile_mode"] == "simd_simt_template" for x in seen)
-    if policy == "ta_only_v1":
-        assert kernel.candidate is env.candidate
-    else:
-        assert kernel.candidate is None
-        assert kernel.block_batching["reason"] == "CANDIDATE_VALIDATION_MISSING"
+    assert kernel.candidate is None
+    assert kernel.block_batching["reason"] == ("CANDIDATE_PLAN_CHANGED"
+                                               if policy == "ta_only_v1" else "CANDIDATE_VALIDATION_MISSING")
     kernel.run(*env.launch)
-    assert env.launches[-1][0] == ("candidate" if policy == "ta_only_v1" else "baseline")
+    assert env.launches[-1][0] == "baseline"
 
 
 def test_ub_compile_failure_selects_complete_baseline(bundle_environment):
@@ -498,7 +587,7 @@ def test_ub_compile_failure_selects_complete_baseline(bundle_environment):
     assert env.launches[-1][0] == "baseline"
 
 
-@pytest.mark.parametrize("version,lane_width", [(2, 3), (3, 4), (None, 3)])
+@pytest.mark.parametrize("version,lane_width", [(2, 3), (3, 4), (18, 3), (19, 3), (None, 3)])
 def test_bundle_rejects_old_or_padded_layout(bundle_environment, version, lane_width):
     import hashlib
     env = bundle_environment

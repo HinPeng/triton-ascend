@@ -97,13 +97,27 @@ def test_address_stride_mismatch(tmp_path):
     assert rows[1]["action"] == "MemoryView"
 
 
-def test_original_address_division_stays_rejected(tmp_path):
+def test_original_address_division_never_authorizes_overlapping_writes(tmp_path):
     text = pointwise(0).replace("%base = arith.muli %p, %b", "%base = arith.divsi %p, %b")
     module = parse(tmp_path, text)
     before = str(module)
     result = ascend.passes.ttir.analyze_block_batching(module, 3, 0)
-    assert result["compile_status"] == "REJECTED"
-    assert result["reason"] == "UNSUPPORTED_ADDRESS_EXPRESSION"
+    assert result["compile_status"] == "ANALYZED"
+    assert str(module) == before
+    result = ascend.passes.ttir.rewrite_block_batching(module, 3, 0)
+    assert result['compile_status'] == 'REWRITTEN'
+    from triton.backends.ascend.block_batching_guard import check_guard
+    guard = dict(json.loads(result['guard_json']), axis=0)
+    assert check_guard(guard, [1 << 32, 1 << 45, 64], (8, 1, 1), 3) == (False, 'OVERLAPPING_BLOCK_WRITES')
+
+
+def test_general_address_division_stays_rejected(tmp_path):
+    text = pointwise(0).replace("%base = arith.muli %p, %b", "%base = arith.divsi %p, %n")
+    module = parse(tmp_path, text)
+    before = str(module)
+    result = ascend.passes.ttir.analyze_block_batching(module, 3, 0)
+    assert result['compile_status'] == 'REJECTED'
+    assert result['reason'] == 'UNSUPPORTED_ADDRESS_EXPRESSION'
     assert str(module) == before
 
 
