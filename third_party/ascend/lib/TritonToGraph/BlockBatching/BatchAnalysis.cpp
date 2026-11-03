@@ -66,9 +66,8 @@ FailureOr<BatchAnalysisReport> analyzeBlockBatching(ModuleOp module,
   if (report.reason.empty()) {
     // Analyze with the same registry and verifier on a private clone. This
     // report never authorizes a launch: alias/resource/mode proofs remain.
-    OwningOpRef<ModuleOp> sandbox(module.clone());
     request.semanticOnly = true;
-    auto rewrite = rewriteBlockBatching(sandbox.get(), request);
+    auto rewrite = probeBlockBatching(module, request);
     if (failed(rewrite))
       return failure();
     report.status =

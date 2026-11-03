@@ -1,5 +1,7 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+#include "TritonToGraph/BlockBatching/BatchFactsJSON.h"
 #include "TritonToGraph/BlockBatching/BatchAccessAnalysis.h"
+#include "TritonToGraph/BlockBatching/BatchLoopForm.h"
 #include "TritonToGraph/BlockBatching/MemoryModels.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -12,78 +14,6 @@
 #include <optional>
 
 namespace mlir::triton::cfg {
-BatchExprRef BatchExpr::leaf(Kind kind, int64_t value, unsigned bits,
-                             int64_t extent) {
-  return std::make_shared<BatchExpr>(
-      BatchExpr{kind, bits, value, extent, {}, {}});
-}
-BatchExprRef BatchExpr::node(Kind kind, unsigned bits, BatchExprRef lhs,
-                             BatchExprRef rhs, unsigned sourceBits) {
-  return std::make_shared<BatchExpr>(
-      BatchExpr{kind, bits, 0, sourceBits, std::move(lhs), std::move(rhs)});
-}
-BatchExprRef BatchExpr::range(BatchExprRef start, BatchExprRef projection) {
-  return std::make_shared<BatchExpr>(
-      BatchExpr{Add, 32, 0, 0, std::move(start), std::move(projection), true});
-}
-llvm::json::Value batchExprJSON(const BatchExprRef &expr) {
-  return expr ? expr->json() : llvm::json::Value(nullptr);
-}
-llvm::json::Value BatchExpr::json() const {
-  using A = llvm::json::Array;
-  switch (kind) {
-  case Constant:
-    return A{"const", value, bits};
-  case Argument:
-    return A{"arg", value, bits};
-  case Program:
-    return A{"pid", value, bits};
-  case ProgramQuotient:
-  case ProgramRemainder:
-    return A{kind == ProgramQuotient ? "pid_div" : "pid_rem", value, extent,
-             bits};
-  case Grid:
-    return A{"grid", value, bits};
-  case Coordinate:
-    return A{"coord", value, extent, bits};
-  case Induction:
-    return A{"iv", value, bits};
-  case True:
-    return A{"true"};
-  case False:
-    return A{"false"};
-  case Unknown:
-    return A{"unknown"};
-  case And:
-    return A{"and", batchExprJSON(lhs), batchExprJSON(rhs)};
-  case SLT:
-  case ULT:
-  case EQ:
-    return A{kind == SLT   ? "slt"
-             : kind == ULT ? "ult"
-                           : "eq",
-             batchExprJSON(lhs), batchExprJSON(rhs), bits};
-  case ExtSI:
-  case ExtUI:
-  case Trunc:
-    return A{kind == ExtSI   ? "extsi"
-             : kind == ExtUI ? "extui"
-                             : "trunci",
-             bits, batchExprJSON(lhs), extent};
-  case MinSI:
-  case MaxSI:
-    return A{kind == MinSI ? "minsi" : "maxsi", bits, batchExprJSON(lhs),
-             batchExprJSON(rhs)};
-  case Add:
-  case Sub:
-  case Mul:
-    return A{kind == Add   ? "addi"
-             : kind == Sub ? "subi"
-                           : "muli",
-             bits, batchExprJSON(lhs), batchExprJSON(rhs)};
-  }
-  llvm_unreachable("unhandled batch coordinate expression");
-}
 namespace {
 using J = llvm::json::Value;
 using A = llvm::json::Array;
@@ -605,22 +535,23 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
       analysis.fail(ptr, "UNSUPPORTED_POINTER_TYPE");
     if (!analysis.report.reason.empty())
       return;
-    A loops;
+    SmallVector<BatchLoopFact, 0> loops;
     for (Operation *parent = op->getParentOp();
          parent != function.getOperation(); parent = parent->getParentOp()) {
       if (auto loop = dyn_cast<scf::ForOp>(parent)) {
-        if (write) {
-          analysis.fail(ptr, "LOOP_WRITE_NOT_IMPLEMENTED");
-          return;
-        }
-        loops.push_back(llvm::json::Object{
-            {"id", analysis.inductionVariables.lookup(loop.getInductionVar())},
-            {"bits", analysis.bits(loop.getInductionVar().getType())},
-            {"lower",
-             batchExprJSON(analysis.integer(loop.getLowerBound(), {}))},
-            {"upper",
-             batchExprJSON(analysis.integer(loop.getUpperBound(), {}))},
-            {"step", batchExprJSON(analysis.integer(loop.getStep(), {}))}});
+        // 循环内的写不再在这里拒（S8b2）。它和循环内的读走同一条证明：地址归一到
+        // 逻辑轴，再由布局层证方向与步长链。证不出的话驱动层的
+        // LOOP_ACCESS_NOT_PROVEN 会把整条 kernel 拒掉，不会悄悄放行。
+        BatchLoopFact fact;
+        fact.id = analysis.inductionVariables.lookup(loop.getInductionVar());
+        fact.bits = analysis.bits(loop.getInductionVar().getType());
+        fact.lower = analysis.integer(loop.getLowerBound(), {});
+        fact.upper = analysis.integer(loop.getUpperBound(), {});
+        fact.step = analysis.integer(loop.getStep(), {});
+        // 跨行归约在 IR 里的对应物就是 iter_args，判定层的关卡 1.5a 查的是这一位
+        // （设计 §2.4 第 13 行）。这里是它全程唯一的生产者。
+        fact.carriesValues = batchLoopCarriesValues(loop);
+        loops.push_back(std::move(fact));
       }
     }
     E mask = analysis.mask(predicate, axes);
@@ -633,15 +564,29 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
   });
   if (analysis.report.reason.empty() && analysis.report.accesses.empty())
     analysis.report.reason = "NO_MEMORY_ACCESSES";
+  // 把按访存挂的循环事实收成函数级一份，同一条循环只留一次。上面已经按由内向外
+  // 的次序填好了每条访存的 loops，这里只做去重与排序，不重新证任何东西。
+  if (analysis.report.reason.empty()) {
+    llvm::DenseMap<unsigned, const BatchLoopFact *> byID;
+    for (const auto &fact : analysis.report.accesses)
+      for (const auto &loop : fact.loops)
+        byID.try_emplace(loop.id, &loop);
+    SmallVector<unsigned> ids(llvm::make_first_range(byID));
+    llvm::sort(ids);
+    for (unsigned id : ids)
+      analysis.report.loops.push_back(*byID[id]);
+  }
   if (analysis.report.reason.empty()) {
     A accesses;
     for (const auto &fact :
          jointScalarStoreEffects(function, analysis.report.accesses)) {
-      A checks, shape;
+      A checks, shape, loops;
       for (const auto &step : fact.pointerChecks)
         checks.push_back(batchExprJSON(step));
       for (int64_t extent : fact.shape)
         shape.push_back(extent);
+      for (const auto &loop : fact.loops)
+        loops.push_back(batchLoopJSON(loop));
       accesses.push_back(
           llvm::json::Object{{"root", fact.root},
                              {"offset", batchExprJSON(fact.byteOffset)},
@@ -650,7 +595,7 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
                              {"write", fact.write},
                              {"bytes", fact.bytes},
                              {"pointer_checks", std::move(checks)},
-                             {"loops", A(fact.loops)},
+                             {"loops", std::move(loops)},
                              {"volatile", fact.isVolatile},
                              {"device_address", fact.deviceAddress}});
     }

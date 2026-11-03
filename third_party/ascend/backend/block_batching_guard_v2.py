@@ -32,6 +32,9 @@ class ByteDomain:
         self.checks = []
         self.budget = 1024
         self.loop_axes = {}
+        # Program axes that a loop reparameterized away; see the lower-bound
+        # handling below.
+        self.absorbed = {}
         loops = access.get("loops", ())
         if not isinstance(loops, (tuple, list)) or len(loops) > 8:
             raise GuardFailure("INVALID_LOOP_DOMAIN")
@@ -41,24 +44,42 @@ class ByteDomain:
             if identity < 0 or identity in self.loop_axes:
                 raise GuardFailure("INVALID_LOOP_DOMAIN")
             domain = ByteDomain(arguments, grid, {"shape": []})
+            # A program-axis loop starts at pid*R by definition, so its lower
+            # bound is not a scalar. Upper and step must still be uniform.
+            lower = domain.expression(loop["lower"])
             bounds = []
-            for field in ("lower", "upper", "step"):
+            for field in ("upper", "step"):
                 value = domain.expression(loop[field])
                 if not value.uniform:
                     raise GuardFailure("NON_UNIFORM_LOOP_DOMAIN")
                 bounds.append(value.offset)
             for value, bits in domain.checks:
                 checked(*domain.bounds(value, domain.full), bits)
-            lower, upper, step = bounds
+            upper, step = bounds
             bits = self.bits(loop["bits"])
-            checked(min(lower, upper), max(lower, upper), bits)
             if step <= 0:
                 raise GuardFailure("UNPROVEN_POSITIVE_LOOP_STEP")
-            count = max(0, (upper - lower + step - 1) // step)
+            stride, absorbed = step, None
+            if not lower.uniform:
+                # lower = p*R with step = G*R. Then p runs over every residue
+                # class, so the induction variable takes exactly the values
+                # off + R*m below the upper bound -- one axis of stride R, not
+                # a program axis crossed with a trip axis. Modelling it as the
+                # cross product would admit (p, k) pairs that never happen and
+                # push the proved address range a whole step past the buffer.
+                axes = [a for a, c in enumerate(lower.coefficients) if c]
+                rows = lower.coefficients[axes[0]] if len(axes) == 1 else 0
+                if rows <= 0 or axes[0] >= 3 or step != grid[axes[0]] * rows:
+                    raise GuardFailure("NON_UNIFORM_LOOP_DOMAIN")
+                stride, absorbed = rows, axes[0]
+            checked(min(lower.offset, upper), max(lower.offset, upper), bits)
+            count = max(0, (upper - lower.offset + stride - 1) // stride)
             # Keep the original induction increment representable as well.
-            checked(lower, lower + count * step, bits)
+            checked(lower.offset, lower.offset + count * stride, bits)
             position = 3 + len(self.shape) + len(counts)
-            self.loop_axes[identity] = (position, lower, step, bits)
+            self.loop_axes[identity] = (position, lower.offset, stride, bits)
+            if absorbed is not None:
+                self.absorbed[absorbed] = identity
             counts.append(count)
         self.loop_counts = tuple(counts)
         self.program_splits = {}
@@ -358,6 +379,14 @@ class ByteDomain:
         if any(local_strides) and width not in local_strides:
             raise GuardFailure("NON_UNIT_COLUMN_STRIDE")
         counts = list(self.full)
+        # An absorbed program axis has been folded into its loop's single
+        # stride. Using it again in the same address would mean the address
+        # depends on p and m independently, and the reparameterization no
+        # longer describes what is touched.
+        for program in self.absorbed:
+            if address.coefficients[program]:
+                raise GuardFailure("LOOP_AXIS_REUSES_PROGRAM")
+            counts[program] = 1
         merged = {}
         for predicate, index, bound, bits in predicates:
             if predicate == "false":
@@ -447,7 +476,8 @@ def check_layout_guards(guard, arguments, grid, factor):
     if not isinstance(layouts, list) or len(layouts) > min(1024, len(guard["accesses"])):
         raise GuardFailure("INVALID_LAYOUT_GUARD")
     fields = {
-        "version", "access_id", "axis", "factor", "root", "bytes", "shape", "positive", "checks", "pointer_checks"
+        "version", "access_id", "axis", "factor", "root", "bytes", "shape", "loops", "positive", "checks",
+        "pointer_checks"
     }
     seen = set()
     physical = list(grid)
@@ -469,8 +499,11 @@ def check_layout_guards(guard, arguments, grid, factor):
                 raise GuardFailure("INVALID_LAYOUT_GUARD")
         if not isinstance(layout["shape"], list) or not layout["shape"]:
             raise GuardFailure("INVALID_LAYOUT_GUARD")
-        domain = ByteDomain(arguments, grid, {"shape": layout["shape"]})
-        domain.full = (*physical, *domain.shape)
+        # The bridged address carries the in-loop offset, so the loop domain
+        # belongs here too; it is read by the same constructor as the original
+        # access guard. Program coordinates then range over the physical grid.
+        domain = ByteDomain(arguments, grid, {"shape": layout["shape"], "loops": layout["loops"]})
+        domain.full = (*physical, *domain.shape, *domain.loop_counts)
         for expr in layout["positive"]:
             value = domain.expression(expr)
             if not value.uniform or value.offset <= 0:

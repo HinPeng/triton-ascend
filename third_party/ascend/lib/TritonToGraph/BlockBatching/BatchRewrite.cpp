@@ -1,7 +1,11 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #include "TritonToGraph/BlockBatching/BatchAccessAnalysis.h"
 #include "TritonToGraph/BlockBatching/BatchLayoutPlan.h"
+#include "TritonToGraph/BlockBatching/BatchLoopForm.h"
+#include "TritonToGraph/BlockBatching/BatchLoopLegality.h"
+#include "TritonToGraph/BlockBatching/BatchLoopTransform.h"
 #include "TritonToGraph/BlockBatching/BatchOpRegistry.h"
+#include "TritonToGraph/BlockBatching/BatchRangeAnalysis.h"
 #include "TritonToGraph/BlockBatching/BatchPlan.h"
 #include "TritonToGraph/BlockBatching/BatchValueMapping.h"
 #include "TritonToGraph/BlockBatching/CVSpatial.h"
@@ -522,8 +526,14 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   triton::FuncOp function;
   for (auto f : module.getOps<triton::FuncOp>()) {
     diagnosticOp = f.getOperation();
-    if (function || !f.isPublic() || f.getBody().getBlocks().size() != 1)
+    if (function || !f.isPublic())
       return reject("EXPECTED_SINGLE_PUBLIC_ENTRY");
+    // 提前 return 会被降成 cf.cond_br，函数体从此不止一块。这一条原先和"入口
+    // 不止一个"共用同一个码，而真实算子里触发的全是这一种——liger 的
+    // llama4_rope、cross_entropy、grpo_loss 都只有一个 public 入口，照着那个
+    // 码查会一路查错方向。拒还是拒，但要说对拒的是什么。
+    if (f.getBody().getBlocks().size() != 1)
+      return reject("MULTI_BLOCK_ENTRY_BODY");
     function = f;
   }
   if (!function || function.getFunctionType().getNumResults())
@@ -680,6 +690,7 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       diagnosticOp = access.operation;
     return reject(access.reason);
   }
+  report.guardJSON = access.guardJSON;
   for (const auto &fact : access.accesses)
     if (fact.deviceAddress)
       plan.replicatedLoads.insert(fact.operation);
@@ -689,6 +700,41 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
     diagnosticOp = control.operation;
     return reject(control.reason);
   }
+  // 关卡 0：形态。程序轴循环最多一条，而且必须直接在函数体顶层。
+  auto form = checkBatchLoopForm(
+      function, [&](Value value) { return control.isVarying(value); });
+  if (!form.ok) {
+    diagnosticOp = form.operation;
+    return reject(form.reason);
+  }
+  // 关卡 1：坐标归一。拿函数级的那份循环事实，按 id 找回关卡 0 认下的那条。
+  const BatchLoopFact *programLoop = nullptr;
+  if (form.programLoop) {
+    // 编号和采事实时一样，是同一个遍历里的序号（BatchAccessAnalysis.cpp:353-356）。
+    // 两边都是 function.walk 的默认次序，所以这里重数一遍就能对上。
+    unsigned id = 0, counter = 0;
+    function.walk([&](scf::ForOp loop) {
+      if (loop == form.programLoop)
+        id = counter;
+      ++counter;
+    });
+    for (const auto &fact : access.loops)
+      if (fact.id == id)
+        programLoop = &fact;
+    if (!programLoop) {
+      // 关卡 0 认下的循环在事实里没有对应项，只可能是里面一条访存都没有。
+      // 那样的循环合并了也没有收益，保守拒掉。
+      diagnosticOp = form.programLoop;
+      return reject("LOOP_WITHOUT_MEMORY_ACCESS");
+    }
+  }
+  BatchRangeFacts ranges(axis);
+  auto legality = isSafeToBatchLoop(programLoop, ranges, axis);
+  if (!legality.safe) {
+    diagnosticOp = form.programLoop;
+    return reject(legality.reason);
+  }
+
   // CV lowering changes matrix dimensions and may share an operand. The
   // terminal-read relaxation for VV does not prove those transformations.
   // Keep CV on the original byte-domain contract until an opaque-address
@@ -856,6 +902,26 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   auto &layouts = plan.layouts;
   layouts = planBatchLayouts(access, axis, request.factor);
   report.layoutJSON = serializeBatchLayouts(layouts);
+
+  // 新关卡：有程序轴循环时，圈内访存必须全部被布局层证下来。
+  //
+  // 没有循环时 Keep 是安全的：证不出就不改写，交回通用的 lane 加宽，程序号派生
+  // 的值被提成 lane 张量，数值照样对。程序轴循环破坏了这个兜底——合并后循环变量
+  // 必须是各 lane 共享的标量（scf.for 的界不可能按 lane 不同），于是只由它派生的
+  // 值也被判成非 varying、不会被提，lane u 该读的那一份只存在于布局层重建的程序号
+  // 项里。这类访存一旦落到 Keep，合并后会对所有 lane 读同一处——**静默算错**。
+  // 看的是 linearMemoryView 而不是 action：证到了 PROVEN_… 但这一位为假的访存，
+  // BatchMemoryView.cpp:451 照样跳过，结果一样是循环重分块了而访存原样不动。
+  //
+  // 这道检查必须在动 IR 之前做完。改写开始之后没有回滚：原 op 已经删、事实上的
+  // operation 句柄已经清空，那时再拒既给不出诊断位置，也会留下一个改了一半的模块。
+  if (legality.axis)
+    for (const auto &plan : layouts)
+      if (!access.accesses[plan.accessID].loops.empty() &&
+          !plan.linearMemoryView) {
+        diagnosticOp = access.accesses[plan.accessID].operation;
+        return reject("LOOP_ACCESS_NOT_PROVEN");
+      }
   llvm::DenseMap<Operation *, unsigned> accessIDs;
   SmallVector<Operation *> semanticAccesses(access.accesses.size(), nullptr);
   for (auto [id, fact] : llvm::enumerate(access.accesses))
@@ -888,6 +954,10 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       break;
     }
   Value group = rewriter.clone(*pidSource)->getResult(0);
+  // 合并后这一组覆盖的第一个原程序号。程序轴循环的界用它代换原来的 pid：各 lane
+  // 共享这一个标量，lane u 的那一份由布局层重建的程序号项补上。
+  Value folded =
+      rewriter.create<arith::MulIOp>(loc, group, constant(i32, request.factor));
   Value group64 = rewriter.create<arith::ExtSIOp>(loc, i64, group);
   Value lane = rewriter.create<triton::MakeRangeOp>(loc, lane32, 0, lanes);
   Value laneExt = rewriter.create<arith::ExtSIOp>(loc, lane64, lane);
@@ -1044,6 +1114,22 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
           replacement = created;
         } else {
           auto loop = cast<scf::ForOp>(op);
+          // 程序轴循环的三个界不能照搬映射：下界是 pid 的函数，而 pid 在新体里是
+          // 一个 lane 张量，scf.for 的界只能是标量。重分块把界里的程序号换成合并
+          // 后的标量 group*F，lane 间的差异改由布局层重建的程序号项承担。
+          BatchRetiledBounds retiled;
+          if (loop == form.programLoop)
+            retiled = retileBatchLoopBounds(
+                rewriter, loop, *legality.axis, pidSource->getResult(0), folded,
+                [&](Value v) { return mapping.lookupOrNull(v); });
+          auto bound = [&](Value original, Value replacement) {
+            return replacement ? replacement : mapping.lookup(original);
+          };
+          Value lower = bound(loop.getLowerBound(), retiled.lower);
+          Value upper = bound(loop.getUpperBound(), retiled.upper);
+          Value stride = bound(loop.getStep(), retiled.step);
+          if (loop == form.programLoop && !retiled.ok())
+            return rejectRewrite("LOOP_RETILING_FAILED");
           SmallVector<Value> init;
           for (auto [value, type] : llvm::zip(loop.getInitArgs(), resultTypes))
             init.push_back(value.getType() == type && !values.isVarying(value)
@@ -1055,9 +1141,7 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
           // even on a zero-trip loop. Express the original zero-trip result
           // explicitly, while leaving the positive iteration sequence intact.
           Value nonempty = rewriter.create<arith::CmpIOp>(
-              loc, arith::CmpIPredicate::slt,
-              mapping.lookup(loop.getLowerBound()),
-              mapping.lookup(loop.getUpperBound()));
+              loc, arith::CmpIPredicate::slt, lower, upper);
           auto gate =
               rewriter.create<scf::IfOp>(loc, resultTypes, nonempty, true);
           Block &thenBlock = gate.getThenRegion().front();
@@ -1067,14 +1151,57 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
           while (!elseBlock.empty())
             rewriter.eraseOp(&elseBlock.back());
           rewriter.setInsertionPointToEnd(&thenBlock);
-          auto created = rewriter.create<scf::ForOp>(
-              loc, mapping.lookup(loop.getLowerBound()),
-              mapping.lookup(loop.getUpperBound()),
-              mapping.lookup(loop.getStep()), init);
+          auto created =
+              rewriter.create<scf::ForOp>(loc, lower, upper, stride, init);
           created->setAttrs(op->getAttrs());
           while (!created.getBody()->empty())
             rewriter.eraseOp(&created.getBody()->back());
-          values.map(loop.getInductionVar(), created.getInductionVar(), false);
+          if (loop == form.programLoop) {
+            // lane u 这一圈处理的行是 iv + u*R，R 是一个原程序拥有的行距。
+            //
+            // R 不取 axis.chunk：那个量对定长分块恒为 1，不是行距。两种分布的下界
+            // 都是 p*R 这个一次式（关卡 1 已经证过形态），所以直接从界里取差分：
+            // R = lower(p=1) - lower(p=0)。对成块发与定长分块一样成立，也不用把
+            // 新字段加进判定层的契约。
+            OpBuilder::InsertionGuard guard(rewriter);
+            // 行距在循环外算一次。
+            rewriter.setInsertionPoint(created);
+            auto at = [&](int64_t p) {
+              return retileBatchLoopBounds(
+                         rewriter, loop, *legality.axis, pidSource->getResult(0),
+                         constant(i32, p),
+                         [&](Value v) { return mapping.lookupOrNull(v); })
+                  .lower;
+            };
+            Value atZero = at(0), atOne = at(1);
+            if (!atZero || !atOne)
+              return rejectRewrite("LOOP_RETILING_FAILED");
+            Value rows = rewriter.create<arith::SubIOp>(loc, atOne, atZero);
+            rewriter.setInsertionPointToStart(created.getBody());
+            // 循环变量不一定是 i32。源码只要写过 tl.program_id(0).cast(tl.int64)，
+            // 整条循环就抬到 i64，而 lane 号是 tt.make_range 出来的，只能是 i32。
+            // 两边不同宽就拼不出 iv + u*R，改写会产出过不了验证的 IR。
+            Type rowType = created.getInductionVar().getType();
+            auto rowInt = dyn_cast<IntegerType>(rowType);
+            if (!rowInt || rowInt.getWidth() < 32)
+              return rejectRewrite("LOOP_RETILING_FAILED");
+            auto rowVec = RankedTensorType::get({lanes}, rowType);
+            Value laneIndex =
+                rowInt.getWidth() == 32
+                    ? lane
+                    : rewriter.create<arith::ExtSIOp>(loc, rowVec, lane)
+                          .getResult();
+            Value laneRows = rewriter.create<arith::MulIOp>(
+                loc, laneIndex,
+                rewriter.create<triton::SplatOp>(loc, rowVec, rows));
+            Value base = rewriter.create<triton::SplatOp>(
+                loc, rowVec, created.getInductionVar());
+            values.map(loop.getInductionVar(),
+                       rewriter.create<arith::AddIOp>(loc, base, laneRows),
+                       true);
+          } else
+            values.map(loop.getInductionVar(), created.getInductionVar(),
+                       false);
           for (auto [from, to] :
                llvm::zip(loop.getRegionIterArgs(), created.getRegionIterArgs()))
             values.map(from, to, control.isVarying(from));
@@ -1420,15 +1547,29 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   report.reason = "";
   return report;
 }
-FailureOr<BatchRewriteReport> rewriteBlockBatching(ModuleOp module,
-                                                   BatchRequest request) {
+namespace {
+// 两个入口共用的那一步：改写永远发生在私有沙箱上，差别只在成功之后提不提交。
+FailureOr<BatchRewriteReport> rewriteInSandbox(ModuleOp module,
+                                               BatchRequest request,
+                                               bool commit) {
   OwningOpRef<ModuleOp> sandbox(module.clone());
   auto result = rewriteImpl(sandbox.get(), request);
-  if (succeeded(result) && result->status == "REWRITTEN") {
+  if (commit && succeeded(result) && result->status == "REWRITTEN") {
     ModuleOp candidate = sandbox.get();
     module->setAttrs(candidate->getAttrs());
     module.getBodyRegion().takeBody(candidate.getBodyRegion());
   }
   return result;
+}
+} // namespace
+
+FailureOr<BatchRewriteReport> rewriteBlockBatching(ModuleOp module,
+                                                   BatchRequest request) {
+  return rewriteInSandbox(module, request, /*commit=*/true);
+}
+
+FailureOr<BatchRewriteReport> probeBlockBatching(ModuleOp module,
+                                                 BatchRequest request) {
+  return rewriteInSandbox(module, request, /*commit=*/false);
 }
 } // namespace mlir::triton::cfg

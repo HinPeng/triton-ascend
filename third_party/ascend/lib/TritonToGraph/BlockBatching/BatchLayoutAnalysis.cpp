@@ -1,5 +1,8 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+#include "TritonToGraph/BlockBatching/BatchAffine.h"
+#include "TritonToGraph/BlockBatching/BatchFactsJSON.h"
 #include "TritonToGraph/BlockBatching/BatchLayoutPlan.h"
+#include "TritonToGraph/BlockBatching/BatchLoopSchedule.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
@@ -11,57 +14,10 @@ namespace {
 using E = BatchExprRef;
 using K = BatchExpr;
 using Key = std::pair<K::Kind, int64_t>;
-// Deliberately bounded exact integer algebra. No sampled dynamic stride or
-// equality of byte strides can establish a logical direction.
-struct Linear {
-  int64_t constant = 0;
-  std::map<Key, int64_t> terms;
-};
-std::optional<Linear> linear(E e, unsigned &budget) {
-  if (!e || !budget)
-    return std::nullopt;
-  --budget;
-  if (e->kind == K::Constant)
-    return Linear{e->value, {}};
-  if (e->kind == K::Coordinate || e->kind == K::Program ||
-      e->kind == K::Argument || e->kind == K::Grid)
-    return Linear{0, {{{e->kind, e->value}, 1}}};
-  // Signed extension is exact under the existing no-wrap guard. Unsigned
-  // extension and truncation require additional range facts: KEEP for now.
-  if (e->kind == K::ExtSI)
-    return linear(e->lhs, budget);
-  if (e->kind != K::Add && e->kind != K::Sub && e->kind != K::Mul)
-    return std::nullopt;
-  auto a = linear(e->lhs, budget), b = linear(e->rhs, budget);
-  if (!a || !b)
-    return std::nullopt;
-  if (e->kind == K::Mul) {
-    if (!a->terms.empty() && !b->terms.empty())
-      return std::nullopt;
-    if (b->terms.empty())
-      std::swap(a, b);
-    int64_t scale = a->constant;
-    if (llvm::MulOverflow(b->constant, scale, b->constant))
-      return std::nullopt;
-    for (auto &[key, value] : b->terms)
-      if (llvm::MulOverflow(value, scale, value))
-        return std::nullopt;
-    return b;
-  }
-  if (e->kind == K::Sub) {
-    if (llvm::MulOverflow(b->constant, int64_t(-1), b->constant))
-      return std::nullopt;
-    for (auto &[key, value] : b->terms)
-      if (llvm::MulOverflow(value, int64_t(-1), value))
-        return std::nullopt;
-  }
-  if (llvm::AddOverflow(a->constant, b->constant, a->constant))
-    return std::nullopt;
-  for (auto [key, value] : b->terms)
-    if (llvm::AddOverflow(a->terms[key], value, a->terms[key]))
-      return std::nullopt;
-  return a;
-}
+// The exact integer affine decomposition now lives in BatchAffine.h, shared
+// with the loop judgment layer. This file keeps its historical leaf set
+// (kBatchLayoutLeaves): induction variables still fail the decomposition here,
+// so a loop-dependent bound still falls through to KEEP exactly as before.
 
 // Parameter-affine addresses: coordinates vary inside the batch; scalar
 // arguments/grid extents are uniform parameters of their coefficients. Keep
@@ -148,7 +104,10 @@ std::optional<ParameterAffine> parameterAffine(E e, unsigned &budget) {
     value.parameters[{e->kind, e->value, e->bits}] = 1;
     return ParameterAffine{value, {}};
   }
-  if (e->kind == K::Coordinate || e->kind == K::Program || e->kind == K::Grid) {
+  // Induction 在这里和坐标同级：normalizeBatchAccessOnLogicalAxis 已经把循环
+  // 变量换成「下界 + 圈内偏移」，剩下的这个叶子代表圈内偏移，各份相同。
+  if (e->kind == K::Coordinate || e->kind == K::Program ||
+      e->kind == K::Grid || e->kind == K::Induction) {
     ParameterAffine value;
     value.terms[{e->kind, e->value}] = Scalar{1, {}};
     return value;
@@ -233,13 +192,14 @@ bool rangeGroup(E e, ArrayRef<int64_t> axes) {
 // A bound on a coordinate, before byte scaling, associates that coordinate's
 // local projections with the selected program direction. It excludes all
 // other program directions, even if their strides happen to be equal.
-bool bind(E predicate, const BatchAccessFact &fact, BatchLayoutPlan &plan) {
+// 名字不叫 bind：实参里有 std::shared_ptr，ADL 会把 std::bind 拉进候选集。
+bool bindProgramDirection(E predicate, const BatchAccessFact &fact,
+                          BatchLayoutPlan &plan) {
   if (predicate->kind != K::SLT || contains(predicate->rhs, K::Coordinate) ||
-      contains(predicate->rhs, K::Program) ||
-      contains(predicate->rhs, K::Induction))
+      contains(predicate->rhs, K::Program))
     return false;
   unsigned budget = 256;
-  auto form = linear(predicate->lhs, budget);
+  auto form = batchLinearForm(predicate->lhs, budget, kBatchLoopLeaves);
   if (!form)
     return false;
   SmallVector<int64_t> axes;
@@ -248,6 +208,9 @@ bool bind(E predicate, const BatchAccessFact &fact, BatchLayoutPlan &plan) {
       continue;
     if (key.first == K::Coordinate && value > 0)
       axes.push_back(key.second);
+    // 圈内偏移对整块是一个各份相同的平移，不参与方向绑定，放行但不记轴。
+    else if (key.first == K::Induction)
+      continue;
     else if (key != Key{K::Program, plan.gridAxis})
       return false;
   }
@@ -273,13 +236,33 @@ bool bind(E predicate, const BatchAccessFact &fact, BatchLayoutPlan &plan) {
 SmallVector<BatchLayoutPlan, 0>
 planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
   SmallVector<BatchLayoutPlan, 0> plans;
-  for (auto [id, fact] : llvm::enumerate(accesses.accesses)) {
+  for (auto [id, originalFact] : llvm::enumerate(accesses.accesses)) {
+    // 把循环变量接回程序号，再往下全程用归一后的这一份。不接的话，一条按行走
+    // 的访存地址里只有归纳变量、没有 K::Program，下面第一个分支就会判它
+    // SHARED_ACCESS——字面正确但结论错，程序号只是藏在循环下界里。
+    //
+    // 地址与掩码必须一起换、而且只换一次：下面要拿 plan.coordinate 和谓词做
+    // 指针相等比较，两边来源不同就对不上。
+    BatchAccessFact fact = originalFact;
+    bool normalized = true;
+    for (const BatchLoopFact &loop : originalFact.loops) {
+      fact.byteOffset = normalizeBatchAccessOnLogicalAxis(fact.byteOffset, loop);
+      fact.mask = normalizeBatchAccessOnLogicalAxis(fact.mask, loop);
+      normalized &= bool(fact.byteOffset);
+    }
     BatchLayoutPlan plan;
     plan.accessID = id;
     plan.gridAxis = axis;
     plan.shape = fact.shape;
     llvm::raw_string_ostream stream(plan.location);
     fact.operation->getLoc().print(stream);
+    if (!normalized) {
+      // 归一不下去就按证不出处理，绝不退回原式：那等于把"程序号不在地址里"这个
+      // 错误结论静默放行。
+      plan.reason = "LOOP_ORIGIN_UNPROVEN";
+      plans.push_back(std::move(plan));
+      continue;
+    }
     SmallVector<E> predicates;
     conjuncts(fact.mask, predicates);
     bool bound = false, unknown = false;
@@ -287,7 +270,7 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
       if (predicate->kind == K::Unknown)
         unknown = true;
       if (contains(predicate, K::Program, axis)) {
-        if (bound || !bind(predicate, fact, plan)) {
+        if (bound || !bindProgramDirection(predicate, fact, plan)) {
           unknown = true;
           continue;
         }
@@ -354,8 +337,15 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
           leading &= local == static_cast<int64_t>(position);
         bool columnRegion =
             fact.shape.size() == 2 && plan.localAxes == SmallVector<int64_t>{1};
-        bool simple = (leading || columnRegion) && fact.shape.size() <= 3 &&
-                      fact.loops.empty();
+        // 这里原本还带一条 fact.loops.empty()。它挡住的不只是程序轴循环——块内
+        // 循环今天就放行，这类访存一路证得出 PROVEN_DIRECTION_AND_STRIDE_CHAIN，
+        // 却因为这一条而 linearMemoryView 为假，于是 BatchMemoryView.cpp:451
+        // 一律跳过：证出来了从不改写。删掉之后它们第一次进入改写路径，这是本步
+        // 唯一一处改变已发布行为的地方，干跑 diff 要逐行过目。
+        //
+        // 地址里真的用到循环变量时，圈内偏移会作为 K::Induction 的 rest term
+        // 留下来，由下面两处和发射器一起接住。
+        bool simple = (leading || columnRegion) && fact.shape.size() <= 3;
         auto origin = address->offset.divide(fact.bytes);
         auto stride =
             address->terms[{K::Coordinate, plan.localAxes.back()}].divide(
@@ -392,12 +382,18 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
             simple = false;
             continue;
           }
+          // Induction 与前三者同级：它代表圈内偏移，发射器从外层 scf.for 取回
+          // 循环变量（BatchMemoryView.cpp 的 Emitter::upper）。
           if (key.first != K::Coordinate && key.first != K::Program &&
-              key.first != K::Grid)
+              key.first != K::Grid && key.first != K::Induction)
             simple = false;
           // Defer nonfused dynamic strides until their target lowering has a
           // dedicated contract; this slice is the dynamic row-stride model.
-          if (!scaled->parameters.empty())
+          //
+          // 圈内偏移是那条契约的第一个持有者，所以单独放行：真实 kernel 的行步长
+          // 是运行期参数，圈内偏移的系数必然带参数，不放行它就永远到不了发射器。
+          // 其余种类仍然挡着——给它们放行是另一桩没验证过的行为变更。
+          if (!scaled->parameters.empty() && key.first != K::Induction)
             simple = false;
           int64_t c = scaled->constant;
           plan.restTerms.push_back(

@@ -10,6 +10,14 @@ add_triton_library(TritonToGraph
   BlockBatching/ElementwiseModels.cpp
   BlockBatching/ShapeModels.cpp
   BlockBatching/BatchAccessAnalysis.cpp
+  BlockBatching/BatchExpr.cpp
+  BlockBatching/BatchFactsJSON.cpp
+  BlockBatching/BatchRangeAnalysis.cpp
+  BlockBatching/BatchAffine.cpp
+  BlockBatching/BatchLoopSchedule.cpp
+  BlockBatching/BatchLoopForm.cpp
+  BlockBatching/BatchLoopLegality.cpp
+  BlockBatching/BatchLoopTransform.cpp
   BlockBatching/BatchLayoutAnalysis.cpp
   BlockBatching/BatchMemoryView.cpp
   BlockBatching/MemoryModels.cpp
