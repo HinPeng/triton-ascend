@@ -8,7 +8,7 @@ No custom AscendNPU-IR report or transitive SIMD proof is required.
 from .block_batching import BatchingRejected
 
 VALIDATION_POLICY = "ta_only_v1"
-CV_VALIDATION_POLICY = "ta_cv_auto_blockify_v14"
+CV_VALIDATION_POLICY = "ta_cv_uniform_control_v15"
 
 
 def _validate_cv_contract(metadata):
@@ -17,11 +17,21 @@ def _validate_cv_contract(metadata):
     full_tile_lowerings = ("rank3_full_tile_batch_v1", "rank3_full_tile_batch_v2")
     lowerings = {
         "independent_batch_v1":
-        ("rank3_batch_v1", "static_masked_lanes_v1", "rank3_masked_batch_v1", *full_tile_lowerings),
+        ("rank3_batch_v1", "static_masked_lanes_v1", "static_uniform_control_lanes_v1",
+         "rank3_masked_batch_v1", *full_tile_lowerings),
         "spatial_concat_v1": ("spatial_m_v1", "spatial_n_v1")
     }
     if report.get("cv_lowering") not in lowerings.get(report.get("cv_mode"), ()):
         raise BatchingRejected("CV_LOWERING_CONTRACT_MISSING")
+    if report.get("cv_lowering") == "static_uniform_control_lanes_v1":
+        proof = report.get("guard", {}).get("cv_control_flow_contract", {})
+        if (type(proof) is not dict or proof.get("version") != 1
+                or proof.get("lane_semantics") != "original_program_clone"
+                or proof.get("uniform_bounds") is not True or proof.get("dot_rank") != 2
+                or type(proof.get("for_count")) is not int or proof["for_count"] < 0
+                or type(proof.get("if_count")) is not int or proof["if_count"] < 0
+                or proof["for_count"] + proof["if_count"] == 0):
+            raise BatchingRejected("CV_UNIFORM_CONTROL_CONTRACT_MISSING")
     if report.get("cv_lowering") in full_tile_lowerings:
         if (metadata.get("enable_hivm_batch_matmul") is not True
                 or report.get("guard", {}).get("require_full_masks") is not True):

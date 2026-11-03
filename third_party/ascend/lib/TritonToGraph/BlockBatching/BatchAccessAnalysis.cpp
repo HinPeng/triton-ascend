@@ -110,6 +110,7 @@ struct Analysis {
   bool scalarBounds = false;
   bool allowDeviceAddress = false;
   bool normalizedPointer = false;
+  bool pointerRecurrences = false;
   llvm::DenseMap<Value, unsigned> inductionVariables;
   BatchAccessReport report;
   explicit Analysis(triton::FuncOp function, unsigned indexBits)
@@ -281,15 +282,42 @@ struct Analysis {
   }
   // Root provenance does not depend on an integer/coordinate summary.
   // Keep pointer normalization on its separately proved path.
+  std::optional<std::pair<Value, Value>> pointerRecurrence(BlockArgument arg) {
+    if (!pointerRecurrences)
+      return std::nullopt;
+    auto loop = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp());
+    if (!loop || arg.getArgNumber() == 0)
+      return std::nullopt;
+    auto step = loop.getStep().getDefiningOp<arith::ConstantOp>();
+    auto amount = step ? dyn_cast<IntegerAttr>(step.getValue()) : IntegerAttr{};
+    // For unit-step loops the exact iteration number is iv - lower. General
+    // division / data-dependent recurrence is intentionally not approximated.
+    if (!amount || amount.getInt() != 1)
+      return std::nullopt;
+    unsigned index = arg.getArgNumber() - 1;
+    Value initial = loop.getInitArgs()[index];
+    Value next = cast<scf::YieldOp>(loop.getBody()->back()).getOperand(index);
+    if (next == arg)
+      return std::make_pair(initial, Value{});
+    auto advance = next.getDefiningOp<triton::AddPtrOp>();
+    if (!advance || advance.getPtr() != arg ||
+        loop->isAncestor(advance.getOffset().getParentBlock()->getParentOp()))
+      return std::nullopt;
+    return std::make_pair(initial, advance.getOffset());
+  }
+
   int rootOnly(Value value, unsigned &remaining) {
     if (!remaining)
       return -1;
     --remaining;
-    if (auto arg = dyn_cast<BlockArgument>(value))
-      return arg.getOwner() == &function.getBody().front() &&
-                     isa<triton::PointerType>(arg.getType())
-                 ? static_cast<int>(arg.getArgNumber())
-                 : -1;
+    if (auto arg = dyn_cast<BlockArgument>(value)) {
+      if (arg.getOwner() == &function.getBody().front() &&
+          isa<triton::PointerType>(arg.getType()))
+        return static_cast<int>(arg.getArgNumber());
+      if (auto recurrence = pointerRecurrence(arg))
+        return rootOnly(recurrence->first, remaining);
+      return -1;
+    }
     auto *op = value.getDefiningOp();
     if (!op)
       return -1;
@@ -306,6 +334,30 @@ struct Analysis {
       if (arg.getOwner() == &function.getBody().front() &&
           isa<triton::PointerType>(arg.getType()))
         return {static_cast<int>(arg.getArgNumber()), constant(0), {}};
+      if (auto recurrence = pointerRecurrence(arg)) {
+        Pointer base = pointer(recurrence->first, axes, normalizedBool);
+        if (!base || !recurrence->second)
+          return base;
+        auto loop = cast<scf::ForOp>(arg.getOwner()->getParentOp());
+        unsigned bytes = width(arg, normalizedBool);
+        if (!bytes)
+          return {};
+        E iteration = K::node(
+            K::Sub, 64,
+            K::leaf(K::Induction,
+                    inductionVariables.lookup(loop.getInductionVar()),
+                    bits(loop.getInductionVar().getType())),
+            integer(loop.getLowerBound(), {}));
+        // Pointer arithmetic is summarized, not rewritten. The byte-domain
+        // guard checks the complete original loop range and every pointer
+        // intermediate for overflow, allocation bounds and noninterference.
+        base.offset = add(
+            std::move(base.offset),
+            scale(K::node(K::Mul, 64, std::move(iteration),
+                          integer(recurrence->second, axes)), bytes));
+        base.checks.push_back(base.offset);
+        return base;
+      }
     }
     Operation *op = value.getDefiningOp();
     if (!op)
@@ -454,8 +506,10 @@ unsigned getBatchIndexBitWidth(ModuleOp module) {
 }
 
 BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
-                                       unsigned indexBits) {
+                                       unsigned indexBits,
+                                       bool pointerRecurrences) {
   Analysis analysis(function, indexBits);
+  analysis.pointerRecurrences = pointerRecurrences;
 
   unsigned loopID = 0;
   function.walk([&](scf::ForOp loop) {

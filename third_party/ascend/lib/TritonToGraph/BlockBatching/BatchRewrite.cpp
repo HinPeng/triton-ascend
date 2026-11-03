@@ -273,7 +273,8 @@ bool hasPureDataDependency(Value value, Value read) {
 // This is an eligibility proof, distinct from the conservative byte-domain
 // proof (which may ignore unknown masks). Never admit a data-loaded predicate
 // merely because ignoring it gives an in-bounds rectangular memory footprint.
-bool structuredMaskExpr(const BatchExprRef &expr) {
+bool structuredMaskExpr(const BatchExprRef &expr,
+                        bool allowUniformInduction = false) {
   if (!expr)
     return true;
   using K = BatchExpr;
@@ -300,8 +301,10 @@ bool structuredMaskExpr(const BatchExprRef &expr) {
   case K::EQ:
   case K::MinSI:
   case K::MaxSI:
-    return structuredMaskExpr(expr->lhs) && structuredMaskExpr(expr->rhs);
+    return structuredMaskExpr(expr->lhs, allowUniformInduction) &&
+           structuredMaskExpr(expr->rhs, allowUniformInduction);
   case K::Induction:
+    return allowUniformInduction;
   case K::Unknown:
     return false;
   }
@@ -427,7 +430,8 @@ cvMaskContract(ArrayRef<Operation *> originals,
 }
 
 // Retain rank-two masked lowering. There is no new tensor lane axis and no
-// speculative memory access: clone the complete original straight-line body
+// speculative memory access: clone the complete original body, including
+// uniform regions and their loop-carried values, independently for each lane
 // with p = group * F + lane. The dispatcher proves full groups, and the
 // original access guard proves bounds, no overflow and disjoint effects.
 LogicalResult rewriteStructuredCV(ModuleOp module, triton::FuncOp function,
@@ -440,12 +444,10 @@ LogicalResult rewriteStructuredCV(ModuleOp module, triton::FuncOp function,
   rewriter.setInsertionPointToStart(&function.getBody().front());
   auto loc = function.getLoc();
   Operation *pidSource = nullptr;
-  for (Operation *op : originals)
-    if (auto pid = dyn_cast<triton::GetProgramIdOp>(op);
-        pid && static_cast<int>(pid.getAxis()) == axis) {
-      pidSource = op;
-      break;
-    }
+  function.walk([&](triton::GetProgramIdOp pid) {
+    if (!pidSource && static_cast<int>(pid.getAxis()) == axis)
+      pidSource = pid;
+  });
   assert(pidSource && "validated program axis");
   Value group = rewriter.clone(*pidSource)->getResult(0);
   Value group64 =
@@ -473,7 +475,24 @@ LogicalResult rewriteStructuredCV(ModuleOp module, triton::FuncOp function,
                                          static_cast<int>(count.getAxis())));
         continue;
       }
-      rewriter.clone(*op, mapping);
+      Operation *copy = rewriter.clone(*op, mapping);
+      // clone() also clones nested regions. Remap their program/grid queries
+      // as well: the physical group ID / shortened launch grid is never an
+      // original program coordinate. Other axes retain their original IDs.
+      SmallVector<Operation *> queries;
+      copy->walk([&](Operation *nested) {
+        if (auto pid = dyn_cast<triton::GetProgramIdOp>(nested);
+            pid && static_cast<int>(pid.getAxis()) == axis) {
+          pid.getResult().replaceAllUsesWith(p);
+          queries.push_back(nested);
+        } else if (auto count = dyn_cast<triton::GetNumProgramsOp>(nested)) {
+          count.getResult().replaceAllUsesWith(function.getArgument(
+              originalArgCount + static_cast<int>(count.getAxis())));
+          queries.push_back(nested);
+        }
+      });
+      for (Operation *query : queries)
+        rewriter.eraseOp(query);
     }
   }
   rewriter.clone(*originals.back()); // single original void return
@@ -577,17 +596,14 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   collect(block, 0);
   if (regionBudgetExceeded)
     return reject("REGION_DEPTH_EXCEEDED");
+  bool cvControlFlow = request.cv && llvm::any_of(validated, [](Operation *op) {
+    return isa<scf::ForOp, scf::IfOp>(op);
+  });
   for (Operation *operation : validated) {
     Operation &op = *operation;
     diagnosticOp = &op;
     auto name = op.getName().getStringRef();
     ++report.operations[name.str()];
-    // The ordinary rank-three backend can compile a dynamic K loop yet
-    // produce invalid shared-operand results. CV v1 admits straight-line
-    // normalized IR only. This is capability rejection, not loop unrolling
-    // or an assumption about correctness from successful compilation.
-    if (request.cv && isa<scf::ForOp, scf::IfOp>(op))
-      return reject("CV_CONTROL_FLOW_NOT_VALIDATED");
     if (name.starts_with("tt.atomic") || name == "tt.print" ||
         name == "tt.assert")
       return reject("UNSUPPORTED_EFFECT");
@@ -684,7 +700,7 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
     return reject("UNUSED_BATCH_AXIS");
   BatchPlan plan;
   auto &access = plan.effects;
-  access = analyzeBatchAccesses(function, indexBits);
+  access = analyzeBatchAccesses(function, indexBits, cvControlFlow);
   if (!access.reason.empty()) {
     if (access.operation)
       diagnosticOp = access.operation;
@@ -700,6 +716,18 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
     diagnosticOp = control.operation;
     return reject(control.reason);
   }
+  // CV loops do not use the VV program-axis retile proof. Keep every bound,
+  // iteration and recurrence unchanged inside a private rank-two lane clone.
+  // In particular, never send a shared-operand dynamic loop to rank-three MMA.
+  if (cvControlFlow)
+    for (Operation *op : validated)
+      if (auto loop = dyn_cast<scf::ForOp>(op))
+        if (control.isVarying(loop.getLowerBound()) ||
+            control.isVarying(loop.getUpperBound()) ||
+            control.isVarying(loop.getStep())) {
+          diagnosticOp = op;
+          return reject("CV_VARYING_LOOP_BOUND");
+        }
   // 关卡 0：形态。程序轴循环最多一条，而且必须直接在函数体顶层。
   auto form = checkBatchLoopForm(
       function, [&](Value value) { return control.isVarying(value); });
@@ -757,7 +785,7 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
         // Broadcasting a loaded nonzero accumulator triggered a device
         // exception in the packaged rank-three path. Only the canonical
         // uniform zero initializer, or a lane-varying accumulator, is admitted.
-        if (!control.isVarying(dot.getC())) {
+        if (!cvControlFlow && !control.isVarying(dot.getC())) {
           auto c = dot.getC().getDefiningOp<arith::ConstantOp>();
           auto dense = c ? dyn_cast<DenseFPElementsAttr>(c.getValue())
                          : DenseFPElementsAttr{};
@@ -836,12 +864,38 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       if (!mask || constantTrueMask(mask))
         continue;
       diagnosticOp = fact.operation;
-      if (!fact.mask || !structuredMaskExpr(fact.mask))
+      if (!fact.mask || !structuredMaskExpr(fact.mask, cvControlFlow))
         return reject("CV_UNSTRUCTURED_MEMORY_MASK");
       if (auto load = dyn_cast<triton::LoadOp>(fact.operation);
           load && !constantZero(load.getOther()))
         return reject("CV_MASKED_LOAD_REQUIRES_ZERO_OTHER");
       ++report.structuredMasks;
+    }
+    if (cvControlFlow) {
+      if (validated.size() > 8192 / request.factor)
+        return reject("CV_STATIC_LANE_CODE_SIZE_EXCEEDED");
+      // This describes independent rank-two execution, not an M/N extension
+      // or batch-MMA optimization. Existing byte-domain/noninterference and
+      // full-group launch guards are retained; no all-true mask guard is added.
+      auto guard = llvm::json::parse(report.guardJSON);
+      if (!guard || !guard->getAsObject())
+        return failure();
+      (*guard->getAsObject())["cv_control_flow_contract"] = llvm::json::Object{
+          {"version", 1}, {"lane_semantics", "original_program_clone"},
+          {"uniform_bounds", true}, {"dot_rank", 2},
+          {"for_count", static_cast<int64_t>(report.operations["scf.for"])},
+          {"if_count", static_cast<int64_t>(report.operations["scf.if"])}};
+      report.guardJSON = llvm::formatv("{0}", *guard).str();
+      report.cvLowering = "static_uniform_control_lanes_v1";
+      report.selectedAxis = axis;
+      report.laneWidth = request.factor;
+      report.layoutJSON = serializeBatchLayouts({});
+      if (failed(rewriteStructuredCV(module, function, originals, axis,
+                                     request.factor)))
+        return failure();
+      report.status = "REWRITTEN";
+      report.reason = "";
+      return report;
     }
     if (sharedCV) {
       std::string reason;

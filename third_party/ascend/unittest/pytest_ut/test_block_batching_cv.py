@@ -133,9 +133,8 @@ def test_existing_batched_dot_is_rejected_without_mutation(tmp_path):
     assert str(mod) == before
 
 
-def test_cv_uniform_control_flow_is_rejected_before_backend(tmp_path):
-    # A correct lane rewrite is insufficient: the packaged rank-three backend
-    # has not passed numerical validation for a dynamic loop with shared A/B.
+def test_cv_uniform_control_flow_retains_independent_rank_two_lanes(tmp_path):
+    # Uniform control must not reach the unvalidated rank-three loop lowering.
     text = dot_module().replace(
         '    %result = "tt.reduce"', '''
     %zero_i = arith.constant 0 : i32
@@ -145,10 +144,13 @@ def test_cv_uniform_control_flow_is_rejected_before_backend(tmp_path):
     }
     %result = "tt.reduce"''')
     mod = parse(tmp_path, text)
-    before = str(mod)
     report = ascend.passes.ttir.rewrite_block_batching(mod, 2, 0, 'semantic_only', True)
-    assert report['reason'] == 'CV_CONTROL_FLOW_NOT_VALIDATED'
-    assert str(mod) == before
+    assert report['compile_status'] == 'REWRITTEN', report
+    assert report['cv_lowering'] == 'static_uniform_control_lanes_v1'
+    assert str(mod).count('scf.if') == 2
+    assert str(mod).count('tt.dot ') == 2
+    assert 'tensor<2x4x4xf32>' not in str(mod)
+    assert mod.verify()
 
 
 def test_cv_shared_matrix_requires_a_separately_validated_lowering(tmp_path):

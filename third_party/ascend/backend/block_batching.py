@@ -7,7 +7,7 @@ compiler artifacts; rejected or guarded calls select the complete baseline.
 """
 from dataclasses import dataclass
 
-IMPLEMENTATION_VERSION = 27
+IMPLEMENTATION_VERSION = 28
 
 
 @dataclass(frozen=True)

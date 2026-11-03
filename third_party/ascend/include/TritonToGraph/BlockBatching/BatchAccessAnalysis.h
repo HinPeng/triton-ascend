@@ -47,6 +47,7 @@ struct BatchAccessReport {
 };
 unsigned getBatchIndexBitWidth(ModuleOp module);
 BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
-                                       unsigned indexBits);
+                                       unsigned indexBits,
+                                       bool pointerRecurrences = false);
 } // namespace mlir::triton::cfg
 #endif
