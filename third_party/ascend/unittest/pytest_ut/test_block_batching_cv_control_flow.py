@@ -196,3 +196,20 @@ def test_control_lower_bound_mask_keeps_stronger_memory_guard(tmp_path, data_dep
         assert check_guard(guard, [1 << 30, 1 << 40, 32], (4, 1, 1), 2)[0]
         assert not check_guard(guard, [1 << 30, 1 << 30, 32], (4, 1, 1), 2)[0]
         assert module.verify()
+
+
+@pytest.mark.parametrize('other', ['0.0', '1.0', '0x7FC00000'])
+def test_normalized_block_pointer_zero_padding_is_recognized(tmp_path, other):
+    text = loop_dot().replace('%zero = arith.constant dense<0.0> : tensor<4xf32>',
+        f'%scalar_zero = arith.constant {other} : f32\n    %zero = tt.splat %scalar_zero : f32 -> tensor<4xf32>')
+    text = text.replace('tt.load %xa :', 'tt.load %xa, %mask, %zero :')
+    module = parse(tmp_path, text)
+    before = str(module)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 2, 0, 'auto', True)
+    if other == '0.0':
+        assert report['compile_status'] == 'REWRITTEN', report
+        assert str(module).count('tt.load') == 2
+        assert module.verify()
+    else:
+        assert report['reason'] == 'CV_MASKED_LOAD_REQUIRES_ZERO_OTHER', report
+        assert str(module) == before

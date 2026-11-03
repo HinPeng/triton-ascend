@@ -392,8 +392,22 @@ bool constantTrueMask(Value mask) {
 }
 
 bool constantZero(Value value) {
+  // Stock block-pointer normalization materializes scalar zero + tt.splat,
+  // whereas the frontend usually emits a dense zero. Recognize both exact
+  // representations without accepting NaN, nonzero, or device-loaded other.
+  if (auto splat = value ? value.getDefiningOp<triton::SplatOp>()
+                         : triton::SplatOp{})
+    value = splat.getSrc();
   auto c =
       value ? value.getDefiningOp<arith::ConstantOp>() : arith::ConstantOp{};
+  if (c) {
+    if (auto scalar = dyn_cast<FloatAttr>(c.getValue()))
+      return scalar.getValue().isZero();
+    if (auto scalar = dyn_cast<IntegerAttr>(c.getValue()))
+      return scalar.getValue().isZero();
+    if (auto integer = dyn_cast<DenseIntElementsAttr>(c.getValue()))
+      return integer.isSplat() && integer.getSplatValue<APInt>().isZero();
+  }
   auto dense =
       c ? dyn_cast<DenseFPElementsAttr>(c.getValue()) : DenseFPElementsAttr{};
   return dense && dense.isSplat() && dense.getSplatValue<APFloat>().isZero();
