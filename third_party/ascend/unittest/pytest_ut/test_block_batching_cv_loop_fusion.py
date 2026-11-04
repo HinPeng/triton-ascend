@@ -106,7 +106,7 @@ def periodic_head_loop(period, axis):
 
 
 @pytest.mark.parametrize('axis', [0, 1, 2])
-@pytest.mark.parametrize('period,factor', [(4, 2), (4, 4), (6, 3), (8, 4)])
+@pytest.mark.parametrize('period,factor', [(4, 2), (4, 4), (6, 2), (8, 4)])
 def test_aligned_periodic_program_addresses_keep_scalar_quotient(tmp_path, axis, period, factor):
     module = parse(tmp_path, periodic_head_loop(period, axis))
     report = ascend.passes.ttir.rewrite_block_batching(module, factor, axis, 'auto', True, True)
@@ -130,6 +130,15 @@ def test_period_crossing_group_falls_back_to_independent_regions(tmp_path, perio
     assert report['cv_lowering'] == 'static_uniform_control_lanes_v1', report
     assert json.loads(report['guard_json'])['cv_loop_fusion_rejection'] == 'CV_BATCH_QUOTIENT_GROUP_CROSSES_PERIOD'
     assert str(module).count('tt.dot ') == factor and module.verify()
+
+
+def test_period_alignment_does_not_bypass_cv_factor_capability(tmp_path):
+    module = parse(tmp_path, periodic_head_loop(6, 0))
+    before = str(module)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 3, 0, 'auto', True, True)
+    assert report['compile_status'] == 'REJECTED', report
+    assert report['reason'] == 'CV_FACTOR_REQUIRES_POWER_OF_TWO'
+    assert str(module) == before
 
 
 @pytest.mark.parametrize('factor', [2, 4])
