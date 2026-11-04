@@ -1,6 +1,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 import json
 import pytest
+from triton.backends.ascend.block_batching import IMPLEMENTATION_VERSION
 from triton._C.libtriton import ir, ascend
 from block_batching_memory_cases import KINDS, memory_ir
 
@@ -31,7 +32,7 @@ def test_byte_provenance_and_explicit_scalar_index(tmp_path, kind, factor):
     module = parse(tmp_path, memory_ir(kind))
     report = ascend.passes.ttir.rewrite_block_batching(module, factor, 0)
     assert report["compile_status"] == "REWRITTEN", report
-    assert report["implementation_version"] == 28
+    assert report["implementation_version"] == IMPLEMENTATION_VERSION
     assert module.verify()
     guard = json.loads(report["guard_json"])
     assert guard["version"] == 3

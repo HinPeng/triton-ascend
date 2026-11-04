@@ -4,6 +4,7 @@ import json
 import re
 
 import pytest
+from triton.backends.ascend.block_batching import IMPLEMENTATION_VERSION
 from triton._C.libtriton import ascend, ir
 
 from block_batching_op_cases import ELEMENTWISE_OPS, W2_OPS, case_ir
@@ -36,7 +37,7 @@ def test_registered_elementwise_combinations(tmp_path, op, factor, variant):
     module = parse(tmp_path, case_ir(op, variant))
     report = ascend.passes.ttir.rewrite_block_batching(module, factor, 0)
     assert report["compile_status"] == "REWRITTEN", report
-    assert report["implementation_version"] == 28
+    assert report["implementation_version"] == IMPLEMENTATION_VERSION
     assert report["lane_width"] == factor
     assert report["operations"][op] >= 1
     assert module.verify()

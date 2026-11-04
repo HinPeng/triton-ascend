@@ -76,6 +76,9 @@ def test_cv_analysis_does_not_mutate(tmp_path):
     ('spatial_concat_v1', 'spatial_m_v1'),
     ('spatial_concat_v1', 'spatial_n_v1'),
     ('independent_batch_v1', 'static_uniform_control_lanes_v1'),
+    ('spatial_concat_v1', 'spatial_m_uniform_control_v1'),
+    ('spatial_concat_v1', 'spatial_n_uniform_control_v1'),
+    ('independent_batch_v1', 'rank3_uniform_control_batch_v1'),
 ])
 def test_cv_can_share_grid_coverage_with_auto_blockify(monkeypatch, mode, lowering):
     from types import SimpleNamespace

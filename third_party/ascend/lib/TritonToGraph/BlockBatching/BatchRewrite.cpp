@@ -59,6 +59,7 @@ std::optional<int64_t> coordinateStride(BatchExprRef expr, int axis,
   case K::ProgramQuotient:
   case K::ProgramRemainder:
   case K::Grid:
+  case K::Induction:
     return 0;
   case K::Coordinate:
     return expr->value == axis ? 1 : 0;
@@ -562,7 +563,8 @@ LogicalResult rewriteStructuredCV(ModuleOp module, triton::FuncOp function,
 } // namespace
 
 static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
-                                                 BatchRequest request) {
+                                                 BatchRequest request,
+                                                 bool fuseControlFlow = false) {
   if (!request.isValid())
     return failure();
   BatchRewriteReport report;
@@ -766,9 +768,10 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
     diagnosticOp = control.operation;
     return reject(control.reason);
   }
-  // CV loops do not use the VV program-axis retile proof. Keep every bound,
-  // iteration and recurrence unchanged inside a private rank-two lane clone.
-  // In particular, never send a shared-operand dynamic loop to rank-three MMA.
+  // CV loops do not use the VV program-axis retile proof. All lanes retain
+  // the same bounds, iteration order and independent recurrence state.
+  // Shared operands can only take the rank-two spatial proof, never a
+  // broadcast shared-operand rank-three MMA.
   if (cvControlFlow)
     for (Operation *op : validated)
       if (auto loop = dyn_cast<scf::ForOp>(op))
@@ -925,7 +928,24 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
         return reject("CV_MASKED_LOAD_REQUIRES_ZERO_OTHER");
       ++report.structuredMasks;
     }
-    if (cvControlFlow) {
+    if (cvControlFlow && !fuseControlFlow) {
+      std::string fusionReason = "CV_LOOP_BATCH_MATMUL_DISABLED";
+      if (sharedCV || request.cvBatchMatmul) {
+        // A failed eligibility proof must not leave partly widened regions
+        // in the lane-clone fallback. Try the complete region rewrite in a
+        // nested sandbox; internal verification errors still propagate.
+        OwningOpRef<ModuleOp> fused(module.clone());
+        auto attempt = rewriteImpl(fused.get(), request, true);
+        if (failed(attempt))
+          return failure();
+        if (attempt->status == "REWRITTEN") {
+          ModuleOp candidate = fused.get();
+          module->setAttrs(candidate->getAttrs());
+          module.getBodyRegion().takeBody(candidate.getBodyRegion());
+          return attempt;
+        }
+        fusionReason = attempt->reason;
+      }
       if (validated.size() > 8192 / request.factor)
         return reject("CV_STATIC_LANE_CODE_SIZE_EXCEEDED");
       // This describes independent rank-two execution, not an M/N extension
@@ -939,6 +959,7 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
           {"uniform_bounds", true}, {"dot_rank", 2},
           {"for_count", static_cast<int64_t>(report.operations["scf.for"])},
           {"if_count", static_cast<int64_t>(report.operations["scf.if"])}};
+      (*guard->getAsObject())["cv_loop_fusion_rejection"] = fusionReason;
       report.guardJSON = llvm::formatv("{0}", *guard).str();
       report.cvLowering = "static_uniform_control_lanes_v1";
       report.selectedAxis = axis;
@@ -961,6 +982,20 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
         return reject(reason);
       }
       report.cvMode = "spatial_concat_v1";
+      if (cvControlFlow) {
+        report.cvLowering = report.cvLowering == "spatial_m_v1"
+                                ? "spatial_m_uniform_control_v1"
+                                : "spatial_n_uniform_control_v1";
+        auto guard = llvm::json::parse(report.guardJSON);
+        if (!guard || !guard->getAsObject())
+          return failure();
+        (*guard->getAsObject())["cv_control_flow_contract"] = llvm::json::Object{
+            {"version", 1}, {"lane_semantics", "spatial_concatenation"},
+            {"uniform_bounds", true}, {"dot_rank", 2},
+            {"for_count", static_cast<int64_t>(report.operations["scf.for"])},
+            {"if_count", static_cast<int64_t>(report.operations["scf.if"])}};
+        report.guardJSON = llvm::formatv("{0}", *guard).str();
+      }
       report.selectedAxis = axis;
       report.laneWidth = request.factor;
       report.layoutJSON = serializeBatchLayouts({});
@@ -986,10 +1021,17 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       if (!guard->getAsObject())
         return failure();
       (*guard->getAsObject())["cv_mask_contract"] = std::move(*contract);
+      if (cvControlFlow)
+        (*guard->getAsObject())["cv_control_flow_contract"] = llvm::json::Object{
+            {"version", 1}, {"lane_semantics", "independent_batch"},
+            {"uniform_bounds", true}, {"dot_rank", 3},
+            {"for_count", static_cast<int64_t>(report.operations["scf.for"])},
+            {"if_count", static_cast<int64_t>(report.operations["scf.if"])}};
       report.guardJSON = llvm::formatv("{0}", *guard).str();
       // Keep the original masked-load values and masked-store effects. There
       // is no all-true launch proof and no mask erasure in this path.
-      report.cvLowering = "rank3_masked_batch_v1";
+      report.cvLowering = cvControlFlow ? "rank3_uniform_control_batch_v1"
+                                       : "rank3_masked_batch_v1";
       maskedBatch = true;
     }
     if (report.structuredMasks && !maskedBatch) {

@@ -1,6 +1,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 import json
 import pytest
+from triton.backends.ascend.block_batching import IMPLEMENTATION_VERSION
 from triton._C.libtriton import ir, ascend
 from block_batching_byte_extern_cases import case_ir
 
@@ -30,7 +31,7 @@ def test_new_subsets_keep_lane_mapping_and_memory_contract(tmp_path, kind, facto
     module = parse(tmp_path, case_ir(kind))
     report = ascend.passes.ttir.rewrite_block_batching(module, factor, 0)
     assert report["compile_status"] == "REWRITTEN", report
-    assert report["implementation_version"] == 28
+    assert report["implementation_version"] == IMPLEMENTATION_VERSION
     assert module.verify()
     text = str(module)
     assert f"tensor<{factor}x8xf32>" in text

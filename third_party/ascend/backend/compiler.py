@@ -73,7 +73,7 @@ from triton.backends.ascend.driver import (NPUUtils)
 from triton.backends.ascend.compiler_capabilities import optimized_metaop_options
 from triton.backends.ascend.block_batching import BatchRequest, analyze_request, BatchingRejected, IMPLEMENTATION_VERSION
 from triton.backends.ascend.block_batching_report import (
-    VALIDATION_POLICY, CV_AUTO_BLOCKIFY_LOWERINGS, validate_compilation_result,
+    VALIDATION_POLICY, CV_AUTO_BLOCKIFY_LOWERINGS, CV_MASKED_BATCH_LOWERINGS, validate_compilation_result,
 )
 from triton.backends.ascend.program_grid import (
     DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK,
@@ -385,7 +385,7 @@ def make_ttir(mod, metadata, opt):
         report["layout"]["selected_policy"] = opt.block_batching_layout
         report["guard"] = json.loads(report.pop("guard_json"))
         report["guard"]["axis"] = report["selected_axis"]
-        if report.get("cv_lowering") == "rank3_masked_batch_v1":
+        if report.get("cv_lowering") in CV_MASKED_BATCH_LOWERINGS:
             report["guard"]["require_same_fractal_bounds"] = True
             from .block_batching_guard_v2 import static_cv_mask_refusal
             reason = static_cv_mask_refusal(report["guard"])
@@ -699,7 +699,7 @@ def _full_row_copy_compile_options(metadata, compiler_path):
 
 def _masked_batch_compile_options(metadata, compiler_path):
     report = metadata.get("block_batching", {})
-    if report.get("cv_lowering") != "rank3_masked_batch_v1":
+    if report.get("cv_lowering") not in CV_MASKED_BATCH_LOWERINGS:
         return []
     # Masked ND2NZ must retain the allocation's complete fractal footprint.
     # Its current batch libcall does not initialize extra fractal blocks when

@@ -8,14 +8,19 @@ No custom AscendNPU-IR report or transitive SIMD proof is required.
 from .block_batching import BatchingRejected
 
 VALIDATION_POLICY = "ta_only_v1"
-CV_VALIDATION_POLICY = "ta_cv_uniform_control_ab_v16"
+CV_VALIDATION_POLICY = "ta_cv_uniform_fusion_v17"
+
+CV_MASKED_BATCH_LOWERINGS = ("rank3_masked_batch_v1", "rank3_uniform_control_batch_v1")
+CV_SPATIAL_LOWERINGS = (
+    "spatial_m_v1", "spatial_n_v1", "spatial_m_uniform_control_v1", "spatial_n_uniform_control_v1",
+)
 
 # Both launch-policy selection and final validation must use the same set.
 # These lowerings retain the hidden ORIGINAL grid while AutoBlockify iterates
 # over the transformed grid. Eligibility still requires MIX, no blacklist,
 # no persistent cap, and the owned v3 grid/effect contract below.
 CV_AUTO_BLOCKIFY_LOWERINGS = (
-    "rank3_masked_batch_v1", "spatial_m_v1", "spatial_n_v1", "static_uniform_control_lanes_v1",
+    *CV_MASKED_BATCH_LOWERINGS, *CV_SPATIAL_LOWERINGS, "static_uniform_control_lanes_v1",
 )
 
 
@@ -26,16 +31,23 @@ def _validate_cv_contract(metadata):
     lowerings = {
         "independent_batch_v1":
         ("rank3_batch_v1", "static_masked_lanes_v1", "static_uniform_control_lanes_v1",
-         "rank3_masked_batch_v1", *full_tile_lowerings),
-        "spatial_concat_v1": ("spatial_m_v1", "spatial_n_v1")
+         *CV_MASKED_BATCH_LOWERINGS, *full_tile_lowerings),
+        "spatial_concat_v1": CV_SPATIAL_LOWERINGS,
     }
     if report.get("cv_lowering") not in lowerings.get(report.get("cv_mode"), ()):
         raise BatchingRejected("CV_LOWERING_CONTRACT_MISSING")
-    if report.get("cv_lowering") == "static_uniform_control_lanes_v1":
+    uniform_contracts = {
+        "static_uniform_control_lanes_v1": ("original_program_clone", 2),
+        "spatial_m_uniform_control_v1": ("spatial_concatenation", 2),
+        "spatial_n_uniform_control_v1": ("spatial_concatenation", 2),
+        "rank3_uniform_control_batch_v1": ("independent_batch", 3),
+    }
+    if report.get("cv_lowering") in uniform_contracts:
+        semantics, rank = uniform_contracts[report["cv_lowering"]]
         proof = report.get("guard", {}).get("cv_control_flow_contract", {})
         if (type(proof) is not dict or proof.get("version") != 1
-                or proof.get("lane_semantics") != "original_program_clone"
-                or proof.get("uniform_bounds") is not True or proof.get("dot_rank") != 2
+                or proof.get("lane_semantics") != semantics
+                or proof.get("uniform_bounds") is not True or proof.get("dot_rank") != rank
                 or type(proof.get("for_count")) is not int or proof["for_count"] < 0
                 or type(proof.get("if_count")) is not int or proof["if_count"] < 0
                 or proof["for_count"] + proof["if_count"] == 0):
@@ -44,7 +56,7 @@ def _validate_cv_contract(metadata):
         if (metadata.get("enable_hivm_batch_matmul") is not True
                 or report.get("guard", {}).get("require_full_masks") is not True):
             raise BatchingRejected("CV_FULL_TILE_BATCH_CONTRACT_MISSING")
-    if report.get("cv_lowering") == "rank3_masked_batch_v1":
+    if report.get("cv_lowering") in CV_MASKED_BATCH_LOWERINGS:
         if (metadata.get("enable_hivm_batch_matmul") is not True or "require_full_masks" in report.get("guard", {})):
             raise BatchingRejected("CV_MASKED_BATCH_CONTRACT_MISSING")
         if (report.get("cv_memory_lowering") != "full_reduction_guard_v3"
