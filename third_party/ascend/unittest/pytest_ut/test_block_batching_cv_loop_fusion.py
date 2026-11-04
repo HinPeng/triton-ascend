@@ -143,12 +143,14 @@ def test_period_alignment_does_not_bypass_cv_factor_capability(tmp_path):
 
 def independent_pointer_loop(delta=32):
     text = independent_loop()
-    text = text.replace('%dot = scf.for', '%loop:2 = scf.for')
+    # The access proof accepts invariant deltas defined before the region,
+    # matching canonical TTIR. An in-region delta is deliberately fail-closed.
+    text = text.replace('%dot = scf.for', f'''%advance = arith.constant dense<{delta}> : tensor<4x8xi32>
+    %loop:2 = scf.for''')
     text = text.replace('iter_args(%carry = %zero) -> (tensor<4x4xf32>)',
                         'iter_args(%carry = %zero, %input = %ptr) -> (tensor<4x4xf32>, tensor<4x8x!tt.ptr<f32>>)')
     text = text.replace('%av = tt.load %ptr', '%av = tt.load %input')
     text = text.replace('scf.yield %next : tensor<4x4xf32>', f'''
-      %advance = arith.constant dense<{delta}> : tensor<4x8xi32>
       %nextptr = tt.addptr %input, %advance : tensor<4x8x!tt.ptr<f32>>, tensor<4x8xi32>
       scf.yield %next, %nextptr : tensor<4x4xf32>, tensor<4x8x!tt.ptr<f32>>''')
     return text.replace('tt.store %cptr, %dot', 'tt.store %cptr, %loop#0')
