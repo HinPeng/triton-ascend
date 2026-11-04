@@ -373,16 +373,30 @@ bool rectangularBatchMask(const BatchExprRef &expr, int axis, unsigned rank) {
            rectangularBatchMask(expr->rhs, axis, rank);
   if (expr->kind != K::SLT && expr->kind != K::ULT)
     return false;
+  // The canonical -1 < coordinate lower bound must be true on the full
+  // original box, as checked by the existing byte-domain contract. It is
+  // never used to shorten a prefix or to remove the source load mask.
+  bool nonnegative = expr->kind == K::SLT &&
+                     expr->lhs && expr->lhs->kind == K::Constant &&
+                     expr->lhs->value == -1;
   unsigned coordinates = 0;
   for (unsigned dim = 0; dim < rank; ++dim) {
     unsigned budget = 4096;
     auto left = coordinateStride(expr->lhs, dim, budget);
     auto right = coordinateStride(expr->rhs, dim, budget);
-    if (!left || !right || *right || (*left != 0 && *left != 1))
+    if (!left || !right)
+      return false;
+    if (nonnegative) {
+      if (*left || (*right != 0 && *right != 1))
+        return false;
+      coordinates += *right != 0;
+      continue;
+    }
+    if (*right || (*left != 0 && *left != 1))
       return false;
     coordinates += *left != 0;
   }
-  return coordinates == 1;
+  return nonnegative ? coordinates <= 1 : coordinates == 1;
 }
 
 bool constantTrueMask(Value mask) {

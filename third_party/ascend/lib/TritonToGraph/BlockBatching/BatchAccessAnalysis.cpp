@@ -460,6 +460,7 @@ struct Analysis {
     if (!cmp)
       return K::leaf(K::Unknown);
     K::Kind kind;
+    bool nonnegative = false;
     switch (cmp.getPredicate()) {
     case arith::CmpIPredicate::slt:
       kind = K::SLT;
@@ -469,6 +470,13 @@ struct Analysis {
       break;
     case arith::CmpIPredicate::eq:
       kind = K::EQ;
+      break;
+    case arith::CmpIPredicate::sge:
+      // Canonical block-pointer lower bound x >= 0 is exactly -1 < x.
+      // Keep the original device predicate; this only exposes its meaning
+      // to the byte-domain proof. Never subtract one from an arbitrary bound.
+      kind = K::SLT;
+      nonnegative = true;
       break;
     default:
       return K::leaf(K::Unknown);
@@ -484,6 +492,12 @@ struct Analysis {
       report.reason = previousReason;
       report.operation = previousOperation;
       return K::leaf(K::Unknown);
+    }
+    if (nonnegative) {
+      if (!rhs || rhs->kind != K::Constant || rhs->value != 0)
+        return K::leaf(K::Unknown);
+      return K::node(K::SLT, bits(cmp.getLhs().getType()),
+                     constant(-1, bits(cmp.getLhs().getType())), std::move(lhs));
     }
     return K::node(kind, bits(cmp.getLhs().getType()), std::move(lhs),
                    std::move(rhs));

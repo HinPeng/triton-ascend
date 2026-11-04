@@ -169,6 +169,54 @@ def test_invariant_dot_yield_retains_explicit_zero_trip_result(tmp_path, kind):
     assert module.verify()
 
 
+@pytest.mark.parametrize('negative', [False, True])
+def test_canonical_nonnegative_mask_keeps_full_domain_proof(tmp_path, negative):
+    text = independent_loop(masked=True)
+    coord = '%kk'
+    extra = ''
+    if negative:
+        coord = '%shifted'
+        extra = '''
+      %negative_one = arith.constant dense<-1> : tensor<4x8xi32>
+      %shifted = arith.addi %kk, %negative_one : tensor<4x8xi32>
+'''
+    text = text.replace('%mask = arith.cmpi slt, %kk, %bound : tensor<4x8xi32>', extra + f'''
+      %integer_zero = arith.constant dense<0> : tensor<4x8xi32>
+      %nonnegative = arith.cmpi sge, {coord}, %integer_zero : tensor<4x8xi32>
+      %upper = arith.cmpi slt, %kk, %bound : tensor<4x8xi32>
+      %mask = arith.andi %nonnegative, %upper : tensor<4x8xi1>
+''')
+    module = parse(tmp_path, text)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 2, 0, 'auto', True, True)
+    assert report['compile_status'] == 'REWRITTEN', report
+    assert report['cv_lowering'] == 'rank3_uniform_control_batch_v1', report
+    assert 'arith.cmpi sge' in str(module)  # Never erase the device predicate.
+    guard = json.loads(report['guard_json'])
+    guard['require_same_fractal_bounds'] = True
+    checked = check_guard(guard, [1 << 30, 1 << 40, 1 << 45, 3, 8], [2, 1, 1], 2)
+    if negative:
+        assert checked == (False, 'CV_BATCH_PADDING_NOT_PROVEN')
+    else:
+        assert checked[0], checked
+    assert module.verify()
+
+
+def test_batch_loop_allows_proved_auxiliary_vector_access(tmp_path):
+    text = independent_loop().replace('    %av = tt.load', '''
+    %aux_base = tt.splat %b : !tt.ptr<f32> -> tensor<8x!tt.ptr<f32>>
+    %aux_ptr = tt.addptr %aux_base, %r8 : tensor<8x!tt.ptr<f32>>, tensor<8xi32>
+    %aux = tt.load %aux_ptr : tensor<8x!tt.ptr<f32>>
+    %av = tt.load''')
+    module = parse(tmp_path, text)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 2, 0, 'auto', True, True)
+    assert report['compile_status'] == 'REWRITTEN', report
+    assert report['cv_lowering'] == 'rank3_uniform_control_batch_v1', report
+    guard = json.loads(report['guard_json'])
+    guard['require_same_fractal_bounds'] = True
+    checked = check_guard(guard, [1 << 30, 1 << 40, 1 << 45, 3, 8], [2, 1, 1], 2)
+    assert checked[0], checked
+
+
 @pytest.mark.parametrize('lowering,mode,semantics,rank', [
     ('spatial_m_uniform_control_v1', 'spatial_concat_v1', 'spatial_concatenation', 2),
     ('spatial_n_uniform_control_v1', 'spatial_concat_v1', 'spatial_concatenation', 2),

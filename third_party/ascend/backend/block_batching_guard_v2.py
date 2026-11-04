@@ -309,6 +309,14 @@ class ByteDomain:
             if node[0] not in ("slt", "ult") or len(node) != 4:
                 raise GuardFailure(reason)
             lhs, rhs = self.expression(node[1]), self.expression(node[2])
+            if node[0] == "slt" and lhs.uniform and lhs.offset == -1:
+                # x >= 0 canonicalized to -1 < x. Prove it over the untrimmed
+                # box; an active lower tail would violate the padding proof.
+                try:
+                    self.require_full_mask(node)
+                except GuardFailure:
+                    raise GuardFailure(reason)
+                return
             if node[0] == "ult":
                 for value in (lhs, rhs):
                     checked(*self.bounds(value, self.full), self.bits(node[3]), unsigned=True)
@@ -330,10 +338,10 @@ class ByteDomain:
             raise GuardFailure(reason)
 
     def require_full_axes(self, axes):
+        if axes == []:
+            return  # Auxiliary rank-one accesses are not dot reduction inputs.
         if len(self.shape) != 2 or not all(type(axis) is int and axis in (0, 1) for axis in axes):
             raise GuardFailure("CV_BATCH_DOT_CONTRACT_NOT_PROVEN")
-        if not axes:
-            return
         mask = self.access.get("mask")
         if mask is None or mask == ["true"]:
             return
@@ -351,6 +359,12 @@ class ByteDomain:
             if node[0] not in ("slt", "ult") or len(node) != 4:
                 raise GuardFailure(reason)
             lhs, rhs = self.expression(node[1]), self.expression(node[2])
+            if node[0] == "slt" and lhs.uniform and lhs.offset == -1:
+                try:
+                    self.require_full_mask(node)
+                except GuardFailure:
+                    raise GuardFailure(reason)
+                return
             delta = lhs.add(rhs, -1)
             local = delta.coefficients[3:5]
             touched = [axis for axis, stride in enumerate(local) if stride]

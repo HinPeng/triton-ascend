@@ -8,7 +8,7 @@ No custom AscendNPU-IR report or transitive SIMD proof is required.
 from .block_batching import BatchingRejected
 
 VALIDATION_POLICY = "ta_only_v1"
-CV_VALIDATION_POLICY = "ta_cv_uniform_fusion_recurrence_v19"
+CV_VALIDATION_POLICY = "ta_cv_uniform_fusion_lower_bounds_v20"
 
 CV_MASKED_BATCH_LOWERINGS = ("rank3_masked_batch_v1", "rank3_uniform_control_batch_v1")
 CV_SPATIAL_LOWERINGS = (
