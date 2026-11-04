@@ -59,6 +59,70 @@ std::optional<int64_t> programDivisor(Operation *op) {
   return value.getInt();
 }
 
+// Recover a pointer recurrence's affine address without carrying a complete
+// tensor of offsets into the consumer. Only an exact, constant-splat addptr
+// backedge qualifies. Unknown or conditional updates retain their old form.
+Value rebuildCVPointerRecurrence(Value argument, Value initial, Value yielded,
+                                 scf::ForOp loop, IRRewriter &rewriter) {
+  if (!isa<triton::PointerType>(scalar(argument.getType())))
+    return {};
+  auto update = yielded.getDefiningOp<triton::AddPtrOp>();
+  if (!update || update.getPtr() != argument)
+    return {};
+  Value offset = update.getOffset();
+  while (Operation *op = offset.getDefiningOp()) {
+    if (!isa<triton::SplatOp, triton::BroadcastOp, triton::ExpandDimsOp>(op))
+      break;
+    offset = op->getOperand(0);
+  }
+  auto constant = offset.getDefiningOp<arith::ConstantOp>();
+  if (!constant)
+    return {};
+  Attribute attr = constant.getValue();
+  if (auto dense = dyn_cast<DenseIntElementsAttr>(attr)) {
+    if (!dense.isSplat())
+      return {};
+    attr = dense.getSplatValue<Attribute>();
+  }
+  auto delta = dyn_cast<IntegerAttr>(attr);
+  if (!delta || delta.getValue().getBitWidth() > 64)
+    return {};
+  Type ivType = loop.getInductionVar().getType();
+  auto integer = dyn_cast<IntegerType>(ivType);
+  if (!ivType.isIndex() && (!integer || integer.getWidth() > 64))
+    return {};
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPointToStart(loop.getBody());
+  Location loc = update.getLoc();
+  auto asI64 = [&](Value value) -> Value {
+    if (ivType.isIndex())
+      return rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(),
+                                                value);
+    if (integer.getWidth() < 64)
+      return rewriter.create<arith::ExtSIOp>(loc, rewriter.getI64Type(), value);
+    return value;
+  };
+  Value distance = rewriter.create<arith::SubIOp>(
+      loc, asI64(loop.getInductionVar()), asI64(loop.getLowerBound()));
+  // The accepted loop has a positive step. Unsigned distance also represents
+  // a signed range spanning zero without introducing signed-overflow flags.
+  Value iteration = rewriter.create<arith::DivUIOp>(
+      loc, distance, asI64(loop.getStep()));
+  Value advance = rewriter.create<arith::ConstantIntOp>(
+      loc, delta.getValue().getSExtValue(), 64);
+  Value displacement =
+      rewriter.create<arith::MulIOp>(loc, iteration, advance);
+  // Repeated i32 addptr deltas are sign-extended for each pointer addition.
+  // Accumulate in i64, not i32: truncating the total could change an address
+  // after crossing 2 Gi elements even though each individual delta fits i32.
+  if (auto tensor = dyn_cast<RankedTensorType>(initial.getType()))
+    displacement = rewriter.create<triton::SplatOp>(
+        loc, RankedTensorType::get(tensor.getShape(), rewriter.getI64Type()),
+        displacement);
+  return rewriter.create<triton::AddPtrOp>(loc, initial.getType(), initial,
+                                           displacement);
+}
+
 // A constant derivative in the original byte-address expression. The launch
 // guard still proves no-wrap and all accessed addresses; this only chooses a
 // representation for the same load. Dynamic/unproved strides are not guessed.
@@ -1393,9 +1457,21 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
           } else
             values.map(loop.getInductionVar(), created.getInductionVar(),
                        false);
-          for (auto [from, to] :
-               llvm::zip(loop.getRegionIterArgs(), created.getRegionIterArgs()))
-            values.map(from, to, control.isVarying(from));
+          for (auto [from, to, initial, yielded] :
+               llvm::zip(loop.getRegionIterArgs(), created.getRegionIterArgs(),
+                         loop.getInitArgs(), loop.getYieldedValues())) {
+            Value mapped = to;
+            if (cvControlFlow && maskedBatch &&
+                isa<triton::PointerType>(scalar(from.getType()))) {
+              Value base = mapping.lookup(initial);
+              if (base.getType() != to.getType())
+                base = lift(initial, cast<RankedTensorType>(to.getType()));
+              if (Value affine = rebuildCVPointerRecurrence(
+                      from, base, yielded, created, rewriter))
+                mapped = affine;
+            }
+            values.map(from, mapped, control.isVarying(from));
+          }
           if (failed(
                   rewriteBody(*loop.getBody(), created.getBody(), resultTypes)))
             return failure();

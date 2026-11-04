@@ -141,6 +141,34 @@ def test_period_alignment_does_not_bypass_cv_factor_capability(tmp_path):
     assert str(module) == before
 
 
+def independent_pointer_loop(delta=32):
+    text = independent_loop()
+    text = text.replace('%dot = scf.for', '%loop:2 = scf.for')
+    text = text.replace('iter_args(%carry = %zero) -> (tensor<4x4xf32>)',
+                        'iter_args(%carry = %zero, %input = %ptr) -> (tensor<4x4xf32>, tensor<4x8x!tt.ptr<f32>>)')
+    text = text.replace('%av = tt.load %ptr', '%av = tt.load %input')
+    text = text.replace('scf.yield %next : tensor<4x4xf32>', f'''
+      %advance = arith.constant dense<{delta}> : tensor<4x8xi32>
+      %nextptr = tt.addptr %input, %advance : tensor<4x8x!tt.ptr<f32>>, tensor<4x8xi32>
+      scf.yield %next, %nextptr : tensor<4x4xf32>, tensor<4x8x!tt.ptr<f32>>''')
+    return text.replace('tt.store %cptr, %dot', 'tt.store %cptr, %loop#0')
+
+
+@pytest.mark.parametrize('delta', [32, -32, 1073741824])
+def test_batch_pointer_recurrence_rebuilds_addresses_in_i64(tmp_path, delta):
+    module = parse(tmp_path, independent_pointer_loop(delta))
+    report = ascend.passes.ttir.rewrite_block_batching(module, 2, 0, 'auto', True, True)
+    assert report['compile_status'] == 'REWRITTEN', report
+    assert report['cv_lowering'] == 'rank3_uniform_control_batch_v1', report
+    text = str(module)
+    assert 'arith.divui ' in text
+    assert 'tensor<2x4x8xi64>' in text
+    assert text.count('tt.dot ') == 1 and module.verify()
+    # There is no extra all-true mask or pointer-provenance runtime guard.
+    guard = json.loads(report['guard_json'])
+    assert 'require_full_masks' not in guard
+
+
 @pytest.mark.parametrize('factor', [2, 4])
 @pytest.mark.parametrize('masked', [False, True])
 def test_loop_batch_preserves_independent_accumulators_and_transposed_load(tmp_path, factor, masked):

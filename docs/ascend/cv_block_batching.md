@@ -152,6 +152,15 @@ Invariant or unclassified yielded results keep the explicit zero-trip
 workaround. Zero-trip semantics are never removed, and VV's existing rule is
 unchanged.
 
+For an exact pointer backedge `ptr_next = addptr(ptr, constant_splat)`, the
+independent-batch loop rebuilds each iteration's address from its original
+initial pointer and the scalar iteration count. The cumulative displacement
+uses i64, preserving the sign extension of each original i32 pointer step.
+This exposes the existing strides to memory lowering instead of carrying a
+rank-three address tensor. Original masks, loop bounds, zero-trip behavior and
+byte-domain proofs remain; unknown or conditional pointer steps keep their
+original representation.
+
 Induction gives the loop proof: if the accumulated state at iteration `t` is
 the concatenation (or independent stack) of the original states, the unchanged
 K-step dot produces that same relation at iteration `t+1`. The common loop
