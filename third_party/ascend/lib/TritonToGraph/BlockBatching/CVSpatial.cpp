@@ -1,6 +1,7 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #include "TritonToGraph/BlockBatching/CVSpatial.h"
 #include "TritonToGraph/BlockBatching/BatchOpRegistry.h"
+#include "TritonToGraph/BlockBatching/ControlFlowModels.h"
 #include "TritonToGraph/ProgramGridTransform.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -335,18 +336,19 @@ class SpatialBuilder {
       Value lower = mapped.lookup(loop.getLowerBound());
       Value upper = mapped.lookup(loop.getUpperBound());
       Value step = mapped.lookup(loop.getStep());
-      // Preserve the original zero-trip result even if the consumer folds a
-      // loop-invariant yield. This uniform test never selects individual lanes.
-      Value nonempty = rw.create<arith::CmpIOp>(
-          op->getLoc(), arith::CmpIPredicate::slt, lower, upper);
-      auto gate = rw.create<scf::IfOp>(op->getLoc(), types, nonempty, true);
-      Block &thenBlock = gate.getThenRegion().front();
-      Block &elseBlock = gate.getElseRegion().front();
-      while (!thenBlock.empty())
-        rw.eraseOp(&thenBlock.back());
-      while (!elseBlock.empty())
-        rw.eraseOp(&elseBlock.back());
-      rw.setInsertionPointToEnd(&thenBlock);
+      // Wrapping an accumulator recurrence forces the consumer to move its
+      // f32 result across a new if boundary (L0C -> UB). Only invariant or
+      // unclassified yields need the explicit zero-trip workaround.
+      scf::IfOp gate;
+      if (cvLoopNeedsZeroTripGuard(loop)) {
+        Value nonempty = rw.create<arith::CmpIOp>(
+            op->getLoc(), arith::CmpIPredicate::slt, lower, upper);
+        gate = rw.create<scf::IfOp>(op->getLoc(), types, nonempty, true);
+        for (Region &region : gate->getRegions())
+          while (!region.front().empty())
+            rw.eraseOp(&region.front().back());
+        rw.setInsertionPointToEnd(&gate.getThenRegion().front());
+      }
       auto created = rw.create<scf::ForOp>(op->getLoc(), lower, upper, step, init);
       created->setAttrs(op->getAttrs());
       while (!created.getBody()->empty())
@@ -356,11 +358,15 @@ class SpatialBuilder {
         mapped.map(from, to);
       if (failed(rewriteRegion(*loop.getBody(), *created.getBody())))
         return failure();
-      rw.setInsertionPointToEnd(&thenBlock);
-      rw.create<scf::YieldOp>(op->getLoc(), created.getResults());
-      rw.setInsertionPointToEnd(&elseBlock);
-      rw.create<scf::YieldOp>(op->getLoc(), init);
-      replacement = gate;
+      if (gate) {
+        rw.setInsertionPointToEnd(&gate.getThenRegion().front());
+        rw.create<scf::YieldOp>(op->getLoc(), created.getResults());
+        rw.setInsertionPointToEnd(&gate.getElseRegion().front());
+        rw.create<scf::YieldOp>(op->getLoc(), init);
+        replacement = gate;
+      } else {
+        replacement = created;
+      }
     }
     for (auto [from, to] : llvm::zip(op->getResults(), replacement->getResults()))
       mapped.map(from, to);

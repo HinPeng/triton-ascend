@@ -9,7 +9,7 @@
 #include <cstdint>
 
 namespace mlir::triton::cfg {
-inline constexpr unsigned kBatchImplementationVersion = 31;
+inline constexpr unsigned kBatchImplementationVersion = 32;
 enum class BatchModel {
   Domain,
   Constant,

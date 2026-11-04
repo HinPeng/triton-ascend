@@ -159,4 +159,37 @@ BatchControlFlowPlan analyzeBatchControlFlow(triton::FuncOp function,
   analysis.block(function.getBody().front());
   return std::move(analysis.plan);
 }
+
+bool cvLoopNeedsZeroTripGuard(scf::ForOp loop) {
+  auto recurrent = [&](auto &&self, Value value, Value iterArg,
+                       unsigned depth) -> bool {
+    if (value == iterArg)
+      return true;
+    if (depth > 16)
+      return false;
+    if (auto dot = value.getDefiningOp<triton::DotOp>())
+      return dot.getC() == iterArg;
+    if (auto pointer = value.getDefiningOp<triton::AddPtrOp>())
+      return pointer.getPtr() == iterArg;
+    if (auto branch = value.getDefiningOp<scf::IfOp>()) {
+      unsigned index = cast<OpResult>(value).getResultNumber();
+      for (Region &region : branch->getRegions()) {
+        if (!region.hasOneBlock())
+          return false;
+        Value yielded = region.front().getTerminator()->getOperand(index);
+        if (!self(self, yielded, iterArg, depth + 1))
+          return false;
+      }
+      return true;
+    }
+    return false;
+  };
+  auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+  for (auto [result, arg, end] : llvm::zip(
+           loop.getResults(), loop.getRegionIterArgs(), yield.getOperands())) {
+    if (!result.use_empty() && !recurrent(recurrent, end, arg, 0))
+      return true;
+  }
+  return false;
+}
 } // namespace mlir::triton::cfg

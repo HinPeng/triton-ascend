@@ -1290,17 +1290,16 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
           // A backend loop-invariant-yield fold can replace a tensor result
           // even on a zero-trip loop. Express the original zero-trip result
           // explicitly, while leaving the positive iteration sequence intact.
-          Value nonempty = rewriter.create<arith::CmpIOp>(
-              loc, arith::CmpIPredicate::slt, lower, upper);
-          auto gate =
-              rewriter.create<scf::IfOp>(loc, resultTypes, nonempty, true);
-          Block &thenBlock = gate.getThenRegion().front();
-          Block &elseBlock = gate.getElseRegion().front();
-          while (!thenBlock.empty())
-            rewriter.eraseOp(&thenBlock.back());
-          while (!elseBlock.empty())
-            rewriter.eraseOp(&elseBlock.back());
-          rewriter.setInsertionPointToEnd(&thenBlock);
+          scf::IfOp gate;
+          if (!cvControlFlow || cvLoopNeedsZeroTripGuard(loop)) {
+            Value nonempty = rewriter.create<arith::CmpIOp>(
+                loc, arith::CmpIPredicate::slt, lower, upper);
+            gate = rewriter.create<scf::IfOp>(loc, resultTypes, nonempty, true);
+            for (Region &region : gate->getRegions())
+              while (!region.front().empty())
+                rewriter.eraseOp(&region.front().back());
+            rewriter.setInsertionPointToEnd(&gate.getThenRegion().front());
+          }
           auto created =
               rewriter.create<scf::ForOp>(loc, lower, upper, stride, init);
           created->setAttrs(op->getAttrs());
@@ -1358,11 +1357,15 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
           if (failed(
                   rewriteBody(*loop.getBody(), created.getBody(), resultTypes)))
             return failure();
-          rewriter.setInsertionPointToEnd(&thenBlock);
-          rewriter.create<scf::YieldOp>(op->getLoc(), created.getResults());
-          rewriter.setInsertionPointToEnd(&elseBlock);
-          rewriter.create<scf::YieldOp>(op->getLoc(), init);
-          replacement = gate;
+          if (gate) {
+            rewriter.setInsertionPointToEnd(&gate.getThenRegion().front());
+            rewriter.create<scf::YieldOp>(op->getLoc(), created.getResults());
+            rewriter.setInsertionPointToEnd(&gate.getElseRegion().front());
+            rewriter.create<scf::YieldOp>(op->getLoc(), init);
+            replacement = gate;
+          } else {
+            replacement = created;
+          }
         }
         for (auto [old, result] :
              llvm::zip(op->getResults(), replacement->getResults()))

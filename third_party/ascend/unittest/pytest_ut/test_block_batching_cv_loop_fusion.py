@@ -51,6 +51,7 @@ def test_loop_spatial_fusion_preserves_one_dot_and_one_recurrence(tmp_path, mode
     assert report['cv_lowering'] == f'spatial_{mode}_uniform_control_v1', report
     text = str(module)
     assert text.count('tt.dot ') == 1 and text.count('scf.for') == 1
+    assert text.count('scf.if') == int(branch)  # no new accumulator-transfer boundary
     shape = f'{4*factor}x4' if mode == 'm' else f'4x{4*factor}'
     dot, = [line for line in text.splitlines() if 'tt.dot ' in line]
     assert f'-> tensor<{shape}xf32>' in dot
@@ -101,6 +102,7 @@ def test_loop_batch_preserves_independent_accumulators_and_transposed_load(tmp_p
     assert report['cv_lowering'] == 'rank3_uniform_control_batch_v1', report
     text = str(module)
     assert text.count('scf.for') == 1 and text.count('tt.dot ') == 1
+    assert 'scf.if' not in text
     assert f'tensor<{factor}x4x8xf32> * tensor<{factor}x8x4xf32>' in text
     assert 'tt.cv_batch_full_mkn' in text
     assert module.verify()
@@ -153,6 +155,18 @@ def test_shared_load_keeps_both_operands_reduction_axis_obligations(tmp_path):
     assert check_guard(guard, args, [2, 1, 1], 2) == expected
     inputs.reverse()
     assert check_guard(guard, args, [2, 1, 1], 2) == expected
+
+
+@pytest.mark.parametrize('kind', ['spatial', 'batch'])
+def test_invariant_dot_yield_retains_explicit_zero_trip_result(tmp_path, kind):
+    text = spatial_loop() if kind == 'spatial' else independent_loop()
+    text = text.replace('%b, %carry,', '%b, %zero,').replace('%bv, %carry :', '%bv, %zero :')
+    module = parse(tmp_path, text)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 2, 0, 'auto', True, True)
+    assert report['compile_status'] == 'REWRITTEN', report
+    assert str(module).count('scf.if') == 1
+    assert str(module).count('scf.for') == 1
+    assert module.verify()
 
 
 @pytest.mark.parametrize('lowering,mode,semantics,rank', [
