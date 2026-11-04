@@ -24,7 +24,7 @@ def spatial_loop(mode='m', axis=0, branch=False):
     body = text[begin:end].replace('%dot = tt.dot', '%next = tt.dot').replace('%b, %zero,', '%b, %carry,')
     if branch:
         body = '''
-      %choose = arith.cmpi sgt, %flag, %z : i32
+      %choose = arith.cmpi sgt, %flag, %loop_zero : i32
       %picked = scf.if %choose -> (tensor<4x4xf32>) {
         ''' + body + '''
         scf.yield %next : tensor<4x4xf32>
@@ -34,9 +34,9 @@ def spatial_loop(mode='m', axis=0, branch=False):
 '''
     result = '%picked' if branch else '%next'
     return text[:begin] + '''
-    %z = arith.constant 0 : i32
+    %loop_zero = arith.constant 0 : i32
     %one = arith.constant 1 : i32
-    %dot = scf.for %iv = %z to %trips step %one iter_args(%carry = %zero) -> (tensor<4x4xf32>) : i32 {
+    %dot = scf.for %iv = %loop_zero to %trips step %one iter_args(%carry = %zero) -> (tensor<4x4xf32>) : i32 {
 ''' + body + f'    scf.yield {result} : tensor<4x4xf32>\n    }}\n' + text[end:]
 
 
@@ -64,7 +64,8 @@ def test_loop_spatial_fusion_preserves_one_dot_and_one_recurrence(tmp_path, mode
     grid[axis] = factor
     for trips in [0, 1, 3]:
         args = [1 << 30, 1 << 40, 1 << 45, factor*4, trips, 1]
-        assert check_guard(guard, args, grid, factor)[0]
+        checked = check_guard(guard, args, grid, factor)
+        assert checked[0], checked
     args[2] = args[0]
     args[4] = 3
     assert not check_guard(guard, args, grid, factor)[0]
@@ -106,7 +107,8 @@ def test_loop_batch_preserves_independent_accumulators_and_transposed_load(tmp_p
     guard = json.loads(report['guard_json'])
     guard['require_same_fractal_bounds'] = True
     args = [1 << 30, 1 << 40, 1 << 45, 3, 8]
-    assert check_guard(guard, args, [factor, 1, 1], factor)[0]
+    checked = check_guard(guard, args, [factor, 1, 1], factor)
+    assert checked[0], checked
     if masked:
         args[-1] = 7
         assert check_guard(guard, args, [factor, 1, 1], factor) == (False, 'CV_BATCH_REDUCTION_MASK_NOT_PROVEN')
@@ -130,6 +132,29 @@ def test_unprovable_spatial_local_bias_rolls_back_to_original_lane_regions(tmp_p
     assert module.verify()
 
 
+def test_shared_load_keeps_both_operands_reduction_axis_obligations(tmp_path):
+    # A row tail is harmless to the original A @ A.T reduction (axis 1).
+    text = independent_loop(masked=True).replace('slt, %kk, %bound', 'slt, %mm, %bound')
+    module = parse(tmp_path, text)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 2, 0, 'auto', True, True)
+    assert report['compile_status'] == 'REWRITTEN', report
+    guard = json.loads(report['guard_json'])
+    guard['require_same_fractal_bounds'] = True
+    args = [1 << 30, 1 << 40, 1 << 45, 3, 3]
+    checked = check_guard(guard, args, [2, 1, 1], 2)
+    assert checked[0], checked
+    # Exercise the guard contract for a shared source whose second use also
+    # reduces original axis 0: both obligations must be retained, in any order.
+    inputs = guard['cv_mask_contract']['inputs']
+    for item in inputs:
+        if item['operand'] == 1:
+            item['axes'] = [0, 1]
+    expected = (False, 'CV_BATCH_REDUCTION_MASK_NOT_PROVEN')
+    assert check_guard(guard, args, [2, 1, 1], 2) == expected
+    inputs.reverse()
+    assert check_guard(guard, args, [2, 1, 1], 2) == expected
+
+
 @pytest.mark.parametrize('lowering,mode,semantics,rank', [
     ('spatial_m_uniform_control_v1', 'spatial_concat_v1', 'spatial_concatenation', 2),
     ('spatial_n_uniform_control_v1', 'spatial_concat_v1', 'spatial_concatenation', 2),
@@ -141,7 +166,12 @@ def test_loop_lowering_contract_requires_matching_region_and_memory_proofs(lower
     from test_block_batching_guard import cv_metadata
     metadata = cv_metadata()
     report = metadata['block_batching']
-    report.update(cv_mode=mode, cv_lowering=lowering)
+    report.update(cv_mode=mode, cv_lowering=lowering, guard={})
+    if rank == 3:
+        metadata['enable_hivm_batch_matmul'] = True
+        report['cv_memory_lowering'] = 'full_reduction_guard_v3'
+        report['guard'].update(require_same_fractal_bounds=True,
+                              cv_mask_contract=dict(version=1, inputs=[{}, {}], outputs=[{}]))
     report['guard']['cv_control_flow_contract'] = dict(version=1, lane_semantics=semantics,
         uniform_bounds=True, dot_rank=rank, for_count=1, if_count=0)
     metadata.update(auto_blockify_enabled=True, has_auto_blockify_blacklist_op=False)

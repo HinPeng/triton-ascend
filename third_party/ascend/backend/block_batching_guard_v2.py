@@ -644,9 +644,16 @@ def check_guard_v2(guard, arguments, grid, factor):
             for item in cv_contract["inputs"]:
                 aid, operand, axes = item.get("access"), item["operand"], item.get("axes")
                 if (type(aid) is not int or not 0 <= aid < len(guard["accesses"]) or type(axes) is not list
-                        or sorted(axes) != [0, 1] or guard["accesses"][aid]["write"] or aid in input_axes):
+                        or sorted(axes) != [0, 1] or guard["accesses"][aid]["write"]):
                     raise GuardFailure("CV_BATCH_DOT_CONTRACT_NOT_PROVEN")
-                input_axes[aid] = [axes[1] if operand == 0 else axes[0]]
+                # One load can legally supply both dot operands (A @ A.T).
+                # Keep every reduction-axis obligation in original load
+                # coordinates; overwriting the first operand's axis could
+                # incorrectly admit a masked K dimension on that operand.
+                reduction_axis = axes[1] if operand == 0 else axes[0]
+                input_axes.setdefault(aid, [])
+                if reduction_axis not in input_axes[aid]:
+                    input_axes[aid].append(reduction_axis)
             if (any(
                     type(aid) is not int or not 0 <= aid < len(guard["accesses"]) or not guard["accesses"][aid]["write"]
                     for aid in cv_contract["outputs"])):
