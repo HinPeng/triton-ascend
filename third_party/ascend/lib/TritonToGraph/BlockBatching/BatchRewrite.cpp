@@ -43,6 +43,22 @@ Type scalar(Type type) {
   return type;
 }
 
+bool isSelectedProgramDivision(Operation *op, int axis) {
+  if (!isa<arith::DivSIOp, arith::RemSIOp>(op))
+    return false;
+  auto pid = op->getOperand(0).getDefiningOp<triton::GetProgramIdOp>();
+  return pid && static_cast<int>(pid.getAxis()) == axis;
+}
+
+std::optional<int64_t> programDivisor(Operation *op) {
+  auto constant = op->getOperand(1).getDefiningOp<arith::ConstantOp>();
+  auto value = constant ? dyn_cast<IntegerAttr>(constant.getValue())
+                        : IntegerAttr{};
+  if (!value || !value.getType().isInteger(32))
+    return std::nullopt;
+  return value.getInt();
+}
+
 // A constant derivative in the original byte-address expression. The launch
 // guard still proves no-wrap and all accessed addresses; this only chooses a
 // representation for the same load. Dynamic/unproved strides are not guessed.
@@ -1018,6 +1034,18 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       return report;
     }
     if (request.cvBatchMatmul) {
+      // A group that crosses a quotient period needs a discontinuous lane
+      // address. The consumer's per-lane assembly before batch MMA is not
+      // validated for this path; retain the transactional lane fallback.
+      for (Operation *op : validated) {
+        if (!isSelectedProgramDivision(op, axis))
+          continue;
+        auto divisor = programDivisor(op);
+        if (!divisor || *divisor <= 0 || *divisor % request.factor != 0) {
+          diagnosticOp = op;
+          return reject("CV_BATCH_QUOTIENT_GROUP_CROSSES_PERIOD");
+        }
+      }
       for (const auto &fact : access.accesses) {
         if (!rectangularBatchMask(fact.mask, axis, fact.shape.size())) {
           diagnosticOp = fact.operation;
@@ -1409,7 +1437,25 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       if (isa<triton::StoreOp>(op) && !var)
         return rejectRewrite("UNIFORM_STORE");
       Operation *replacement = nullptr;
-      if (auto intToPtr = dyn_cast<triton::IntToPtrOp>(op)) {
+      if (maskedBatch && isSelectedProgramDivision(op, axis)) {
+        // p = g*F + u, 0 <= u < F, H > 0 and F divides H. Therefore
+        // floor(p/H) = floor(g*F/H), p%H = (g*F)%H + u. The full-group
+        // grid contract bounds p by INT32_MAX, so signed arithmetic cannot
+        // wrap. Keep the quotient scalar and the remainder unit-strided;
+        // tensor div/rem would hide that stride and force per-lane DMA loops.
+        // Original byte-domain/mask proofs remain in original coordinates.
+        int64_t divisor = *programDivisor(op);
+        Value period = constant(i32, divisor);
+        if (isa<arith::DivSIOp>(op)) {
+          Value quotient = rewriter.create<arith::DivSIOp>(loc, folded, period);
+          replacement =
+              rewriter.create<triton::SplatOp>(loc, lane32, quotient);
+        } else {
+          Value remainder = rewriter.create<arith::RemSIOp>(loc, folded, period);
+          Value start = rewriter.create<triton::SplatOp>(loc, lane32, remainder);
+          replacement = rewriter.create<arith::AddIOp>(loc, start, lane);
+        }
+      } else if (auto intToPtr = dyn_cast<triton::IntToPtrOp>(op)) {
         auto pointer =
             dyn_cast<triton::PointerType>(scalar(intToPtr.getType()));
         unsigned bytes =

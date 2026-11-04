@@ -93,6 +93,45 @@ def independent_loop(masked=False):
 ''' + body + '    scf.yield %next : tensor<4x4xf32>\n    }\n' + text[end:]
 
 
+def periodic_head_loop(period, axis):
+    text = independent_loop().replace('tt.get_program_id x', f'tt.get_program_id {"xyz"[axis]}')
+    return text.replace('%base = arith.muli %p, %c32 : i32', f'''
+    %heads = arith.constant {period} : i32
+    %batch_stride = arith.constant {period * 64} : i32
+    %batch = arith.divsi %p, %heads : i32
+    %head = arith.remsi %p, %heads : i32
+    %bb = arith.muli %batch, %batch_stride : i32
+    %hh = arith.muli %head, %c32 : i32
+    %base = arith.addi %bb, %hh : i32''')
+
+
+@pytest.mark.parametrize('axis', [0, 1, 2])
+@pytest.mark.parametrize('period,factor', [(4, 2), (4, 4), (6, 3), (8, 4)])
+def test_aligned_periodic_program_addresses_keep_scalar_quotient(tmp_path, axis, period, factor):
+    module = parse(tmp_path, periodic_head_loop(period, axis))
+    report = ascend.passes.ttir.rewrite_block_batching(module, factor, axis, 'auto', True, True)
+    assert report['compile_status'] == 'REWRITTEN', report
+    assert report['cv_lowering'] == 'rank3_uniform_control_batch_v1', report
+    text = str(module)
+    divisions = [line for line in text.splitlines() if 'arith.divsi ' in line or 'arith.remsi ' in line]
+    assert len(divisions) == 2 and all('tensor<' not in line for line in divisions)
+    assert text.count('tt.dot ') == 1 and module.verify()
+    guard = json.loads(report['guard_json'])
+    guard['require_same_fractal_bounds'] = True
+    grid = [1, 1, 1]; grid[axis] = period * 2
+    assert check_guard(guard, [1 << 30, 1 << 40, 1 << 45, 3, 8], grid, factor)[0]
+
+
+@pytest.mark.parametrize('period,factor', [(3, 2), (6, 4), (2, 4)])
+def test_period_crossing_group_falls_back_to_independent_regions(tmp_path, period, factor):
+    module = parse(tmp_path, periodic_head_loop(period, 0))
+    report = ascend.passes.ttir.rewrite_block_batching(module, factor, 0, 'auto', True, True)
+    assert report['compile_status'] == 'REWRITTEN', report
+    assert report['cv_lowering'] == 'static_uniform_control_lanes_v1', report
+    assert json.loads(report['guard_json'])['cv_loop_fusion_rejection'] == 'CV_BATCH_QUOTIENT_GROUP_CROSSES_PERIOD'
+    assert str(module).count('tt.dot ') == factor and module.verify()
+
+
 @pytest.mark.parametrize('factor', [2, 4])
 @pytest.mark.parametrize('masked', [False, True])
 def test_loop_batch_preserves_independent_accumulators_and_transposed_load(tmp_path, factor, masked):

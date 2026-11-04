@@ -35,7 +35,7 @@ authorize a CV matrix transformation: those addresses are rejected for CV.
 
 ### Shared B: concatenate M; shared A: concatenate N
 
-For a single straight-line rank-two dot, the new `spatial_concat_v1` path proves
+For a single rank-two dot, the `spatial_concat_v1` path proves
 one canonical coordinate `pid(axis) * T + arange(0, T)`. All uses of that program
 ID must enter through this coordinate. It rewrites the coordinate to
 `group * (F*T) + arange(0, F*T)` and propagates the expanded tensor dimension
@@ -43,6 +43,13 @@ through addresses, loads, structured masks, transpose, dot and elementwise
 operations. `spatial_m_v1` requires only A's M axis to expand; `spatial_n_v1`
 requires only B's N axis. The shared operand and K extent/order are unchanged.
 The initial accumulator must be constant zero.
+
+The same spatial proof now applies inside supported uniform `scf.for` and
+`scf.if` regions. The loop's bounds and a branch's condition must be independent
+of the selected program axis. The expansion analysis reaches a fixed point for
+each loop's initial values, iter_args, yielded values and results, rather than
+resizing just the dot. Such rewrites are reported as
+`spatial_m_uniform_control_v1` or `spatial_n_uniform_control_v1`.
 
 The proof is ordinary block matrix multiplication:
 
@@ -73,9 +80,14 @@ matrix pairs into `[F,M,K] @ [F,K,N] -> [F,M,N]`. The added batch dimension neve
 becomes part of K, so each output lane depends only on its own input pair.
 `rank3_masked_batch_v1` retains rectangular, zero-padded load masks and the
 original output masks. It does not require every memory mask to be true.
+Inside supported uniform regions this is reported as
+`rank3_uniform_control_batch_v1`; each loop-carried accumulator has an
+independent batch dimension. Neither the original reduction order nor the
+number of iterations changes.
 
-This path first zero-initializes the complete load destination, then writes each
-lane's valid GM data directly into its destination subview. This avoids an
+For supported prefix-masked, partially structured loads, the memory converter
+zero-initializes the complete destination, then writes each lane's valid GM
+data directly into its destination subview. This avoids an
 intermediate L1-to-L1 copy, which the packaged backend cannot lower. Transposed
 operands are loaded as a contiguous batch and then transposed as a whole.
 
@@ -93,6 +105,26 @@ tile (quantum 8 for FP32, 16 for FP16/BF16). Empty or more distant tails select
 the full baseline before launch. This is a backend-layout restriction in addition
 to ordinary bounds and alias checks; arbitrary zero-padded K tails are not yet
 supported. Numerical validation is required for each admitted layout and dtype.
+
+For a directly decoded program ID `p = g*F + u`, `0 <= u < F`, a constant
+positive head period `H` divisible by `F` permits the compile-time identities
+`p // H = (g*F) // H` and `p % H = (g*F) % H + u`. The rewrite keeps division
+scalar and preserves unit stride across lanes. The existing full-group and
+signed-range proofs exclude overflow; no new runtime guard is required.
+This avoids discontinuous tensor div/rem address lowering and its per-lane
+assembly before batch MMA. If `F` does not divide `H`, the group may cross a
+period boundary: batch fusion reports `CV_BATCH_QUOTIENT_GROUP_CROSSES_PERIOD`
+and supported uniform regions retain the independent rank-two lane fallback.
+The original masks, coordinates and byte-domain proof are unchanged.
+
+The proof recognizes a block pointer's signed `x >= 0` predicate as `-1 < x`
+without changing the device mask. This normalization is restricted to a zero
+right operand. The lower bound must hold over the complete original domain,
+with checked integer arithmetic; it cannot trim a negative prefix to justify
+the padding proof. If one load supplies both dot operands, all reduction-axis
+obligations are combined in that load's original coordinates. Auxiliary
+rank-one accesses do not acquire an artificial rank-two reduction obligation,
+but still require their ordinary memory and mask proofs.
 If JIT specialization makes a prefix bound constant, a proven violation of these
 same limits is rejected before calling the backend. This prevents a statically
 ineligible `1x1x1` candidate from reaching unsupported ND2NZ lowering before its
@@ -102,6 +134,30 @@ this early check; their existing launch checks remain mandatory.
 Without the batch-matmul option, structured masked memory still uses
 `static_masked_lanes_v1`, cloning the rank-two body F times. That path must not be
 reported as a hardware batch-matmul optimization.
+
+### Uniform control flow and fallback
+
+The spatial and independent-batch proofs are attempted on a private copy of the
+normalized module. If fusion cannot be proved, the original program's complete
+regions can still be cloned per lane, reported as
+`static_uniform_control_lanes_v1`. `cv_loop_fusion_rejection` records why genuine
+fusion was rejected. This fallback retains each original two-dimensional dot;
+it must not be counted as M/N or hardware batch fusion.
+
+For canonical dot-accumulator and pointer recurrences, including supported
+uniform branches, the original `scf.for` already preserves the zero-trip initial
+result. An additional result-selecting `scf.if` is omitted for these recurrences
+to avoid an unnecessary cross-region accumulator transfer in the consumer.
+Invariant or unclassified yielded results keep the explicit zero-trip
+workaround. Zero-trip semantics are never removed, and VV's existing rule is
+unchanged.
+
+Induction gives the loop proof: if the accumulated state at iteration `t` is
+the concatenation (or independent stack) of the original states, the unchanged
+K-step dot produces that same relation at iteration `t+1`. The common loop
+bounds and branch condition preserve the sequence for every lane. The zero
+initial state establishes the base case; disjoint final stores establish the
+same observable outputs.
 
 ### Common limits
 
@@ -115,18 +171,30 @@ guarded CV grid transform. The launcher first maps the original grid to grouped
 programs, then caps physical blocks; the backend loop visits every grouped
 program at a stride of the physical core count. The original-grid hidden
 arguments remain unchanged. This combination is admitted only for MIX mode,
-`rank3_masked_batch_v1`, `spatial_m_v1` or `spatial_n_v1`, and an empty
-compiler-derived AutoBlockify blacklist.
+an empty compiler-derived AutoBlockify blacklist and no competing persistent
+cap. The shared allowlist includes `rank3_masked_batch_v1`, `spatial_m_v1`,
+`spatial_n_v1`, their uniform control-flow fusion counterparts, and
+`static_uniform_control_lanes_v1`.
 Other CV lowerings retain their prior AutoBlockify exclusion. Correctness and
 performance still require a device test with more grouped programs than physical
 blocks; enabling the flag on a smaller grid does not exercise the loop.
 
-Only straight-line normalized IR is accepted. A statically unrolled source loop
-can qualify if no control-flow region remains. Dynamic loops/conditionals,
-dot-scaled, pre-batched rank-three dot, atomics and cross-program synchronization
-remain rejected. VV memory-view folding is disabled for CV. CV owns logical
-grouping; AutoBlockify may schedule those grouped programs only in the admitted
-masked independent-batch and spatial paths above.
+Dynamic loops and conditions can qualify when uniform relative to the selected
+axis and accepted by the recurrence and memory analyses above. Varying control
+flow, dot-scaled, pre-batched rank-three dot, atomics and cross-program
+synchronization remain outside this CV path. Independent batch fusion still
+requires rectangular masks uniform along the selected axis and traceable
+dot-input coordinates. Multi-dot graphs or transformed inputs that cannot be
+traced may use the complete-lane fallback or reject. VV memory-view folding is
+disabled for CV. CV owns logical grouping; AutoBlockify schedules the grouped
+programs only in the admitted paths above.
+
+The byte-domain proof permits positive strided layouts with holes when their
+integer bounds, address ranges and exclusive writes are proved. A uniform CV
+loop bound may depend on other grid axes; a conservative whole-grid envelope
+covers those iterations. This can still reject a safe case when the envelope
+overlaps another range. It does not authorize dependence on the selected axis,
+negative strides, unchecked address overflow, or overlapping writes.
 
 ## Admission and failure
 
