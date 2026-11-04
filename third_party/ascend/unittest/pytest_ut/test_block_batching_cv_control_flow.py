@@ -147,7 +147,7 @@ def test_loop_dependent_pointer_increment_is_not_summarized(tmp_path):
     assert str(module) == before
 
 
-def test_uniform_control_requires_owned_contract_and_disables_unvalidated_auto_blockify():
+def test_uniform_control_auto_blockify_requires_owned_contract_and_launch_checks():
     from triton.backends.ascend import compiler
     from triton.backends.ascend.block_batching import BatchingRejected
     from triton.backends.ascend.block_batching_report import validate_compilation_result
@@ -165,9 +165,17 @@ def test_uniform_control_requires_owned_contract_and_disables_unvalidated_auto_b
     metadata["auto_blockify_enabled"] = False
     validate_compilation_result(metadata)
     metadata["auto_blockify_enabled"] = True
+    metadata['has_auto_blockify_blacklist_op'] = False
+    validate_compilation_result(metadata)
+    compiler._finalize_program_launch_policy(metadata, SimpleNamespace(is_pure_simt=False))
+    assert metadata["auto_blockify_enabled"] is True
+    metadata['has_auto_blockify_blacklist_op'] = True
     with pytest.raises(BatchingRejected, match="CV_AUTO_BLOCKIFY_NOT_PROVEN"):
         validate_compilation_result(metadata)
+    compiler._finalize_program_launch_policy(metadata, SimpleNamespace(is_pure_simt=False))
+    assert metadata["auto_blockify_enabled"] is False
     metadata['has_auto_blockify_blacklist_op'] = False
+    metadata['mix_mode'] = 'aic'
     compiler._finalize_program_launch_policy(metadata, SimpleNamespace(is_pure_simt=False))
     assert metadata["auto_blockify_enabled"] is False
 

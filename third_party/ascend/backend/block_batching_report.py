@@ -8,7 +8,15 @@ No custom AscendNPU-IR report or transitive SIMD proof is required.
 from .block_batching import BatchingRejected
 
 VALIDATION_POLICY = "ta_only_v1"
-CV_VALIDATION_POLICY = "ta_cv_uniform_control_v15"
+CV_VALIDATION_POLICY = "ta_cv_uniform_control_ab_v16"
+
+# Both launch-policy selection and final validation must use the same set.
+# These lowerings retain the hidden ORIGINAL grid while AutoBlockify iterates
+# over the transformed grid. Eligibility still requires MIX, no blacklist,
+# no persistent cap, and the owned v3 grid/effect contract below.
+CV_AUTO_BLOCKIFY_LOWERINGS = (
+    "rank3_masked_batch_v1", "spatial_m_v1", "spatial_n_v1", "static_uniform_control_lanes_v1",
+)
 
 
 def _validate_cv_contract(metadata):
@@ -61,7 +69,7 @@ def _validate_cv_contract(metadata):
     auto_blockify = metadata.get("auto_blockify_enabled")
     if auto_blockify is not False and auto_blockify is not True:
         raise BatchingRejected("CV_MAPPING_CONFLICT")
-    if auto_blockify and (report.get("cv_lowering") not in ("rank3_masked_batch_v1", "spatial_m_v1", "spatial_n_v1")
+    if auto_blockify and (report.get("cv_lowering") not in CV_AUTO_BLOCKIFY_LOWERINGS
                           or metadata.get("mix_mode") != "mix"
                           or metadata.get("has_auto_blockify_blacklist_op") is not False):
         raise BatchingRejected("CV_AUTO_BLOCKIFY_NOT_PROVEN")

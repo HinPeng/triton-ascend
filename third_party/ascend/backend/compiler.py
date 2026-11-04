@@ -72,7 +72,9 @@ from triton.backends.ascend.utils import (
 from triton.backends.ascend.driver import (NPUUtils)
 from triton.backends.ascend.compiler_capabilities import optimized_metaop_options
 from triton.backends.ascend.block_batching import BatchRequest, analyze_request, BatchingRejected, IMPLEMENTATION_VERSION
-from triton.backends.ascend.block_batching_report import VALIDATION_POLICY, validate_compilation_result
+from triton.backends.ascend.block_batching_report import (
+    VALIDATION_POLICY, CV_AUTO_BLOCKIFY_LOWERINGS, validate_compilation_result,
+)
 from triton.backends.ascend.program_grid import (
     DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK,
     PROGRAM_GRID_TRANSFORMS_ATTR,
@@ -246,10 +248,10 @@ def _finalize_program_launch_policy(metadata, opt):
                                  and not ptsm_cap_authorized)
     cv_report = metadata.get("block_batching", {})
     if cv_report.get("cv_mode") in ("independent_batch_v1", "spatial_concat_v1"):
-        # Masked batches and shared-operand spatial concatenation retain the
-        # original-grid ABI while AutoBlockify loops over grouped programs.
+        # The admitted CV lowerings retain the original-grid ABI while
+        # AutoBlockify loops over grouped programs, including uniform regions.
         auto_blockify_enabled &= (cv_report.get("cv_lowering")
-                                  in ("rank3_masked_batch_v1", "spatial_m_v1", "spatial_n_v1")
+                                  in CV_AUTO_BLOCKIFY_LOWERINGS
                                   and metadata["mix_mode"] == "mix")
 
     if auto_blockify_enabled and ptsm_cap_authorized:

@@ -43,19 +43,25 @@ class ByteDomain:
             identity = integer(loop["id"])
             if identity < 0 or identity in self.loop_axes:
                 raise GuardFailure("INVALID_LOOP_DOMAIN")
-            domain = ByteDomain(arguments, grid, {"shape": []})
+            # Bounds may mention a quotient/remainder of an unmerged program
+            # axis. Register its split BEFORE evaluating those expressions.
+            # No nested IV is invented: unsupported outer captures still fail.
+            domain = ByteDomain(arguments, grid, {
+                "shape": [], "pointer_checks": [loop[name] for name in ("lower", "upper", "step")],
+            })
             # A program-axis loop starts at pid*R by definition, so its lower
-            # bound is not a scalar. Upper and step must still be uniform.
+            # bound is not a scalar. The VV absorbed-axis rule below still
+            # requires a uniform upper bound; ordinary CV loops may instead
+            # use an affine upper envelope over all original programs.
             lower = domain.expression(loop["lower"])
-            bounds = []
-            for field in ("upper", "step"):
-                value = domain.expression(loop[field])
-                if not value.uniform:
-                    raise GuardFailure("NON_UNIFORM_LOOP_DOMAIN")
-                bounds.append(value.offset)
+            upper_expr = domain.expression(loop["upper"])
+            step_expr = domain.expression(loop["step"])
+            if not step_expr.uniform:
+                raise GuardFailure("NON_UNIFORM_LOOP_DOMAIN")
             for value, bits in domain.checks:
                 checked(*domain.bounds(value, domain.full), bits)
-            upper, step = bounds
+            upper_lo, upper = domain.bounds(upper_expr, domain.full)
+            step = step_expr.offset
             bits = self.bits(loop["bits"])
             if step <= 0:
                 raise GuardFailure("UNPROVEN_POSITIVE_LOOP_STEP")
@@ -69,10 +75,15 @@ class ByteDomain:
                 # push the proved address range a whole step past the buffer.
                 axes = [a for a, c in enumerate(lower.coefficients) if c]
                 rows = lower.coefficients[axes[0]] if len(axes) == 1 else 0
-                if rows <= 0 or axes[0] >= 3 or step != grid[axes[0]] * rows:
+                if (not upper_expr.uniform or rows <= 0 or axes[0] >= 3
+                        or step != grid[axes[0]] * rows):
                     raise GuardFailure("NON_UNIFORM_LOOP_DOMAIN")
                 stride, absorbed = rows, axes[0]
-            checked(min(lower.offset, upper), max(lower.offset, upper), bits)
+            checked(min(lower.offset, upper_lo), max(lower.offset, upper), bits)
+            # With an affine upper bound this box is a SUPERSET of every
+            # actual (program, iv) pair. Do not use it to erase masks or infer
+            # independence. The byte interval, write injection and alias
+            # checks below must all succeed on the larger box.
             count = max(0, (upper - lower.offset + stride - 1) // stride)
             # Keep the original induction increment representable as well.
             checked(lower.offset, lower.offset + count * stride, bits)
@@ -107,7 +118,8 @@ class ByteDomain:
                 if isinstance(operand, list):
                     collect(operand)
 
-        for node in (access.get("offset"), access.get("mask"), *access.get("pointer_checks", ())):
+        loop_bounds = [loop[name] for loop in loops for name in ("lower", "upper", "step")]
+        for node in (access.get("offset"), access.get("mask"), *access.get("pointer_checks", ()), *loop_bounds):
             collect(node)
         full = [*grid, *self.shape, *counts]
         for axis, divisor in sorted(splits.items()):
@@ -375,9 +387,12 @@ class ByteDomain:
         for step in steps:
             lo, hi = self.bounds(step, self.full)
             checked(pointer + lo, pointer + hi, 64, unsigned=True)
-        local_strides = address.coefficients[3:3 + len(self.shape)]
-        if any(local_strides) and width not in local_strides:
-            raise GuardFailure("NON_UNIT_COLUMN_STRIDE")
+        # Unit column stride is a layout preference, not a requirement of a
+        # byte-domain proof. Positive strided/gapped accesses are enclosed by
+        # the same interval below. For writes/volatile reads the sorted-stride
+        # test proves disjoint element-byte sets (stride > prior span); gaps
+        # stay in the conservative alias interval. Retain all integer/pointer
+        # overflow, negative-stride and cross-access alias checks.
         counts = list(self.full)
         # An absorbed program axis has been folded into its loop's single
         # stride. Using it again in the same address would mean the address
