@@ -1,6 +1,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """Integer dot preserves K, exact i32 accumulation and per-lane byte unpacking."""
 import re
+import json
 
 import pytest
 from triton._C.libtriton import ascend
@@ -85,3 +86,47 @@ def test_integer_cv_does_not_bypass_overflow_attributes(tmp_path):
     report = ascend.passes.ttir.rewrite_block_batching(module, 2, 0, 'auto', True, True)
     assert report['reason'] == 'UNSUPPORTED_OPERATION_ATTRIBUTE', report
     assert str(module) == before
+
+
+@pytest.mark.parametrize('factor', [2, 4])
+@pytest.mark.parametrize('batch_matmul', [False, True])
+def test_integer_independent_pairs_retain_rank_two_dots(tmp_path, factor, batch_matmul):
+    text = integer_module().replace(
+        '%boff = arith.addi %boff1, %boff2 : tensor<4x4xi32>', '''
+    %lane_offset = tt.splat %base : i32 -> tensor<4x4xi32>
+    %boff_local = arith.addi %boff1, %boff2 : tensor<4x4xi32>
+    %boff = arith.addi %boff_local, %lane_offset : tensor<4x4xi32>''')
+    module = parse(tmp_path, text)
+    report = ascend.passes.ttir.rewrite_block_batching(module, factor, 0, 'auto', True, batch_matmul)
+    assert report['compile_status'] == 'REWRITTEN', report
+    assert report['cv_lowering'] == 'static_integer_lanes_v1', report
+    dots = [line for line in str(module).splitlines() if 'tt.dot ' in line]
+    assert len(dots) == factor
+    assert all('tensor<4x4xi8> * tensor<4x4xi8> -> tensor<4x4xi32>' in line for line in dots)
+    assert json.loads(report['guard_json'])['cv_integer_contract']['dot_rank'] == 2
+    assert module.verify()
+
+
+@pytest.mark.parametrize('proof', [None, {}, dict(version=True, input_bits=8, accumulator_bits=32,
+                                                lane_semantics='original_program_clone', dot_rank=2)])
+def test_integer_lane_report_requires_owned_contract(proof):
+    from test_block_batching_guard import cv_metadata
+    from triton.backends.ascend.block_batching_report import validate_compilation_result
+    from triton.backends.ascend.block_batching import BatchingRejected
+    metadata = cv_metadata()
+    metadata['block_batching']['cv_lowering'] = 'static_integer_lanes_v1'
+    metadata['block_batching']['guard'] = dict(cv_integer_contract=proof)
+    with pytest.raises(BatchingRejected, match='CV_INTEGER_LANE_CONTRACT_MISSING'):
+        validate_compilation_result(metadata)
+
+
+def test_integer_lane_contract_allows_owned_auto_blockify_grid():
+    from test_block_batching_guard import cv_metadata
+    from triton.backends.ascend.block_batching_report import validate_compilation_result
+    metadata = cv_metadata()
+    metadata['block_batching'].update(cv_lowering='static_integer_lanes_v1', guard=dict(
+        cv_integer_contract=dict(version=1, input_bits=8, accumulator_bits=32,
+                                 lane_semantics='original_program_clone', dot_rank=2)))
+    metadata.update(auto_blockify_enabled=True, has_auto_blockify_blacklist_op=False)
+    validate_compilation_result(metadata)
+    assert metadata['block_batching']['compile_status'] == 'COMPILED_GUARDED'

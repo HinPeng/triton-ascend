@@ -935,10 +935,13 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
         return reject("CV_DEVICE_ADDRESS_NOT_PROVEN");
       }
   bool sharedCV = false;
+  bool integerCV = false;
   if (request.cv) {
     report.cvMode = "independent_batch_v1";
     for (Operation *op : validated) {
       if (auto dot = dyn_cast<triton::DotOp>(op)) {
+        integerCV |= cast<RankedTensorType>(dot.getA().getType())
+                         .getElementType().isSignlessInteger(8);
         // Shared operands use a rank-two spatial concatenation proof, never
         // the unvalidated shared-operand rank-three broadcast lowering.
         sharedCV |=
@@ -1103,6 +1106,32 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       report.selectedAxis = axis;
       report.laneWidth = request.factor;
       report.layoutJSON = serializeBatchLayouts({});
+      report.status = "REWRITTEN";
+      report.reason = "";
+      return report;
+    }
+    // The stock consumer has no linked int8->int32 batch-MMA implementation.
+    // Retain rank-two integer dots instead of generating a known unlowerable
+    // rank-three call. Spatial M/N above still performs a single wider dot.
+    if (integerCV) {
+      if (cvControlFlow)
+        return reject("CV_INTEGER_BATCH_MATMUL_UNAVAILABLE");
+      if (validated.size() > 8192 / request.factor)
+        return reject("CV_STATIC_LANE_CODE_SIZE_EXCEEDED");
+      auto guard = llvm::json::parse(report.guardJSON);
+      if (!guard || !guard->getAsObject())
+        return failure();
+      (*guard->getAsObject())["cv_integer_contract"] = llvm::json::Object{
+          {"version", 1}, {"input_bits", 8}, {"accumulator_bits", 32},
+          {"lane_semantics", "original_program_clone"}, {"dot_rank", 2}};
+      report.guardJSON = llvm::formatv("{0}", *guard).str();
+      report.cvLowering = "static_integer_lanes_v1";
+      report.selectedAxis = axis;
+      report.laneWidth = request.factor;
+      report.layoutJSON = serializeBatchLayouts({});
+      if (failed(rewriteStructuredCV(module, function, originals, axis,
+                                    request.factor)))
+        return failure();
       report.status = "REWRITTEN";
       report.reason = "";
       return report;

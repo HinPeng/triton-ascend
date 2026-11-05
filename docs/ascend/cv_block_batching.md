@@ -25,13 +25,41 @@ it is not a new automatic selection mechanism.
 
 The compiler chooses a lowering from IR dependence on the requested axis;
 there are no Liger names, shape tables or host-side tile overrides in the pass.
-Floating inputs may be FP16, BF16 or FP32 with FP32 accumulation. Device validation
+Floating inputs may be FP16, BF16 or FP32 with FP32 accumulation. Signed INT8
+inputs with INT32 accumulation are also admitted. Integer M/N concatenation
+retains the original K extent/order, bit widths and accumulation operations;
+it neither converts the dot to floating point nor combines reductions across
+programs. Device validation
 must be reported separately for the actual precision/shape tested. The original
 memory-domain, integer-overflow, alias and exclusive-store guards remain required.
 CV uses the same v3 source/plan fingerprint as VV. The independent masked-batch
 path additionally checks its original-coordinate padding and reduction
 obligations. VV's terminal-read relaxation for opaque device addresses does not
 authorize a CV matrix transformation: those addresses are rejected for CV.
+
+### Integer scope
+
+In CV mode, byte-valued loop state and lane-wise integer add/subtract/multiply,
+bitwise and/or/xor, signed/unsigned extension and truncation retain their
+original semantics. Existing uniform-control, pointer-provenance, bounds,
+alias and attribute checks remain required. Overflow promises (`nsw`/`nuw`),
+general byte division/reductions, byte scalar host ABI and FP/integer byte
+conversions are not enabled by this change. VV byte admission is unchanged.
+
+The current official consumer cannot link
+`_mlir_ciface_batch_mma_tile_int8_t_to_int32_t`. Independent integer matrix
+pairs therefore use `static_integer_lanes_v1`: F independent rank-two dots
+inside one grouped program, with the original masks and accumulators.
+This is program grouping, not a single batch MMA or an M/N concatenation.
+Uniform loops retain `static_uniform_control_lanes_v1` with
+`CV_INTEGER_BATCH_MATMUL_UNAVAILABLE` as the fusion reason. The new static
+integer report carries an owned rank/type contract and shares the verified
+original-grid AutoBlockify policy. Shared-operand integer M/N paths still
+produce one wider rank-two dot.
+
+Supporting INT8 types does not establish new proofs for dynamic grouped-pid
+division/remainder or nested pointer recurrences. Such kernels retain their
+complete baseline when the existing address analysis cannot prove them.
 
 ### Shared B: concatenate M; shared A: concatenate N
 

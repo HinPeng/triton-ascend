@@ -8,7 +8,7 @@ No custom AscendNPU-IR report or transitive SIMD proof is required.
 from .block_batching import BatchingRejected
 
 VALIDATION_POLICY = "ta_only_v1"
-CV_VALIDATION_POLICY = "ta_cv_uniform_fusion_affine_recurrence_v22"
+CV_VALIDATION_POLICY = "ta_cv_integer_rank_two_v23"
 
 CV_MASKED_BATCH_LOWERINGS = ("rank3_masked_batch_v1", "rank3_uniform_control_batch_v1")
 CV_SPATIAL_LOWERINGS = (
@@ -20,7 +20,7 @@ CV_SPATIAL_LOWERINGS = (
 # over the transformed grid. Eligibility still requires MIX, no blacklist,
 # no persistent cap, and the owned v3 grid/effect contract below.
 CV_AUTO_BLOCKIFY_LOWERINGS = (
-    *CV_MASKED_BATCH_LOWERINGS, *CV_SPATIAL_LOWERINGS, "static_uniform_control_lanes_v1",
+    *CV_MASKED_BATCH_LOWERINGS, *CV_SPATIAL_LOWERINGS, "static_uniform_control_lanes_v1", "static_integer_lanes_v1",
 )
 
 
@@ -30,12 +30,19 @@ def _validate_cv_contract(metadata):
     full_tile_lowerings = ("rank3_full_tile_batch_v1", "rank3_full_tile_batch_v2")
     lowerings = {
         "independent_batch_v1":
-        ("rank3_batch_v1", "static_masked_lanes_v1", "static_uniform_control_lanes_v1",
+        ("rank3_batch_v1", "static_masked_lanes_v1", "static_uniform_control_lanes_v1", "static_integer_lanes_v1",
          *CV_MASKED_BATCH_LOWERINGS, *full_tile_lowerings),
         "spatial_concat_v1": CV_SPATIAL_LOWERINGS,
     }
     if report.get("cv_lowering") not in lowerings.get(report.get("cv_mode"), ()):
         raise BatchingRejected("CV_LOWERING_CONTRACT_MISSING")
+    if report.get("cv_lowering") == "static_integer_lanes_v1":
+        expected = dict(version=1, input_bits=8, accumulator_bits=32,
+                        lane_semantics="original_program_clone", dot_rank=2)
+        proof = report.get("guard", {}).get("cv_integer_contract")
+        if type(proof) is not dict or proof != expected or any(type(proof.get(k)) is not int for k in
+                ('version', 'input_bits', 'accumulator_bits', 'dot_rank')):
+            raise BatchingRejected("CV_INTEGER_LANE_CONTRACT_MISSING")
     uniform_contracts = {
         "static_uniform_control_lanes_v1": ("original_program_clone", 2),
         "spatial_m_uniform_control_v1": ("spatial_concatenation", 2),
