@@ -4,7 +4,7 @@
 
 ### I. Principles for Automatically Combining Grid Cores
 
-Some scenarios requiring migration of Triton operators from GPUs to NPUs. Due to architectural differences, the Triton operators developed on GPUs often utilize large grid core counts. When executed on NPUs, these operators cannot be scheduled all at once. Delivering them in batches introduces significant latency and degrades performance. To optimize NPU-based Triton operators, you need to check the grid core counts first. In cases with large grid core counts, set the environment variable *TRITON_ALL_BLOCKS_PARALLEL* to improve operator execution performance.
+Some scenarios require migrating Triton operators from GPUs to NPUs. Due to architectural differences, Triton operators developed on GPUs often use large logical grids that cannot be scheduled on NPUs all at once. The Ascend backend automatically maps eligible independent logical programs onto the available physical cores and skips unsupported kernels according to IR safety analysis. During performance tuning, check the grid size and compiler warnings first; if automatic mapping is skipped, reduce the logical grid through explicit tiling or inner loops.
 
 ## Optimizing Instruction Parallelism
 
@@ -18,120 +18,86 @@ When executing Triton operators, NPUs leverage parallel mechanisms such as multi
 
 ### II. Code Examples
 
-- Example 1: Reducing synchronization for higher DOP
+  - Example 1: Using `for` loops in Triton operators to increase tiling and enhance DOP
 
-    In operator optimization, increasing instruction-level parallelism (DOP) is a critical strategy. In the `tl.load` statement below, when `N` > `M`, the loaded data fills only a portion of the tensor memory space pointed to by `data`. For the remaining unfilled portion, if users do not specify the `other` value, GPUs default to zero-padding. To reduce the adaptation workload of migration, NPUs maintain the same behavior as GPUs. NPUs first use the vector core to set all the memory space pointed to by `data` to a specified value (defaulting to `0` if no `other` value is provided). Subsequently, the MTE2 instruction transfers data to part of the memory space pointed to by `data`. This implementation results in a dependency between MTE2 and vector operations, which limits parallelism and degrades overall performance.
+      In Triton operator programming, `mask` operations are frequently employed in syntax such as `load`, `store`, and `where`. During performance optimization, you should prioritize identifying performance degradation caused by these operations. When the logic within Triton operators executes sequentially in a single pass (Start -> Data-in -> Computation -> Data-out -> End), instructions cannot be parallelized, resulting in low execution efficiency. By introducing `for` loops to increase tiling, you can process data in multiple passes (with each pass handling a reduced data volume), enabling parallel execution of data-in, computation, and data-out. This approach reduces serial waiting time and improves overall performance. Additionally, compared to monolithic (non-tiled) data processing, the use of `for` loops for tiling reduces UB space consumption.
+      Note: Mathematical equivalence is an important aspect to consider when you increase data tiling.
 
-    ```diff
-    @triton.jit
-    def npu_vector_add_kernel(
-        input,                          # [Tensor] input tensor (1 x col)
-        output,                         # [Tensor] output tensor (1 x col)
-        M: tl.constexpr,                # len of the vector
-        BLOCK_SIZE: tl.constexpr
-    ):
-        N :tl.constexpr = BLOCK_SIZE
-        idx = tl.arange(0, N)
-        mask = idx < M
-        data = tl.load(input + idx, mask = mask) # Alternatively, specify a value such as other=-1.
-    ```
+      ```diff
+      @triton.jit
+      def alloc_extend_kernel(
+              pre_lens_ptr,
+              seq_lens_ptr,
+              free_page_ptr,
+              out_indices,
+              bs_upper: tl.constexpr,
+              page_size: tl.constexpr,
+              max_num_extend_tokens: tl.constexpr,
+              BLOCK_SIZE: tl.constexpr = 1024,  # Add Param BLOCK_SIZE
+      ):
+          pid = tl.program_id(0)
 
-    To increase DOP and enhance performance, when the loaded data fills only a portion of the memory space pointed to by `data`, add `care_padding=False` to the load statement to remove default-value padding, provided that the unfilled portion does not affect subsequent computation results. That is, the preceding operator can be optimized follows:
+          load_offset = tl.arange(0, bs_upper)
+          seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
+          pre_lens = tl.load(pre_lens_ptr + load_offset, mask=load_offset <= pid)
+          extend_lens = seq_lens - pre_lens
 
-    ```diff
-    @triton.jit
-    def npu_vector_add_kernel(
-        input,                          # [Tensor] input tensor (1 x col)
-        output,                         # [Tensor] output tensor (1 x col)
-        M: tl.constexpr,                # len of the vector
-        BLOCK_SIZE: tl.constexpr
-    ):
-        idx = tl.arange(0, N)
-        mask = idx < M
-    -   data = tl.load(input + idx, mask = mask) # Alternatively, specify a value such as other=-1.
-    +   data = tl.load(input + idx, mask = mask, care_padding=False) # Alternatively, specify a value such as other=-1.
-    ```
+          seq_len = tl.load(seq_lens_ptr + pid)
+          pre_len = tl.load(pre_lens_ptr + pid)
+          extend_len = seq_len - pre_len
 
-- Example 2: Using `for` loops in Triton operators to increase tiling and enhance DOP
+          sum_extend_lens = tl.sum(extend_lens)
+          output_start_loc = sum_extend_lens - extend_len
 
-    In Triton operator programming, `mask` operations are frequently employed in syntax such as `load`, `store`, and `where`. During performance optimization, you should prioritize identifying performance degradation caused by these operations. When the logic within Triton operators executes sequentially in a single pass (Start -> Data-in -> Computation -> Data-out -> End), instructions cannot be parallelized, resulting in low execution efficiency. By introducing `for` loops to increase tiling, you can process data in multiple passes (with each pass handling a reduced data volume), enabling parallel execution of data-in, computation, and data-out. This approach reduces serial waiting time and improves overall performance. Additionally, compared to monolithic (non-tiled) data processing, the use of `for` loops for tiling reduces UB space consumption.
-    Note: Mathematical equivalence is an important aspect to consider when you increase data tiling.
+          num_pages_after = (seq_lens + page_size - 1) // page_size
+          num_pages_before = (pre_lens + page_size - 1) // page_size
+          num_new_pages = num_pages_after - num_pages_before
 
-    ```diff
-    @triton.jit
-    def alloc_extend_kernel(
-            pre_lens_ptr,
-            seq_lens_ptr,
-            free_page_ptr,
-            out_indices,
-            bs_upper: tl.constexpr,
-            page_size: tl.constexpr,
-            max_num_extend_tokens: tl.constexpr,
-    +       BLOCK_SIZE: tl.constexpr = 1024,
-    ):
-        pid = tl.program_id(0)
+          num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
+                  pre_len + page_size - 1
+          ) // page_size
+          sum_num_new_pages = tl.sum(num_new_pages)
+          new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
 
-        load_offset = tl.arange(0, bs_upper)
-        seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
-        pre_lens = tl.load(pre_lens_ptr + load_offset, mask=load_offset <= pid)
-        extend_lens = seq_lens - pre_lens
+          # Part 2: fill the new full pages
+          num_part2 = (
+                  seq_len // page_size * page_size
+                  - (pre_len + page_size - 1) // page_size * page_size
+          )
 
-        seq_len = tl.load(seq_lens_ptr + pid)
-        pre_len = tl.load(pre_lens_ptr + pid)
-        extend_len = seq_len - pre_len
+          #   load data at once
+          #   offset_many_page = tl.arange(0, max_num_extend_tokens)
+          #   page_start = tl.load(
+          #       free_page_ptr + new_page_start_loc + offset_many_page // page_size,
+          #       mask=offset_many_page < num_part2,
+          #   )
+          #   tl.store(
+          #       out_indices + output_start_loc + offset_many_page,
+          #       page_start * page_size + offset_many_page % page_size,
+          #       mask=offset_many_page < num_part2,
+          #   )
 
-        sum_extend_lens = tl.sum(extend_lens)
-        output_start_loc = sum_extend_lens - extend_len
-
-        num_pages_after = (seq_lens + page_size - 1) // page_size
-        num_pages_before = (pre_lens + page_size - 1) // page_size
-        num_new_pages = num_pages_after - num_pages_before
-
-        num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
-                pre_len + page_size - 1
-        ) // page_size
-        sum_num_new_pages = tl.sum(num_new_pages)
-        new_page_start_loc = sum_num_new_pages - num_page_start_loc_self
-
-        # Part 2: fill the new full pages
-        num_part2 = (
-                seq_len // page_size * page_size
-                - (pre_len + page_size - 1) // page_size * page_size
-        )
-
-    -   # load data at once
-    -   offset_many_page = tl.arange(0, max_num_extend_tokens)
-    -   page_start = tl.load(
-    -       free_page_ptr + new_page_start_loc + offset_many_page // page_size,
-    -       mask=offset_many_page < num_part2,
-    -   )
-    -   tl.store(
-    -       out_indices + output_start_loc + offset_many_page,
-    -       page_start * page_size + offset_many_page % page_size,
-    -       mask=offset_many_page < num_part2,
-    -   )
-
-    +   # load data using loop
-    +   num_loop = tl.cdiv(max_num_extend_tokens, BLOCK_SIZE)
-    +   blk_offset = tl.arange(0, BLOCK_SIZE)
-    +   for i in range(num_loop):
-    +       offset_many_page = blk_offset + i * BLOCK_SIZE
-    +       page_start = tl.load(
-    +           free_page_ptr + new_page_start_loc + offset_many_page // page_size,
-    +           mask=offset_many_page < num_part2,
-    +       )
-    +       tl.store(
-    +           out_indices + output_start_loc + offset_many_page,
-    +           page_start * page_size + offset_many_page % page_size,
-    +           mask=offset_many_page < num_part2,
-    +       )
-    ```
+          # load data using loop
+          num_loop = tl.cdiv(max_num_extend_tokens, BLOCK_SIZE)
+          blk_offset = tl.arange(0, BLOCK_SIZE)
+          for i in range(num_loop):
+              offset_many_page = blk_offset + i * BLOCK_SIZE
+              page_start = tl.load(
+                  free_page_ptr + new_page_start_loc + offset_many_page // page_size,
+                  mask=offset_many_page < num_part2,
+              )
+              tl.store(
+                  out_indices + output_start_loc + offset_many_page,
+                  page_start * page_size + offset_many_page % page_size,
+                  mask=offset_many_page < num_part2,
+              )
+      ```
 
 ## Optimizing Data Types
 
 ### I. Core Principles of Data Type Optimization
 
-Some operations of the A2/A3 vector units do not support certain data types. In this case, the corresponding vector operations will degrade to scalar operations, affecting performance. If the overall operator accuracy is not affected, it is advisable to use supported data types to improve performance.
+Some operations of the Atlas A2 products/Atlas A3 products vector units do not support certain data types. In this case, the corresponding vector operations will degrade to scalar operations, affecting performance. If the overall operator accuracy is not affected, it is advisable to use supported data types to improve performance.
 The following operations are involved.
 
 |  **Operator Name** |  **Unsupported Data Type** |
@@ -200,9 +166,9 @@ The following operations are involved.
         mean = tl.sum(x, axis=0) / N
         tl.store(Mean + row, mean)
         # [Changed begin]
-    -   xbar = tl.where(cols < N, X - mean, 0.0)
-    +   cols_cmp = cols.to(tl.float32)
-    +   xbar = tl.where(cols_cmp < N, x - mean, 0.0)
+        # xbar = tl.where(cols < N, X - mean, 0.0)
+        cols_cmp = cols.to(tl.float32)
+        xbar = tl.where(cols_cmp < N, x - mean, 0.0)
         # [Changed end]
 
         var = tl.sum(xbar * xbar, axis=0) / N

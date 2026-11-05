@@ -518,6 +518,28 @@ BlockDataParser::getScalarMemRef(Value ptr, Value memref, const Location &loc,
     return (*castOp).getResult();
   }
 
+  // A scalar pointer produced directly by a distributed custom op (e.g.
+  // distributed.consume_token) is lowered to a memref carrier in the
+  // custom-op conversion. Consume that carrier directly so a following
+  // tt.load/tt.store does not force a live memref-to-pointer cast.
+  if (auto definingOp = ptr.getDefiningOp();
+      definingOp && isDistributedTypeCustomOp(definingOp)) {
+    if (!isa<BaseMemRefType>(memref.getType()))
+      return failure();
+    if (auto memrefType = dyn_cast<MemRefType>(memref.getType());
+        memrefType && memrefType.getRank() == 1)
+      return memref;
+    BlockData data;
+    data.setSource(memref);
+    data.getOffsetsRef().push_back(rewriter.getIndexAttr(0));
+    data.getSizesRef().push_back(rewriter.getIndexAttr(1));
+    data.getStridesRef().push_back(rewriter.getIndexAttr(1));
+    auto castOp = data.createCastOp(SmallVector<int64_t>(1, 1), loc, rewriter);
+    if (failed(castOp))
+      return failure();
+    return (*castOp).getResult();
+  }
+
   if (!isa<BlockArgument>(ptr) || !isa<BaseMemRefType>(memref.getType()))
     return failure();
 
@@ -3228,7 +3250,7 @@ LogicalResult BlockDataParser::rewriteAddPtrToUnstrucMemAcc(
       rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
   auto addptrRes = op.getResult();
   assert(addptrRes.hasOneUse() && "Invalid: tt.addptr has multiple users");
-  auto loadOp = *(addptrRes.user_begin());
+  auto memoryOp = *(addptrRes.user_begin());
 
   // Prepare empty tensor for loop based scalar load
   // FIXME: We use cast here because addptr must return tensor<?x!tt.ptr<f32>>.
@@ -3254,7 +3276,11 @@ LogicalResult BlockDataParser::rewriteAddPtrToUnstrucMemAcc(
   }
   SmallVector<Value> ivs;
   bool castFailed = false;
-  OpBuilder builder(op);
+  // Keep the access after its operand definitions and preceding memory effects.
+  OpBuilder builder(memoryOp->getContext());
+  // The body builder moves memoryOp before the outer loop is inserted, so use
+  // the following operation as the insertion point.
+  builder.setInsertionPointAfter(memoryOp);
   auto loop = createNestedLoops(
       builder, loc, 0, blockSizes.size(), forLBs, forUBs, forSteps, ivs,
       initArgs,
@@ -3289,9 +3315,9 @@ LogicalResult BlockDataParser::rewriteAddPtrToUnstrucMemAcc(
           return;
         }
         rewriter.replaceOp(op, (*castOp).getResult());
-        // Move tt.load using this tt.addptr into this block
-        loadOp->moveAfter((*castOp).getOperation());
-        loadOp->setAttr("IndirectLoad", UnitAttr::get(op.getContext()));
+        // Move the load or store using this tt.addptr into the scalar loop.
+        memoryOp->moveAfter((*castOp).getOperation());
+        memoryOp->setAttr("IndirectLoad", UnitAttr::get(op.getContext()));
         bB.create<scf::YieldOp>(bLoc, iterArgs);
       });
   if (castFailed)

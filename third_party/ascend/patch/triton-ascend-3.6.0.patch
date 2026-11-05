@@ -735,7 +735,7 @@ index d4872a4..e9c8909 100644
  
      use_ir_loc = knobs.compilation.use_ir_loc
      if ir_source and use_ir_loc:
-@@ -321,7 +363,29 @@ def compile(src, target=None, options=None, _env_vars=None):
+@@ -321,7 +363,25 @@ def compile(src, target=None, options=None, _env_vars=None):
      if compilation_listener:
          timer.finished_ir_initialization()
      for ext, compile_ir in list(stages.items())[first_stage:]:
@@ -747,10 +747,6 @@ index d4872a4..e9c8909 100644
 +                stage_name = "ConvertTritonIRToLinalgIR"
 +            elif (ext == "npubin"):
 +                stage_name = "ConvertLinalgIRToBinary"
-+            elif (ext == "bcmlir"):
-+                stage_name = "BytecodeToLinalgIRByBishengirOpt"
-+            elif (ext == "mlirbc"):
-+                stage_name = "LinalgIRToBytecodeByTritonMLIROpt"
 +            else:
 +                stage_name = "MLIRCompile"
 +            if hasattr(e, 'stderr') and e.stderr:
@@ -766,7 +762,7 @@ index d4872a4..e9c8909 100644
          ir_filename = f"{file_name}.{ext}"
          if fn_override_manager is None:
              # Users can override kernels at scale by setting `ir_override` in autotune config
-@@ -331,9 +395,9 @@ def compile(src, target=None, options=None, _env_vars=None):
+@@ -331,9 +391,9 @@ def compile(src, target=None, options=None, _env_vars=None):
          elif full_name := fn_override_manager.get_file(ir_filename):
              print(f"\nOverriding kernel with file {full_name}")
              next_module = parse(full_name, ext, context)
@@ -779,7 +775,7 @@ index d4872a4..e9c8909 100644
          if fn_dump_manager is not None:
              fn_dump_manager.put(next_module, ir_filename)
              if ext == "cubin":
-@@ -341,21 +405,21 @@ def compile(src, target=None, options=None, _env_vars=None):
+@@ -341,21 +401,21 @@ def compile(src, target=None, options=None, _env_vars=None):
                  fn_dump_manager.put(sass, file_name + ".sass")
          # use an env variable to parse ir from file
          if use_ir_loc == ext:
@@ -805,7 +801,7 @@ index d4872a4..e9c8909 100644
      # return handle to compiled kernel
      return CompiledKernel(src, metadata_group, hash)
  
-@@ -402,7 +466,9 @@ def _raise_error(err, *args, **kwargs):
+@@ -402,7 +462,9 @@ def _raise_error(err, *args, **kwargs):
  
  
  class CompiledKernel:
@@ -816,7 +812,7 @@ index d4872a4..e9c8909 100644
      def __init__(self, src, metadata_group, hash):
          from collections import namedtuple
          metadata_path = next((Path(p) for c, p in metadata_group.items() if c.endswith(".json")))
-@@ -420,8 +486,10 @@ class CompiledKernel:
+@@ -420,8 +482,10 @@ class CompiledKernel:
          # stores the text of each level of IR that was generated during compilation
          asm_files = [Path(p) for c, p in metadata_group.items() if not c.endswith(".json")]
          binary_ext = backend.binary_ext
@@ -828,7 +824,7 @@ index d4872a4..e9c8909 100644
              for file in asm_files
          })
          self.metadata_group = metadata_group
-@@ -432,8 +500,33 @@ class CompiledKernel:
+@@ -432,8 +496,33 @@ class CompiledKernel:
          self.module = None
          self.function = None
          self._run = None
@@ -862,7 +858,7 @@ index d4872a4..e9c8909 100644
          if self.module is not None:
              return
  
-@@ -459,20 +552,19 @@ class CompiledKernel:
+@@ -459,20 +548,19 @@ class CompiledKernel:
              max_tmem_size = 512  # tmem size in number of columns
              if self.metadata.tmem_size > max_tmem_size:
                  raise_(OutOfResources(self.metadata.tmem_size, max_tmem_size, "tensor memory"))
@@ -917,19 +913,6 @@ index 39e6c4dfb..c72ca65c2 100644
 +
 +    def format_line_delim(self, keyword):
 +        return f"///------------------{keyword}------------------\n"
-diff --git a/python/triton/extension/buffer/src/buffer_ir.cc b/python/triton/extension/buffer/src/buffer_ir.cc
-index 9ff1e4df9..7e2a4cdff 100644
---- a/python/triton/extension/buffer/src/buffer_ir.cc
-+++ b/python/triton/extension/buffer/src/buffer_ir.cc
-@@ -78,7 +78,7 @@ void init_buffer_ir(py::module &&m) {
-              // TODO: We need to add a pass before OneShotBufferize to generate
-              // MemorySpaceCastOp
-              Operation *memref =
--                 self.create<bufferization::ToBufferOp>(memrefType, src);
-+                 self.create<bufferization::ToMemrefOp>(memrefType, src);
-              if (addressSpace) {
-                memref = self.create<memref::MemorySpaceCastOp>(
-                    MemRefType::get(memrefType.getShape(),
 diff --git a/python/triton/language/math.py b/python/triton/language/math.py
 index 582cd876c..034fe0f87 100644
 --- a/python/triton/language/math.py
@@ -1082,7 +1065,7 @@ index 42bf7024f..8ab2a95b2 100644
          shape = [range]
          if ret_ty is None:
              ret_ty = tl.block_type(tl.int32, shape)
-@@ -1009,6 +1062,8 @@ class TritonSemantic(Generic[TensorTy]):
+@@ -1009,6 +1057,8 @@ class TritonSemantic(Generic[TensorTy]):
          # Check `boundary_check` argument
          boundary_check = self._canonicalize_boundary_check(boundary_check, dst_ty.get_block_shapes())
  
@@ -1091,7 +1074,7 @@ index 42bf7024f..8ab2a95b2 100644
          # Build IR
          return self.tensor(
              self.builder.create_tensor_pointer_load(ptr.handle, boundary_check, padding, cache, eviction, is_volatile),
-@@ -1026,7 +1081,12 @@ class TritonSemantic(Generic[TensorTy]):
+@@ -1026,7 +1076,12 @@ class TritonSemantic(Generic[TensorTy]):
              raise ValueError("`padding_option` or `boundary_check` argument is not supported for loading a tensor of"
                               "pointers or loading a scalar. Because the compiler does not know the boundary; please "
                               "use block pointers (defined by `make_block_ptr`) instead")
@@ -1105,7 +1088,7 @@ index 42bf7024f..8ab2a95b2 100644
          # For a pointer of scalar, check the type of `mask` and `other`
          if not ptr.type.is_block():
              if mask and mask.type.is_block():
-@@ -1065,13 +1125,19 @@ class TritonSemantic(Generic[TensorTy]):
+@@ -1065,13 +1120,19 @@ class TritonSemantic(Generic[TensorTy]):
  
          # Build IR
          if mask is None:
@@ -1130,7 +1113,7 @@ index 42bf7024f..8ab2a95b2 100644
          return ret
  
      def load(self, ptr: TensorTy, mask: Optional[TensorTy], other: Optional[TensorTy], boundary_check: Tuple,
-@@ -1837,12 +1903,17 @@ class TritonSemantic(Generic[TensorTy]):
+@@ -1837,12 +1898,17 @@ class TritonSemantic(Generic[TensorTy]):
          is_signed = [arg.dtype.is_int_signed() for arg in args]
          return self.tensor(self.builder.create_print(prefix, hex, new_args, is_signed), tl.void)
  
