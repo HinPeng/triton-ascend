@@ -60,6 +60,9 @@ produce one wider rank-two dot.
 Supporting INT8 types does not establish new proofs for dynamic grouped-pid
 division/remainder or nested pointer recurrences. Such kernels retain their
 complete baseline when the existing address analysis cannot prove them.
+The [INT8 device validation](cv_integer_validation_20261105.md) records actual
+M/N and rank-two lane execution, the current consumer's batch-MMA limitation,
+and the unchanged Liger kernel's remaining address-proof fallback.
 
 ### Shared B: concatenate M; shared A: concatenate N
 
