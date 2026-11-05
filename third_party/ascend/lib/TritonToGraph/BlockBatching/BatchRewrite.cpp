@@ -274,12 +274,23 @@ bool hasByteType(Type type) {
     type = ptr.getPointeeType();
   return type.isInteger(8);
 }
-bool byteOperationSupported(Operation *op) {
+bool byteOperationSupported(Operation *op, bool cv) {
   bool usesByte = llvm::any_of(op->getOperandTypes(), hasByteType) ||
                   llvm::any_of(op->getResultTypes(), hasByteType);
   if (!usesByte)
     return true;
   auto name = op->getName().getStringRef();
+  // Integer CV keeps the original signedness, bit width, K reduction and
+  // loop recurrence. These are lane-wise operations, not byte host ABI or
+  // a new cross-lane reduction. Existing control/effect/attribute proofs
+  // still apply; in particular nsw/nuw arithmetic is not admitted.
+  if (cv && (isa<scf::ForOp, scf::IfOp, scf::YieldOp, triton::DotOp>(op) ||
+             name == "arith.extsi" || name == "arith.extui" ||
+             name == "arith.trunci" || name == "arith.addi" ||
+             name == "arith.subi" || name == "arith.muli" ||
+             name == "arith.andi" || name == "arith.ori" ||
+             name == "arith.xori"))
+    return true;
   if (name == "tt.bitcast") {
     if (isBatchBoolToByteCast(op)) {
       // Only the frontend's explicit, byte-stored bool load contract is
@@ -770,8 +781,11 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       if (a.getRank() != 2 || b.getRank() != 2 || c.getRank() != 2)
         return reject("CV_REQUIRES_RANK_TWO_DOT");
       auto element = a.getElementType();
-      if (!(element.isF16() || element.isBF16() || element.isF32()) ||
-          b.getElementType() != element || !c.getElementType().isF32() ||
+      bool floatingDot = (element.isF16() || element.isBF16() ||
+                          element.isF32()) && c.getElementType().isF32();
+      bool integerDot = element.isSignlessInteger(8) &&
+                        c.getElementType().isSignlessInteger(32);
+      if (!(floatingDot || integerDot) || b.getElementType() != element ||
           dot.getType() != c)
         return reject("CV_UNSUPPORTED_DOT_TYPE");
     }
@@ -779,7 +793,7 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       return reject(name == "tt.extern_elementwise"
                         ? "UNSUPPORTED_EXTERNAL_FUNCTION"
                         : "UNSUPPORTED_OPERATION_ATTRIBUTE");
-    if (!byteOperationSupported(&op))
+    if (!byteOperationSupported(&op, request.cv))
       return reject("UNSUPPORTED_BYTE_OPERATION");
     if (name == "tt.reshape" && op.hasAttr("allow_reorder"))
       return reject("CROSS_LANE_REORDER");
@@ -933,11 +947,7 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
         // exception in the packaged rank-three path. Only the canonical
         // uniform zero initializer, or a lane-varying accumulator, is admitted.
         if (!cvControlFlow && !control.isVarying(dot.getC())) {
-          auto c = dot.getC().getDefiningOp<arith::ConstantOp>();
-          auto dense = c ? dyn_cast<DenseFPElementsAttr>(c.getValue())
-                         : DenseFPElementsAttr{};
-          if (!dense || !dense.isSplat() ||
-              !dense.getSplatValue<APFloat>().isZero()) {
+          if (!constantZero(dot.getC())) {
             diagnosticOp = op;
             return reject("CV_SHARED_ACCUMULATOR_NOT_VALIDATED");
           }

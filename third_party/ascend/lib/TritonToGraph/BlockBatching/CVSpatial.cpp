@@ -423,10 +423,15 @@ class SpatialBuilder {
         return reject("CV_SPATIAL_ACCUMULATOR_AXIS_NOT_PROVEN");
       if (dim(dot.getC()) == -1) {
         auto c = dot.getC().getDefiningOp<arith::ConstantOp>();
-        auto dense = c ? dyn_cast<DenseFPElementsAttr>(c.getValue())
-                       : DenseFPElementsAttr{};
-        if (!dense || !dense.isSplat() ||
-            !dense.getSplatValue<APFloat>().isZero())
+        auto fp = c ? dyn_cast<DenseFPElementsAttr>(c.getValue())
+                    : DenseFPElementsAttr{};
+        auto integer = c ? dyn_cast<DenseIntElementsAttr>(c.getValue())
+                         : DenseIntElementsAttr{};
+        bool zero = (fp && fp.isSplat() &&
+                     fp.getSplatValue<APFloat>().isZero()) ||
+                    (integer && integer.isSplat() &&
+                     integer.getSplatValue<APInt>().isZero());
+        if (!zero)
           return reject("CV_SPATIAL_REQUIRES_ZERO_ACCUMULATOR");
       }
       Value acc = materialize(dot.getC(), d);
