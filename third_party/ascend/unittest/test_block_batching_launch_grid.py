@@ -167,3 +167,31 @@ def test_unmerged_static_grid_keeps_original_options(frontend, launch_grid):
     assert "block_batching_grid" not in result.options
     assert not f.calls and f.launches == [(1, 16, 1)]
     assert f.events.index("pre_run") < f.events.index("compile")
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_explicit_axis_grid_changes_reuse_one_compilation(frontend, axis):
+    f = frontend
+    calls = []
+
+    def callable_grid(extent):
+        def grid(meta):
+            calls.append(extent)
+            return (extent,)
+        return grid
+
+    first = f.run(launch_grid=(128,), block_batching_axis=axis)
+    for grid in ((256,), [128], callable_grid(256), callable_grid(128)):
+        assert f.run(launch_grid=grid, block_batching_axis=axis) is first
+    assert len(f.compiled) == 1
+    assert "block_batching_grid" not in first.options
+    assert f.launches == [(128, 1, 1), (256, 1, 1), (128, 1, 1), (256, 1, 1), (128, 1, 1)]
+    assert calls == [256, 128]
+
+
+def test_explicit_axis_warmup_reuses_compilation_for_other_grid(frontend):
+    f = frontend
+    first = f.run(launch_grid=(128,), block_batching_axis=0, warmup=True)
+    assert not f.launches
+    assert f.run(launch_grid=(256,), block_batching_axis=0) is first
+    assert len(f.compiled) == 1 and f.launches == [(256, 1, 1)]

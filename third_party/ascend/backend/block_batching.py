@@ -19,11 +19,13 @@ def _annotate_launch_grid(kwargs, grid, *, bind=None):
     reuse and launch from invoking the callback a second time.
     """
     factor = kwargs.get("block_batching_factor", 1)
-    if factor == 1 or "block_batching_grid" in kwargs:
+    # An explicit axis is already selected; launch extents must not split
+    # the candidate or its baseline cache, for static or callable grids.
+    if (factor == 1 or "block_batching_grid" in kwargs
+            or kwargs.get("block_batching_axis", -1) != -1):
         return grid
     if callable(grid):
         if (bind is None or type(factor) is not int or factor <= 1
-                or kwargs.get("block_batching_axis", -1) != -1
                 or kwargs.get("block_batching_cv", False)):
             return grid
         grid = grid(bind())
