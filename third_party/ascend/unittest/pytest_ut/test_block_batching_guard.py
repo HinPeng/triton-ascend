@@ -582,7 +582,7 @@ def test_ub_compile_failure_selects_complete_baseline(bundle_environment):
 
     kernel = batching.compile_bundle(backend, src, {"block_batching_factor": 64}, compile_variant)
     assert kernel.candidate is None
-    assert kernel.block_batching["reason"] == "BACKEND_COMPILE_REJECTED"
+    assert kernel.block_batching["reason"] == "BATCH_TARGET_RESOURCE_REJECTED"
     assert "ub overflow" in kernel.block_batching["backend_diagnostic"]
     kernel.run(*env.launch)
     assert env.launches[-1][0] == "baseline"

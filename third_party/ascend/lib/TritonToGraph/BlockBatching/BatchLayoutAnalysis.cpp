@@ -254,6 +254,12 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
     plan.accessID = id;
     plan.gridAxis = axis;
     plan.shape = fact.shape;
+    // Reuse the access proof: nested execution, device-derived addresses and
+    // unknown expressions do not establish control-flow-independent memory.
+    plan.controlFlowIndependent =
+        isa<triton::FuncOp>(fact.operation->getParentOp()) &&
+        !fact.deviceAddress && fact.byteOffset &&
+        !contains(fact.byteOffset, K::Unknown) && !contains(fact.mask, K::Unknown);
     llvm::raw_string_ostream stream(plan.location);
     fact.operation->getLoc().print(stream);
     if (!normalized) {
@@ -429,11 +435,14 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
 std::string serializeBatchLayouts(ArrayRef<BatchLayoutPlan> plans) {
   llvm::json::Array rows;
   for (const auto &plan : plans) {
-    llvm::json::Array axes, shape;
+    llvm::json::Array axes, shape, effectiveShape;
     for (auto axis : plan.localAxes)
       axes.push_back(axis);
-    for (auto extent : plan.shape)
+    for (auto extent : plan.shape) {
       shape.push_back(extent);
+      if (extent != 1)
+        effectiveShape.push_back(extent);
+    }
     rows.push_back(llvm::json::Object{
         {"access_id", plan.accessID},
         {"action", plan.action == BatchLayoutPlan::Keep ? "Keep"
@@ -443,6 +452,8 @@ std::string serializeBatchLayouts(ArrayRef<BatchLayoutPlan> plans) {
         {"selected_grid_axis", plan.gridAxis},
         {"local_axes", std::move(axes)},
         {"original_shape", std::move(shape)},
+        {"effective_shape", std::move(effectiveShape)},
+        {"control_flow_independent", plan.controlFlowIndependent},
         {"tile_extent", plan.tileExtent},
         {"origin", plan.origin},
         {"reason", plan.reason},

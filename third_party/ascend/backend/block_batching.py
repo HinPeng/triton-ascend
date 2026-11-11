@@ -7,7 +7,7 @@ compiler artifacts; rejected or guarded calls select the complete baseline.
 """
 from dataclasses import dataclass
 
-IMPLEMENTATION_VERSION = 38
+IMPLEMENTATION_VERSION = 40
 
 
 def _annotate_launch_grid(kwargs, grid, *, bind=None):
@@ -76,16 +76,28 @@ def vv_layout_refusal(report):
         return None
     operations = report.get("operations", {})
     if (not operations.get("tt.load") or not operations.get("tt.store")
-            or any(operations.get(name) for name in ("tt.reduce", "tt.scan", "tt.dot", "scf.for", "scf.if"))):
+            or any(operations.get(name) for name in ("tt.reduce", "tt.scan", "tt.dot"))):
         return None
     accesses = report.get("layout", {}).get("accesses", [])
+    if (any(operations.get(name) for name in ("scf.for", "scf.if"))
+            and not all(access.get("control_flow_independent") is True for access in accesses)):
+        return None
+
+    def row_rank(access):
+        shape = access.get("original_shape", [])
+        if any(type(extent) is not int or extent <= 0 for extent in shape):
+            return None
+        # Retain the existing distinction between scalar accesses and a
+        # one-element row while ignoring singleton coordinate dimensions.
+        return max(1, sum(extent != 1 for extent in shape)) if shape else 0
+
     independent = [access for access in accesses if access.get("mask_class") == "independent_axes"]
     if independent and all(
             access.get("action") == "Keep" and access.get("rewritten") is False
             and ((access.get("mask_class") == "independent_axes"
-                  and len(access.get("original_shape", [])) == 1)
+                  and row_rank(access) == 1)
                  or (access.get("mask_class") == "shared"
-                     and len(access.get("original_shape", [])) <= 1)) for access in accesses):
+                     and row_rank(access) in (0, 1))) for access in accesses):
         return "VV_POINTWISE_MEMORY_VIEW_REQUIRED"
     return None
 
@@ -144,6 +156,10 @@ def analyze_request(mod, request, binding):
 
 class BatchingRejected(RuntimeError):
     """A modeled capability/proof rejection, not an internal compiler error."""
+
+    def __init__(self, reason, analysis=None):
+        super().__init__(reason)
+        self.analysis = analysis
 
 
 class LayoutTargetRejected(BatchingRejected):
@@ -242,17 +258,18 @@ def _batched_blocks(grid, axis, factor):
 
 
 def _core_floor():
-    """Minimum merged block count, defaulting to the available AIC count.
+    """Minimum merged task count for the supported AIV-only candidates.
 
-    The device interface owns NPU_DEVICE_LIMIT parsing and validation. An
-    explicit TA_BLOCK_BATCHING_CORE_FLOOR integer overrides the scheduling
-    threshold only after device validation; zero disables this floor.
+    Batching validates final execution mode as AIV, so its scheduling floor
+    must use available vector cores rather than cube cores. Device limits
+    remain owned and validated by the device interface. An explicit override
+    is honored only after that validation; zero disables the floor.
     """
     import os
     from triton.runtime import driver
-    available_aic = driver.active.utils.get_aicore_num()
+    available_aiv = driver.active.utils.get_aivector_core_num()
     override = os.getenv("TA_BLOCK_BATCHING_CORE_FLOOR")
-    return int(override) if override is not None else available_aic
+    return int(override) if override is not None else available_aiv
 
 
 def _capture_state():
@@ -511,6 +528,8 @@ def compile_bundle(backend, src, options, compile_variant):
             cause = cause.__cause__
         if isinstance(cause, BatchingRejected):
             report["reason"] = str(cause)
+            if cause.analysis is not None:
+                report["candidate_analysis"] = cause.analysis
             if isinstance(cause, CVTargetRejected):
                 report.update(backend_diagnostic=cause.diagnostic, stage=cause.stage)
         elif isinstance(cause, subprocess.CalledProcessError):
@@ -518,7 +537,9 @@ def compile_bundle(backend, src, options, compile_variant):
                 errors="replace") if isinstance(cause.stderr, bytes) else str(cause.stderr or "")
             if _internal_backend_error(cause.returncode, detail):
                 raise
-            report.update(reason="BACKEND_COMPILE_REJECTED", backend_returncode=cause.returncode,
+            reason = ("BATCH_TARGET_RESOURCE_REJECTED" if _cv_resource_refusal(cause.returncode, detail)
+                      else "BACKEND_COMPILE_REJECTED")
+            report.update(reason=reason, backend_returncode=cause.returncode,
                           backend_diagnostic=detail[-16000:])
         else:
             # Internal verifier/runtime errors and unknown compiler failures

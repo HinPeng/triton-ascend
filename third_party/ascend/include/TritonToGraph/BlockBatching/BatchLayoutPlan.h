@@ -28,6 +28,7 @@ struct BatchLayoutPlan {
   std::string location;
   BatchExprRef coordinate, upper;
   bool rewritten = false;
+  bool controlFlowIndependent = false;
 };
 SmallVector<BatchLayoutPlan, 0>
 planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor);

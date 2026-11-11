@@ -40,7 +40,7 @@ def fixture(shape="2x512", dtype="f32", axis=1, reverse=False, owner="block_batc
     }}'''
 
 
-@pytest.mark.parametrize("factor", [2, 3, 6])
+@pytest.mark.parametrize("factor", [2, 3, 6, 8, 16, 32, 64])
 @pytest.mark.parametrize("dtype", ["f32", "i32"])
 @pytest.mark.parametrize("reverse", [False, True])
 def test_lane_scan_preserves_axis_direction_and_type(tmp_path, factor, dtype, reverse):
@@ -54,6 +54,7 @@ def test_lane_scan_preserves_axis_direction_and_type(tmp_path, factor, dtype, re
     assert len(callees) == len(set(callees)) == factor
     assert f'tensor<512x{dtype}>' in text
     assert 'parallel_mode = "mix_simd_simt"' in text
+    assert '#hivm.vf_mode<MIX>' in text
     for lane in range(factor):
         assert f'[{lane}, 0] [1, 512] [1, 1]' in text
     assert f'arith.constant {str(reverse).lower()}' in text
@@ -89,3 +90,15 @@ def test_each_call_has_its_own_declaration(tmp_path):
     assert len(callees) == len(set(callees)) == 4
     declarations = re.findall(r'func.func private @(triton_cumsum[^ (]*)', text)
     assert sorted(declarations) == sorted(callees)
+
+
+@pytest.mark.parametrize('shape,axis', [('2x1x512', 2), ('2x512x1', 1), ('2x1x512x1', 2)])
+def test_singleton_scan_uses_the_same_independent_lane_lowering(tmp_path, shape, axis):
+    module = parse(tmp_path, fixture(shape=shape, axis=axis))
+    assert ascend.passes.ttir.lower_block_batching_scans(module, 2) == 1
+    assert module.verify()
+    text = str(module)
+    assert text.count('tensor.extract_slice') == 2
+    assert text.count('tensor.insert_slice') == 2
+    assert 'tensor<512xf32>' in text
+    assert '#hivm.vf_mode<MIX>' in text
