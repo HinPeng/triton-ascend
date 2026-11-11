@@ -242,22 +242,17 @@ def _batched_blocks(grid, axis, factor):
 
 
 def _core_floor():
-    """Smallest flattened block count a merged launch may still occupy.
+    """Minimum merged block count, defaulting to the available AIC count.
 
-    Measured on Ascend950PR over 157 (kernel body, tile width, grid, F) points:
-    every merged launch landing at or above aiv/2 blocks stayed within noise of
-    its baseline (worst 0.98x), while below it 27 of 95 points regressed, down
-    to 0.45x. Keeping the floor at aiv/2 rather than aiv is deliberate: aiv
-    blocks only the same 27 regressions but also gives up 16 further points
-    that measured as wins, which costs more total time than it saves.
+    The device interface owns NPU_DEVICE_LIMIT parsing and validation. An
+    explicit TA_BLOCK_BATCHING_CORE_FLOOR integer overrides the scheduling
+    threshold only after device validation; zero disables this floor.
     """
     import os
-    override = os.getenv("TA_BLOCK_BATCHING_CORE_FLOOR")
-    if override is not None:
-        return int(override)
     from triton.runtime import driver
-    _, num_aiv = driver.active.utils.get_device_core()
-    return num_aiv // 2
+    available_aic = driver.active.utils.get_aicore_num()
+    override = os.getenv("TA_BLOCK_BATCHING_CORE_FLOOR")
+    return int(override) if override is not None else available_aic
 
 
 def _capture_state():
@@ -363,10 +358,8 @@ class BatchKernel:
                 reason = "GRID_NOT_REDUCED"
             elif _batched_blocks(grid, self.block_batching["selected_axis"],
                                  self.request.factor) < _core_floor():
-                # Merging trades per-program overhead against parallelism. Once
-                # the merged launch no longer fills the device, the parallelism
-                # it gives up outweighs the overhead it saves and the candidate
-                # is slower than the baseline it replaced.
+                # Apply the configured available-core scheduling floor. Its
+                # performance tradeoff is validated separately by workload.
                 reason = "GRID_BELOW_CORE_FLOOR"
             elif capture is not False:
                 reason = "CAPTURE_BASELINE" if capture else "CAPTURE_QUERY_UNAVAILABLE"
@@ -457,6 +450,8 @@ def compile_bundle(backend, src, options, compile_variant):
                            options.get("block_batching_cv", False))
     normalized = backend.parse_options(options)
     baseline_options = dict(options, block_batching_factor=1, block_batching_axis=-1, block_batching_cv=False)
+    # Grid hints specialize candidate axis selection, never the original kernel.
+    baseline_options.pop("block_batching_grid", None)
     freeze_rejection = None
     try:
         frozen = _freeze_source(backend, src, baseline_options, normalized.block_batching_backend_revision)
