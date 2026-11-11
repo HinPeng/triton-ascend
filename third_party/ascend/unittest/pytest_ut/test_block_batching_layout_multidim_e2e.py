@@ -45,7 +45,13 @@ def test_row_and_column_tails_preserve_padding(factor, dtype, axis):
             expected[:covered, :columns] = (
                 torch.arange(rows * stride, dtype=dtype).reshape(rows, stride)[:covered, :columns] * 2 + 1)
             torch.testing.assert_close(y.cpu().reshape(rows, stride), expected, rtol=0, atol=0)
-            assert kernel.last_launch['runtime_status'] == 'APPLIED', kernel.block_batching
+            launch = kernel.last_launch
+            if selected == 1:
+                assert launch['reason'] == 'GRID_NOT_REDUCED', launch
+                assert launch['applied_factor'] == 1
+            else:
+                assert launch['runtime_status'] == 'APPLIED', launch
+                assert launch['applied_factor'] == factor
             assert all(r['rewritten'] for r in kernel.block_batching['layout']['accesses'])
             observed = kernel.block_batching['layout']['lowering_observation']
             assert observed['indirect_load_ops'] == observed['indirect_store_ops'] == 0, observed
@@ -65,7 +71,13 @@ def test_ordered_decomposition_and_two_tails(factor):
             count = min(n, grid * 16)
             expected[:count] = torch.arange(count) * 2 + 1
             torch.testing.assert_close(y.cpu(), expected, rtol=0, atol=0)
-            assert kernel.last_launch['runtime_status'] == 'APPLIED', kernel.block_batching
+            launch = kernel.last_launch
+            if grid == 1:
+                assert launch['reason'] == 'GRID_NOT_REDUCED', launch
+                assert launch['applied_factor'] == 1
+            else:
+                assert launch['runtime_status'] == 'APPLIED', launch
+                assert launch['applied_factor'] == factor
             assert all(r['rewritten'] for r in kernel.block_batching['layout']['accesses'])
             observed = kernel.block_batching['layout']['lowering_observation']
             assert observed['indirect_load_ops'] == observed['indirect_store_ops'] == 0, observed

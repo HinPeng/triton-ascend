@@ -7,7 +7,102 @@ compiler artifacts; rejected or guarded calls select the complete baseline.
 """
 from dataclasses import dataclass
 
-IMPLEMENTATION_VERSION = 27
+IMPLEMENTATION_VERSION = 35
+
+
+def _annotate_launch_grid(kwargs, grid, *, bind=None):
+    """Attach launch extents before cache selection; return the launch grid.
+
+    Auto VV axis selection needs callable extents as well as static ones.
+    The batching continuation binds arguments only for actual launches, keeping
+    warmup callbacks unevaluated. Returning the resolved value also keeps
+    reuse and launch from invoking the callback a second time.
+    """
+    factor = kwargs.get("block_batching_factor", 1)
+    if factor == 1 or "block_batching_grid" in kwargs:
+        return grid
+    if callable(grid):
+        if (bind is None or type(factor) is not int or factor <= 1
+                or kwargs.get("block_batching_axis", -1) != -1
+                or kwargs.get("block_batching_cv", False)):
+            return grid
+        grid = grid(bind())
+    if not isinstance(grid, (tuple, list)) or not 1 <= len(grid) <= 3:
+        return grid
+    extents = [*grid, *((1, ) * (3 - len(grid)))]
+    if all(type(extent) is int and extent > 0 for extent in extents):
+        kwargs["block_batching_grid"] = tuple(extents)
+    return grid
+
+
+class _BatchLaunchHandler:
+    """Block-batching policy behind the existing backend JIT continuation."""
+
+    def run(self, fn, args, kwargs, grid, warmup, device, stream, backend, jit_tail):
+        # Preserve pre-run hooks, cache identity and single callback evaluation
+        # without adding a hook to the common JIT frontend.
+        bind = None if warmup else lambda: fn.device_caches[device][4](*args, **kwargs)[0]
+        grid = _annotate_launch_grid(kwargs, grid, bind=bind)
+        from .reuse.config import enabled
+
+        if enabled():
+            from .reuse.bridge import get_handler
+
+            return get_handler().run(fn, args, kwargs, grid, warmup, device, stream, backend, jit_tail)
+        return jit_tail(args, kwargs, grid, warmup, device, stream)
+
+
+_launch_handler = _BatchLaunchHandler()
+
+
+def get_launch_handler():
+    return _launch_handler
+
+
+def vv_layout_refusal(report):
+    """Conservative structural matching for independent row pointwise bodies.
+
+    Without row aggregation, retaining separate row views adds the dynamic
+    batch prefix without forming the memory view used by contiguous pointwise
+    batching. Shared scalar/vector parameters do not establish that view for
+    the independent rows. Keep this class on the original kernel until its
+    row lowering is improved. This policy does not estimate latency
+    or inspect kernel names, grid sizes, tile widths or measured timings.
+    """
+    if (report.get("owner") != "block_batching" or report.get("cv_mode") != "disabled"
+            or report.get("lane_width", 1) <= 1):
+        return None
+    operations = report.get("operations", {})
+    if (not operations.get("tt.load") or not operations.get("tt.store")
+            or any(operations.get(name) for name in ("tt.reduce", "tt.scan", "tt.dot", "scf.for", "scf.if"))):
+        return None
+    accesses = report.get("layout", {}).get("accesses", [])
+    independent = [access for access in accesses if access.get("mask_class") == "independent_axes"]
+    if independent and all(
+            access.get("action") == "Keep" and access.get("rewritten") is False
+            and ((access.get("mask_class") == "independent_axes"
+                  and len(access.get("original_shape", [])) == 1)
+                 or (access.get("mask_class") == "shared"
+                     and len(access.get("original_shape", [])) <= 1)) for access in accesses):
+        return "VV_POINTWISE_MEMORY_VIEW_REQUIRED"
+    return None
+
+
+def memory_compile_options(metadata, compiler_path, supports_inlining):
+    """Inline dynamic contiguous DMA helpers only in VV batching candidates.
+
+    This is a lowering policy, not a factor selector or a profitability test.
+    Unsupported compiler versions retain their normal candidate compilation.
+    """
+    report = metadata.get("block_batching", {})
+    lowering = report.get("memory_lowering", {})
+    if (metadata.get("block_batching_factor", 1) <= 1 or report.get("owner") != "block_batching"
+            or report.get("cv_mode") != "disabled" or lowering.get("dynamic_contiguous_copy") is not True
+            or not metadata["target"].arch.startswith("Ascend950") or metadata.get("mix_mode") != "aiv"
+            or metadata.get("parallel_mode") != "simd"):
+        return []
+    lowering["libcall_inlining"] = bool(supports_inlining(compiler_path))
+    return ["--enable-lib-call-no-inline=false"] if lowering["libcall_inlining"] else []
 
 
 @dataclass(frozen=True)
@@ -131,6 +226,38 @@ def _runtime_positions(src):
     return result
 
 
+def _reduces_blocks(grid, axis, factor):
+    """Whether batching this axis shrinks the flattened block count at all."""
+    batched = list(grid)
+    batched[axis] = (grid[axis] + factor - 1) // factor
+    return batched[0] * batched[1] * batched[2] < grid[0] * grid[1] * grid[2]
+
+
+def _batched_blocks(grid, axis, factor):
+    batched = list(grid)
+    batched[axis] = (grid[axis] + factor - 1) // factor
+    return batched[0] * batched[1] * batched[2]
+
+
+def _core_floor():
+    """Smallest flattened block count a merged launch may still occupy.
+
+    Measured on Ascend950PR over 157 (kernel body, tile width, grid, F) points:
+    every merged launch landing at or above aiv/2 blocks stayed within noise of
+    its baseline (worst 0.98x), while below it 27 of 95 points regressed, down
+    to 0.45x. Keeping the floor at aiv/2 rather than aiv is deliberate: aiv
+    blocks only the same 27 regressions but also gives up 16 further points
+    that measured as wins, which costs more total time than it saves.
+    """
+    import os
+    override = os.getenv("TA_BLOCK_BATCHING_CORE_FLOOR")
+    if override is not None:
+        return int(override)
+    from triton.runtime import driver
+    _, num_aiv = driver.active.utils.get_device_core()
+    return num_aiv // 2
+
+
 def _capture_state():
     import sys
     torch = sys.modules.get("torch")
@@ -222,7 +349,23 @@ class BatchKernel:
         if self.candidate is not None:
             capture = _capture_state()
             if self.request.cv and grid[self.block_batching["selected_axis"]] % self.request.factor:
+                # VV candidates protect partial groups with a lane mask and
+                # safe inactive operands. CV still requires complete groups.
                 reason = "CV_GRID_NOT_DIVISIBLE"
+            elif not _reduces_blocks(grid, self.block_batching["selected_axis"], self.request.factor):
+                # The device task domain is one dimensional: prepareGrid divides
+                # the selected axis and then multiplies all three extents. An
+                # axis too short to divide leaves that product untouched while
+                # the rewritten tile is still F times wider, so every lane past
+                # the original extent is masked-off work bought for nothing.
+                reason = "GRID_NOT_REDUCED"
+            elif _batched_blocks(grid, self.block_batching["selected_axis"],
+                                 self.request.factor) < _core_floor():
+                # Merging trades per-program overhead against parallelism. Once
+                # the merged launch no longer fills the device, the parallelism
+                # it gives up outweighs the overhead it saves and the candidate
+                # is slower than the baseline it replaced.
+                reason = "GRID_BELOW_CORE_FLOOR"
             elif capture is not False:
                 reason = "CAPTURE_BASELINE" if capture else "CAPTURE_QUERY_UNAVAILABLE"
             else:

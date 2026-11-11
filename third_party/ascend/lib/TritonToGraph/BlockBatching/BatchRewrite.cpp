@@ -486,6 +486,23 @@ LogicalResult rewriteStructuredCV(ModuleOp module, triton::FuncOp function,
                     rewriter.getStringAttr("block_batching"));
   return verify(module);
 }
+
+// Launch extents of the three device grid dimensions, recorded by the backend
+// when the launch site used a static grid tuple. Empty when the grid is only
+// known at launch time, which leaves axis selection exactly as it was.
+SmallVector<int64_t, 3> staticGridExtents(ModuleOp module) {
+  SmallVector<int64_t, 3> extents;
+  auto hint = module->getAttrOfType<ArrayAttr>("hacc.block_batching_grid");
+  if (!hint || hint.size() != 3)
+    return extents;
+  for (Attribute entry : hint) {
+    auto value = dyn_cast<IntegerAttr>(entry);
+    if (!value || value.getInt() < 1)
+      return {};
+    extents.push_back(value.getInt());
+  }
+  return extents;
+}
 } // namespace
 
 static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
@@ -662,12 +679,29 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   // general non-rectangular mask lowering and can still be requested
   // explicitly.
   int axis = request.axis;
-  if (axis < 0)
+  if (axis < 0) {
+    // A VV axis is useful whenever ceil(G/F) < G, including G < F and
+    // partial final groups. CV still requires full groups. Static hints let
+    // auto selection skip singleton tiling axes before choosing a row axis.
+    SmallVector<int64_t, 3> extents = staticGridExtents(module);
     for (int i = 0; i < 3; ++i)
-      if (axes[i]) {
+      if (axes[i] &&
+          (extents.empty() ||
+           (request.cv ? (extents[i] >= request.factor &&
+                          extents[i] % request.factor == 0)
+                       : extents[i] > 1))) {
         axis = i;
         break;
       }
+    // Keep a deterministic choice when no useful static axis is available;
+    // the runtime dispatcher reports why this launch uses the baseline.
+    if (axis < 0)
+      for (int i = 0; i < 3; ++i)
+        if (axes[i]) {
+          axis = i;
+          break;
+        }
+  }
   if (axis < 0)
     return reject("NO_PROGRAM_AXIS");
   if (!axes[axis])
@@ -1298,9 +1332,9 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
               lift(operand,
                    RankedTensorType::get(shape, scalar(operand.getType()))));
         Value mask;
-        if (needsBatchActiveMask(*descriptor))
+        if (needsBatchActiveMask(op, *descriptor))
           mask = liveFor(liftedType(op->getResult(0).getType()));
-        auto safe = prepareBatchElementwiseOperands(*descriptor, lifted, mask,
+        auto safe = prepareBatchElementwiseOperands(op, *descriptor, lifted, mask,
                                                     loc, rewriter);
         replacement = rewriteBatchElementwise(
             op, *descriptor, safe, liftedType(op->getResult(0).getType()), loc,

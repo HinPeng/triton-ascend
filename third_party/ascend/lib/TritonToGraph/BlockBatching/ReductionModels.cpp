@@ -2,6 +2,10 @@
 #include "TritonToGraph/BlockBatching/ReductionModels.h"
 #include "TritonToGraph/BlockBatching/BatchOpRegistry.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/IR/SymbolTable.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -13,6 +17,96 @@ bool scalarNumerical(Type type) {
          type.isInteger(32) || type.isInteger(64);
 }
 } // namespace
+unsigned lowerBatchLaneScans(ModuleOp module, int64_t factor) {
+  auto owner = module->getAttrOfType<StringAttr>("hacc.block_mapping_owner");
+  if (!owner || owner.getValue() != "block_batching" || factor <= 1 ||
+      factor > 64)
+    return 0;
+  auto *context = module.getContext();
+  context->getOrLoadDialect<func::FuncDialect>();
+  context->getOrLoadDialect<tensor::TensorDialect>();
+  SmallVector<func::CallOp> calls;
+  module.walk([&](func::CallOp call) { calls.push_back(call); });
+  IRRewriter rewriter(context);
+  SymbolTable symbols(module);
+  llvm::SmallPtrSet<Operation *, 4> oldDeclarations;
+  unsigned changed = 0;
+  for (func::CallOp call : calls) {
+    auto callee = symbols.lookup<func::FuncOp>(call.getCallee());
+    auto parent = call->getParentOfType<func::FuncOp>();
+    if (!callee || !callee.isExternal() || !callee.isPrivate() || !parent ||
+        !callee.getSymName().starts_with("triton_cumsum") ||
+        call.getNumOperands() != 3 || call.getNumResults() != 1)
+      continue;
+    auto mode = parent->getAttrOfType<StringAttr>("mix_mode");
+    auto parallel = parent->getAttrOfType<StringAttr>("parallel_mode");
+    if (!mode || mode.getValue() != "aiv" || !parallel ||
+        (parallel.getValue() != "simd" &&
+         parallel.getValue() != "mix_simd_simt"))
+      continue;
+    auto source = dyn_cast<RankedTensorType>(call.getOperand(0).getType());
+    if (!source || source.getRank() != 2 || !source.hasStaticShape() ||
+        source.getEncoding() || source.getDimSize(0) != factor ||
+        source.getDimSize(1) <= 0 || call.getResult(0).getType() != source ||
+        !(source.getElementType().isF32() ||
+          source.getElementType().isInteger(32)) ||
+        !call.getOperand(1).getType().isInteger(32) ||
+        !call.getOperand(2).getType().isInteger(1))
+      continue;
+    APInt axis;
+    if (!matchPattern(call.getOperand(1), m_ConstantInt(&axis)) || axis != 1)
+      continue;
+
+    // Each row is an original program's scan. Keep its axis, order and
+    // direction independent of the new batch dimension; do not flatten a
+    // scan across lanes. This avoids the backend's 2D transpose-based scan.
+    auto row = RankedTensorType::get({source.getDimSize(1)},
+                                     source.getElementType());
+    auto signature = rewriter.getFunctionType(
+        {row, rewriter.getI32Type(), rewriter.getI1Type()}, {row});
+    rewriter.setInsertionPoint(call);
+    auto loc = call.getLoc();
+    Value zeroAxis = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
+    SmallVector<OpFoldResult> sizes{rewriter.getIndexAttr(1),
+                                   rewriter.getIndexAttr(source.getDimSize(1))};
+    SmallVector<OpFoldResult> strides(2, rewriter.getIndexAttr(1));
+    Value assembled = call.getOperand(0);
+    for (int64_t lane = 0; lane < factor; ++lane) {
+      func::FuncOp declaration;
+      {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(module.getBody());
+        declaration = rewriter.create<func::FuncOp>(
+            loc, "triton_cumsum_bb_lane", signature);
+        declaration.setPrivate();
+        symbols.insert(declaration);
+      }
+      // The downstream adapter erases a cumulative-call declaration after
+      // consuming one call. Give each lane its own symbol, including when
+      // several scans in this module had shared the original declaration.
+      SmallVector<OpFoldResult> offsets{rewriter.getIndexAttr(lane),
+                                       rewriter.getIndexAttr(0)};
+      Value input = rewriter.create<tensor::ExtractSliceOp>(
+          loc, row, call.getOperand(0), offsets, sizes, strides);
+      Value scanned = rewriter.create<func::CallOp>(
+          loc, declaration.getSymName(), TypeRange{row},
+          ValueRange{input, zeroAxis, call.getOperand(2)}).getResult(0);
+      assembled = rewriter.create<tensor::InsertSliceOp>(
+          loc, scanned, assembled, offsets, sizes, strides);
+    }
+    rewriter.replaceOp(call, assembled);
+    parent->setAttr("parallel_mode", rewriter.getStringAttr("mix_simd_simt"));
+    oldDeclarations.insert(callee.getOperation());
+    ++changed;
+  }
+  for (Operation *declaration : oldDeclarations)
+    if (SymbolTable::symbolKnownUseEmpty(declaration, module)) {
+      symbols.remove(declaration);
+      rewriter.eraseOp(declaration);
+    }
+  return changed;
+}
+
 LogicalResult verifyBatchReduction(Operation *op, std::string &reason,
                                    Operation *&failedOp) {
   auto reject = [&](Operation *at, llvm::StringRef why) {

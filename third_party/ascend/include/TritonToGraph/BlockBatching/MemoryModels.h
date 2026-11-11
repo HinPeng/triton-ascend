@@ -14,6 +14,9 @@ LogicalResult normalizeBatchMemory(ModuleOp module, Operation *&failedOp,
                                    std::string &reason);
 bool isBatchBoolToByteCast(Operation *op);
 bool isBatchNormalizedBoolLoad(Operation *op);
+// Read-only observation of the lowered candidate. Does not alter its masks,
+// memory layout or eligibility for batching; unowned modules return false.
+bool hasBatchDynamicContiguousCopy(ModuleOp module);
 struct BatchPointerPlan {
   Value base;
   llvm::SmallVector<std::pair<Value, bool>> byteOffsets; // value, subtract

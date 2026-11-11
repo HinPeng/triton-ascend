@@ -22,6 +22,7 @@
  */
 
 #include "ascend/include/TritonToLinalg/TritonOpConverter.h"
+#include "ascend/include/TritonToGraph/BlockBatching/ElementwiseModels.h"
 #include "ascend/include/TritonToLinalg/BlockPtrAnalysis.h"
 #include "ascend/include/TritonToLinalg/MaskAnalysis.h"
 #include "ascend/include/TritonToLinalg/TritonToLinalgPass.h"
@@ -549,6 +550,13 @@ LogicalResult PreciseDivConverter::matchAndRewrite(
 LogicalResult
 SelectCanonicalizer::matchAndRewrite(arith::SelectOp op,
                                      PatternRewriter &rewriter) const {
+  // A batch safety select sanitizes inputs before a potentially undefined
+  // operation. Keep that ordering while allowing elementwise fusion; the
+  // slice/insert form materializes a filled tensor and a UB-to-UB copy even
+  // for a fully active group. Ordinary structured selects are unchanged.
+  if (op->hasAttr(mlir::triton::cfg::kBatchSafeInputAttr))
+    return failure();
+
   auto loc = op.getLoc();
 
   // 0. Shortcut for scalars and bool type

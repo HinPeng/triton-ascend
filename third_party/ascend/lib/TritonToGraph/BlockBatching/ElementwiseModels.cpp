@@ -4,26 +4,55 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/STLExtras.h"
 
 namespace mlir::triton::cfg {
-bool needsBatchActiveMask(const BatchOpDescriptor &descriptor) {
-  return descriptor.inactiveInputs != BatchInactivePolicy::Preserve &&
-         descriptor.inactiveInputs != BatchInactivePolicy::IEEE;
+namespace {
+BatchInactivePolicy inactivePolicy(Operation *op,
+                                   const BatchOpDescriptor &descriptor,
+                                   unsigned operand) {
+  // The registered f32 tanh entry lowers to floating min/max, exp and div.
+  // None has immediate integer UB on an inactive lane, including NaN/Inf.
+  // pow's base also enters only floating arithmetic or bit reinterpretation;
+  // its exponent retains sanitization because SIMT pow can cast that value.
+  // Unknown external signatures retain the conservative descriptor policy.
+  if (auto call = dyn_cast<triton::ExternElementwiseOp>(op))
+    if ((call.getSymbol() == "__hmf_tanhf" ||
+         (call.getSymbol() == "__hmf_pow_fp32" && operand == 0)) &&
+        call.getPure() &&
+        call.getLibname().empty() && call.getLibpath().empty())
+      return BatchInactivePolicy::IEEE;
+  return descriptor.inactiveInputs;
+}
+} // namespace
+bool needsBatchActiveMask(Operation *op, const BatchOpDescriptor &descriptor) {
+  for (unsigned index = 0; index < op->getNumOperands(); ++index) {
+    auto policy = inactivePolicy(op, descriptor, index);
+    if (policy != BatchInactivePolicy::Preserve &&
+        policy != BatchInactivePolicy::IEEE)
+      return true;
+  }
+  return false;
 }
 
 SmallVector<Value>
-prepareBatchElementwiseOperands(const BatchOpDescriptor &descriptor,
+prepareBatchElementwiseOperands(Operation *op,
+                                const BatchOpDescriptor &descriptor,
                                 ValueRange operands, Value activeMask,
                                 Location loc, IRRewriter &rewriter) {
   SmallVector<Value> result(operands.begin(), operands.end());
-  if (!needsBatchActiveMask(descriptor))
+  if (!needsBatchActiveMask(op, descriptor))
     return result;
   assert(activeMask && "poison-sensitive operands require a live mask");
   for (auto [index, operand] : llvm::enumerate(operands)) {
+    auto policy = inactivePolicy(op, descriptor, index);
+    if (policy == BatchInactivePolicy::Preserve ||
+        policy == BatchInactivePolicy::IEEE)
+      continue;
     int64_t fill = 0;
-    if (descriptor.inactiveInputs == BatchInactivePolicy::Positive ||
-        (descriptor.inactiveInputs == BatchInactivePolicy::Divide &&
+    if (policy == BatchInactivePolicy::Positive ||
+        (policy == BatchInactivePolicy::Divide &&
          index == 1))
       fill = 1;
     auto type = cast<RankedTensorType>(operand.getType());
@@ -37,8 +66,10 @@ prepareBatchElementwiseOperands(const BatchOpDescriptor &descriptor,
         loc, type, DenseElementsAttr::get(type, value));
     // A select of the RESULT would be too late for integer division, shifts,
     // or float-to-int conversion: sanitize the operands before evaluation.
-    result[index] =
+    auto select =
         rewriter.create<arith::SelectOp>(loc, activeMask, operand, safe);
+    select->setAttr(kBatchSafeInputAttr, rewriter.getUnitAttr());
+    result[index] = select;
   }
   return result;
 }

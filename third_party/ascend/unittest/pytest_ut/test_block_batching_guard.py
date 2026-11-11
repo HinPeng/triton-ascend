@@ -230,6 +230,7 @@ def bundle_environment(monkeypatch):
     utils.backend_policy = 'torch_npu'
     monkeypatch.setitem(sys.modules, PACKAGE + '.utils', utils)
     monkeypatch.setattr(batching, '_capture_state', lambda: False)
+    monkeypatch.setattr(batching, '_core_floor', lambda: 0)
     monkeypatch.setattr(batching, '_freeze_source', lambda backend, src, opts, revision: src)
     launches = []
 
@@ -628,3 +629,14 @@ def test_mask_cannot_hide_its_own_i32_wraparound():
     values, grid = [1 << 40, 1 << 45, 1], ((1 << 30) + 1, 1, 1)
     assert check_guard(specification, values, grid, 3) == (False, "INDEX_OVERFLOW")
     assert guard_module.RuntimeGuard(specification, 3)(values, grid) == (False, "INDEX_OVERFLOW")
+
+
+@pytest.mark.parametrize('rows', [2, 3, 4, 5, 7])
+def test_vv_complete_and_partial_groups_execute_candidate(bundle_environment, rows):
+    env = bundle_environment
+    launch = list(env.launch)
+    launch[0] = rows
+    env.wrapper.run(*launch)
+    assert env.wrapper.last_launch['runtime_status'] == 'APPLIED'
+    assert env.wrapper.last_launch['batch_grid'] == ((rows + 2) // 3, 1, 1)
+    assert env.launches[-1][0] == 'candidate'
