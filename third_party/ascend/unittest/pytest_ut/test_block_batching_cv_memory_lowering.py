@@ -19,8 +19,9 @@ def test_other_lowerings_keep_default_memory_contract(lowering):
 
 @pytest.mark.parametrize("arch,proof,accepted", [("Ascend950PR_9579", True, True), ("Ascend910B4", True, False),
                                                  ("Ascend950PR_9579", False, False), ("Ascend950PR_9579", 1, False)])
-def test_masked_backend_contract_requires_arch_and_padding_proof(arch, proof, accepted):
-    report = dict(cv_lowering="rank3_masked_batch_v1", guard=dict(require_same_fractal_bounds=proof))
+@pytest.mark.parametrize("lowering", ["rank3_masked_batch_v1", "rank3_uniform_control_batch_v1"])
+def test_masked_backend_contract_requires_arch_and_padding_proof(arch, proof, accepted, lowering):
+    report = dict(cv_lowering=lowering, guard=dict(require_same_fractal_bounds=proof))
     metadata = dict(block_batching=report, target=SimpleNamespace(arch=arch))
     if accepted:
         assert compiler._masked_batch_compile_options(metadata, "/compiler") == []

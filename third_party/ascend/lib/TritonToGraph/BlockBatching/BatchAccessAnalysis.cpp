@@ -1,5 +1,7 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+#include "TritonToGraph/BlockBatching/BatchFactsJSON.h"
 #include "TritonToGraph/BlockBatching/BatchAccessAnalysis.h"
+#include "TritonToGraph/BlockBatching/BatchLoopForm.h"
 #include "TritonToGraph/BlockBatching/MemoryModels.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -12,78 +14,6 @@
 #include <optional>
 
 namespace mlir::triton::cfg {
-BatchExprRef BatchExpr::leaf(Kind kind, int64_t value, unsigned bits,
-                             int64_t extent) {
-  return std::make_shared<BatchExpr>(
-      BatchExpr{kind, bits, value, extent, {}, {}});
-}
-BatchExprRef BatchExpr::node(Kind kind, unsigned bits, BatchExprRef lhs,
-                             BatchExprRef rhs, unsigned sourceBits) {
-  return std::make_shared<BatchExpr>(
-      BatchExpr{kind, bits, 0, sourceBits, std::move(lhs), std::move(rhs)});
-}
-BatchExprRef BatchExpr::range(BatchExprRef start, BatchExprRef projection) {
-  return std::make_shared<BatchExpr>(
-      BatchExpr{Add, 32, 0, 0, std::move(start), std::move(projection), true});
-}
-llvm::json::Value batchExprJSON(const BatchExprRef &expr) {
-  return expr ? expr->json() : llvm::json::Value(nullptr);
-}
-llvm::json::Value BatchExpr::json() const {
-  using A = llvm::json::Array;
-  switch (kind) {
-  case Constant:
-    return A{"const", value, bits};
-  case Argument:
-    return A{"arg", value, bits};
-  case Program:
-    return A{"pid", value, bits};
-  case ProgramQuotient:
-  case ProgramRemainder:
-    return A{kind == ProgramQuotient ? "pid_div" : "pid_rem", value, extent,
-             bits};
-  case Grid:
-    return A{"grid", value, bits};
-  case Coordinate:
-    return A{"coord", value, extent, bits};
-  case Induction:
-    return A{"iv", value, bits};
-  case True:
-    return A{"true"};
-  case False:
-    return A{"false"};
-  case Unknown:
-    return A{"unknown"};
-  case And:
-    return A{"and", batchExprJSON(lhs), batchExprJSON(rhs)};
-  case SLT:
-  case ULT:
-  case EQ:
-    return A{kind == SLT   ? "slt"
-             : kind == ULT ? "ult"
-                           : "eq",
-             batchExprJSON(lhs), batchExprJSON(rhs), bits};
-  case ExtSI:
-  case ExtUI:
-  case Trunc:
-    return A{kind == ExtSI   ? "extsi"
-             : kind == ExtUI ? "extui"
-                             : "trunci",
-             bits, batchExprJSON(lhs), extent};
-  case MinSI:
-  case MaxSI:
-    return A{kind == MinSI ? "minsi" : "maxsi", bits, batchExprJSON(lhs),
-             batchExprJSON(rhs)};
-  case Add:
-  case Sub:
-  case Mul:
-    return A{kind == Add   ? "addi"
-             : kind == Sub ? "subi"
-                           : "muli",
-             bits, batchExprJSON(lhs), batchExprJSON(rhs)};
-  }
-  llvm_unreachable("unhandled batch coordinate expression");
-}
 namespace {
 using J = llvm::json::Value;
 using A = llvm::json::Array;
@@ -180,6 +110,7 @@ struct Analysis {
   bool scalarBounds = false;
   bool allowDeviceAddress = false;
   bool normalizedPointer = false;
+  bool pointerRecurrences = false;
   llvm::DenseMap<Value, unsigned> inductionVariables;
   BatchAccessReport report;
   explicit Analysis(triton::FuncOp function, unsigned indexBits)
@@ -351,15 +282,42 @@ struct Analysis {
   }
   // Root provenance does not depend on an integer/coordinate summary.
   // Keep pointer normalization on its separately proved path.
+  std::optional<std::pair<Value, Value>> pointerRecurrence(BlockArgument arg) {
+    if (!pointerRecurrences)
+      return std::nullopt;
+    auto loop = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp());
+    if (!loop || arg.getArgNumber() == 0)
+      return std::nullopt;
+    auto step = loop.getStep().getDefiningOp<arith::ConstantOp>();
+    auto amount = step ? dyn_cast<IntegerAttr>(step.getValue()) : IntegerAttr{};
+    // For unit-step loops the exact iteration number is iv - lower. General
+    // division / data-dependent recurrence is intentionally not approximated.
+    if (!amount || amount.getInt() != 1)
+      return std::nullopt;
+    unsigned index = arg.getArgNumber() - 1;
+    Value initial = loop.getInitArgs()[index];
+    Value next = cast<scf::YieldOp>(loop.getBody()->back()).getOperand(index);
+    if (next == arg)
+      return std::make_pair(initial, Value{});
+    auto advance = next.getDefiningOp<triton::AddPtrOp>();
+    if (!advance || advance.getPtr() != arg ||
+        loop->isAncestor(advance.getOffset().getParentBlock()->getParentOp()))
+      return std::nullopt;
+    return std::make_pair(initial, advance.getOffset());
+  }
+
   int rootOnly(Value value, unsigned &remaining) {
     if (!remaining)
       return -1;
     --remaining;
-    if (auto arg = dyn_cast<BlockArgument>(value))
-      return arg.getOwner() == &function.getBody().front() &&
-                     isa<triton::PointerType>(arg.getType())
-                 ? static_cast<int>(arg.getArgNumber())
-                 : -1;
+    if (auto arg = dyn_cast<BlockArgument>(value)) {
+      if (arg.getOwner() == &function.getBody().front() &&
+          isa<triton::PointerType>(arg.getType()))
+        return static_cast<int>(arg.getArgNumber());
+      if (auto recurrence = pointerRecurrence(arg))
+        return rootOnly(recurrence->first, remaining);
+      return -1;
+    }
     auto *op = value.getDefiningOp();
     if (!op)
       return -1;
@@ -376,6 +334,30 @@ struct Analysis {
       if (arg.getOwner() == &function.getBody().front() &&
           isa<triton::PointerType>(arg.getType()))
         return {static_cast<int>(arg.getArgNumber()), constant(0), {}};
+      if (auto recurrence = pointerRecurrence(arg)) {
+        Pointer base = pointer(recurrence->first, axes, normalizedBool);
+        if (!base || !recurrence->second)
+          return base;
+        auto loop = cast<scf::ForOp>(arg.getOwner()->getParentOp());
+        unsigned bytes = width(arg, normalizedBool);
+        if (!bytes)
+          return {};
+        E iteration = K::node(
+            K::Sub, 64,
+            K::leaf(K::Induction,
+                    inductionVariables.lookup(loop.getInductionVar()),
+                    bits(loop.getInductionVar().getType())),
+            integer(loop.getLowerBound(), {}));
+        // Pointer arithmetic is summarized, not rewritten. The byte-domain
+        // guard checks the complete original loop range and every pointer
+        // intermediate for overflow, allocation bounds and noninterference.
+        base.offset = add(
+            std::move(base.offset),
+            scale(K::node(K::Mul, 64, std::move(iteration),
+                          integer(recurrence->second, axes)), bytes));
+        base.checks.push_back(base.offset);
+        return base;
+      }
     }
     Operation *op = value.getDefiningOp();
     if (!op)
@@ -478,6 +460,7 @@ struct Analysis {
     if (!cmp)
       return K::leaf(K::Unknown);
     K::Kind kind;
+    bool nonnegative = false;
     switch (cmp.getPredicate()) {
     case arith::CmpIPredicate::slt:
       kind = K::SLT;
@@ -487,6 +470,13 @@ struct Analysis {
       break;
     case arith::CmpIPredicate::eq:
       kind = K::EQ;
+      break;
+    case arith::CmpIPredicate::sge:
+      // Canonical block-pointer lower bound x >= 0 is exactly -1 < x.
+      // Keep the original device predicate; this only exposes its meaning
+      // to the byte-domain proof. Never subtract one from an arbitrary bound.
+      kind = K::SLT;
+      nonnegative = true;
       break;
     default:
       return K::leaf(K::Unknown);
@@ -502,6 +492,12 @@ struct Analysis {
       report.reason = previousReason;
       report.operation = previousOperation;
       return K::leaf(K::Unknown);
+    }
+    if (nonnegative) {
+      if (!rhs || rhs->kind != K::Constant || rhs->value != 0)
+        return K::leaf(K::Unknown);
+      return K::node(K::SLT, bits(cmp.getLhs().getType()),
+                     constant(-1, bits(cmp.getLhs().getType())), std::move(lhs));
     }
     return K::node(kind, bits(cmp.getLhs().getType()), std::move(lhs),
                    std::move(rhs));
@@ -524,8 +520,10 @@ unsigned getBatchIndexBitWidth(ModuleOp module) {
 }
 
 BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
-                                       unsigned indexBits) {
+                                       unsigned indexBits,
+                                       bool pointerRecurrences) {
   Analysis analysis(function, indexBits);
+  analysis.pointerRecurrences = pointerRecurrences;
 
   unsigned loopID = 0;
   function.walk([&](scf::ForOp loop) {
@@ -605,22 +603,23 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
       analysis.fail(ptr, "UNSUPPORTED_POINTER_TYPE");
     if (!analysis.report.reason.empty())
       return;
-    A loops;
+    SmallVector<BatchLoopFact, 0> loops;
     for (Operation *parent = op->getParentOp();
          parent != function.getOperation(); parent = parent->getParentOp()) {
       if (auto loop = dyn_cast<scf::ForOp>(parent)) {
-        if (write) {
-          analysis.fail(ptr, "LOOP_WRITE_NOT_IMPLEMENTED");
-          return;
-        }
-        loops.push_back(llvm::json::Object{
-            {"id", analysis.inductionVariables.lookup(loop.getInductionVar())},
-            {"bits", analysis.bits(loop.getInductionVar().getType())},
-            {"lower",
-             batchExprJSON(analysis.integer(loop.getLowerBound(), {}))},
-            {"upper",
-             batchExprJSON(analysis.integer(loop.getUpperBound(), {}))},
-            {"step", batchExprJSON(analysis.integer(loop.getStep(), {}))}});
+        // 循环内的写不再在这里拒（S8b2）。它和循环内的读走同一条证明：地址归一到
+        // 逻辑轴，再由布局层证方向与步长链。证不出的话驱动层的
+        // LOOP_ACCESS_NOT_PROVEN 会把整条 kernel 拒掉，不会悄悄放行。
+        BatchLoopFact fact;
+        fact.id = analysis.inductionVariables.lookup(loop.getInductionVar());
+        fact.bits = analysis.bits(loop.getInductionVar().getType());
+        fact.lower = analysis.integer(loop.getLowerBound(), {});
+        fact.upper = analysis.integer(loop.getUpperBound(), {});
+        fact.step = analysis.integer(loop.getStep(), {});
+        // 跨行归约在 IR 里的对应物就是 iter_args，判定层的关卡 1.5a 查的是这一位
+        // （设计 §2.4 第 13 行）。这里是它全程唯一的生产者。
+        fact.carriesValues = batchLoopCarriesValues(loop);
+        loops.push_back(std::move(fact));
       }
     }
     E mask = analysis.mask(predicate, axes);
@@ -633,15 +632,29 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
   });
   if (analysis.report.reason.empty() && analysis.report.accesses.empty())
     analysis.report.reason = "NO_MEMORY_ACCESSES";
+  // 把按访存挂的循环事实收成函数级一份，同一条循环只留一次。上面已经按由内向外
+  // 的次序填好了每条访存的 loops，这里只做去重与排序，不重新证任何东西。
+  if (analysis.report.reason.empty()) {
+    llvm::DenseMap<unsigned, const BatchLoopFact *> byID;
+    for (const auto &fact : analysis.report.accesses)
+      for (const auto &loop : fact.loops)
+        byID.try_emplace(loop.id, &loop);
+    SmallVector<unsigned> ids(llvm::make_first_range(byID));
+    llvm::sort(ids);
+    for (unsigned id : ids)
+      analysis.report.loops.push_back(*byID[id]);
+  }
   if (analysis.report.reason.empty()) {
     A accesses;
     for (const auto &fact :
          jointScalarStoreEffects(function, analysis.report.accesses)) {
-      A checks, shape;
+      A checks, shape, loops;
       for (const auto &step : fact.pointerChecks)
         checks.push_back(batchExprJSON(step));
       for (int64_t extent : fact.shape)
         shape.push_back(extent);
+      for (const auto &loop : fact.loops)
+        loops.push_back(batchLoopJSON(loop));
       accesses.push_back(
           llvm::json::Object{{"root", fact.root},
                              {"offset", batchExprJSON(fact.byteOffset)},
@@ -650,7 +663,7 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
                              {"write", fact.write},
                              {"bytes", fact.bytes},
                              {"pointer_checks", std::move(checks)},
-                             {"loops", A(fact.loops)},
+                             {"loops", std::move(loops)},
                              {"volatile", fact.isVolatile},
                              {"device_address", fact.deviceAddress}});
     }

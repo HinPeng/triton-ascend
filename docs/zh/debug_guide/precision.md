@@ -6,11 +6,11 @@
 
 ### 基本步骤
 
-1. **获取参考结果**（Golden）：使用等价 Torch 算子在 CPU/GPU/NPU 上计算结果或者相同 Triton 算子在 CPU/GPU 上的计算结果
+1. **获取参考结果**（Golden）：使用等价Torch算子在CPU/GPU/NPU上计算结果或者相同Triton算子在CPU/GPU上的计算结果
 
-2. **获取 Triton 结果**：在昇腾 NPU 上运行 Triton kernel 得到计算结果
+2. **获取 Triton 结果**：在昇腾NPU上运行Triton kernel得到计算结果
 
-3. **对比判断**：使用 `torch.testing.assert_close` 判断是否满足精度要求
+3. **对比判断**：使用`torch.testing.assert_close`判断是否满足精度要求
 
 ### 示例：向量加法（Vector Add）
 
@@ -37,20 +37,25 @@ def test_vector_add(n, dtype):
         tl.store(out_ptr + idx, a + b)
 
     def triton_func(x, y):
-        out = torch.empty_like(x)
-        add_kernel[(1,)](x.npu(), y.npu(), out, n=x.numel())
+        x_dev = x.npu()
+        y_dev = y.npu()
+        out = torch.empty_like(x_dev)
+        add_kernel[(1,)](x_dev, y_dev, out, n=x.numel())
         return out
 
     triton_cal = triton_func(x, y)
 
     # 4. 精度对比
     compare_precision(triton_cal.cpu(), torch_ref)
+
+# 5. 运行测试
+test_vector_add(16,torch.float16)
 ```
 
 ## 2. 精度对比函数
 
 ```python
-def compare_precision(cal, ref):
+def compare_precision(cal, ref, rtol=1e-3, atol=1e-3):
     """
     精度对比函数：根据数据类型选择合适的比对策略。
 
@@ -67,13 +72,13 @@ def compare_precision(cal, ref):
     tensor_dtype = cal.dtype
 
     if tensor_dtype == torch.float16:
-        torch.testing.assert_close(ref, cal, rtol=1e-3, atol=1e-3, equal_nan=True)
+        torch.testing.assert_close(cal, ref, rtol=rtol, atol=atol, equal_nan=True)
 
     elif tensor_dtype == torch.bfloat16:
-        torch.testing.assert_close(ref, cal, rtol=5e-3, atol=5e-3, equal_nan=True)
+        torch.testing.assert_close(cal, ref, rtol=5e-3, atol=5e-3, equal_nan=True)
 
     elif tensor_dtype == torch.float32:
-        torch.testing.assert_close(ref, cal, rtol=1e-5, atol=1e-5, equal_nan=True)
+        torch.testing.assert_close(cal, ref, rtol=1e-5, atol=1e-5, equal_nan=True)
 
     elif tensor_dtype in [torch.int64, torch.int32, torch.int16, torch.int8]:
         assert torch.equal(cal, ref), f"Integer tensors are not equal for dtype {tensor_dtype}"
@@ -99,7 +104,7 @@ def compare_precision(cal, ref):
 
 `torch.testing.assert_close` 的内部逻辑：
 
-```
+```python
 |cal - ref| <= atol + rtol * |ref|
 ```
 
@@ -114,7 +119,6 @@ def compare_precision(cal, ref):
 | `bfloat16` | 5e-3 | 5e-3 | 精度较低，适当放宽 |
 | `int8/16/32/64` | — | — | 必须完全一致（`torch.equal`） |
 | `bool` | — | — | 必须完全一致（`torch.equal`） |
-
 
 ## 4. 注意事项
 
