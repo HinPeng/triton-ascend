@@ -118,7 +118,7 @@ def test_disabled_request_preserves_identity_reshape(tmp_path):
     assert str(ir) == before
 
 
-def test_loop_store_remains_rejected_after_identity_normalization(tmp_path):
+def test_loop_store_alias_remains_guarded_after_identity_normalization(tmp_path):
     from block_batching_control_flow_cases import control_ir
     text = control_ir("for_accumulate").replace(
         "scf.yield %updated : f32",
@@ -131,7 +131,8 @@ def test_loop_store_remains_rejected_after_identity_normalization(tmp_path):
         '}) : (tensor<4xf32>) -> f32\n'
         "tt.store %out, %r : !tt.ptr<f32>\nscf.yield %updated : f32")
     ir = parse(tmp_path, text)
-    before = str(ir)
     report = ascend.passes.ttir.rewrite_block_batching(ir, 3, 0)
-    assert report["reason"] == "LOOP_WRITE_NOT_IMPLEMENTED"
-    assert str(ir) == before
+    assert report['compile_status'] == 'REWRITTEN', report
+    assert ir.verify()
+    spec = json.loads(report['guard_json'])
+    assert guard.check_guard(spec, [1 << 32, 1 << 40, 7, 4], (7, 1, 1), 3) == (False, 'OVERLAPPING_BLOCK_WRITES')

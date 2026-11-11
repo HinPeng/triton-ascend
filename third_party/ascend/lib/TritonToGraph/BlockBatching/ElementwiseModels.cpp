@@ -9,17 +9,32 @@
 
 namespace mlir::triton::cfg {
 namespace {
+bool hasSafeConstantPowExponent(triton::ExternElementwiseOp call) {
+  auto constant = call.getOperand(1).getDefiningOp<arith::ConstantOp>();
+  if (!constant)
+    return false;
+  auto value = dyn_cast<DenseFPElementsAttr>(constant.getValue());
+  if (!value || !value.isSplat())
+    return false;
+  double exponent = value.getSplatValue<APFloat>().convertToDouble();
+  // SIMT pow casts abs(exponent) to signed i32. Both endpoints are
+  // excluded: abs(INT32_MIN) is not representable. NaN/Inf fail the same
+  // comparisons. Keep the original literal; do not rewrite pow's math.
+  return exponent > -2147483648.0 && exponent < 2147483648.0;
+}
+
 BatchInactivePolicy inactivePolicy(Operation *op,
                                    const BatchOpDescriptor &descriptor,
                                    unsigned operand) {
   // The registered f32 tanh entry lowers to floating min/max, exp and div.
   // None has immediate integer UB on an inactive lane, including NaN/Inf.
   // pow's base also enters only floating arithmetic or bit reinterpretation;
-  // its exponent retains sanitization because SIMT pow can cast that value.
+  // its exponent retains sanitization unless its literal is cast-safe.
   // Unknown external signatures retain the conservative descriptor policy.
   if (auto call = dyn_cast<triton::ExternElementwiseOp>(op))
     if ((call.getSymbol() == "__hmf_tanhf" ||
-         (call.getSymbol() == "__hmf_pow_fp32" && operand == 0)) &&
+         (call.getSymbol() == "__hmf_pow_fp32" &&
+          (operand == 0 || hasSafeConstantPowExponent(call)))) &&
         call.getPure() &&
         call.getLibname().empty() && call.getLibpath().empty())
       return BatchInactivePolicy::IEEE;

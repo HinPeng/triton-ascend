@@ -1,5 +1,6 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #include "TritonToGraph/BlockBatching/BatchAccessAnalysis.h"
+#include "TritonToGraph/BlockBatching/BatchFactsJSON.h"
 #include "TritonToGraph/BlockBatching/BatchLayoutPlan.h"
 #include "TritonToGraph/BlockBatching/BatchLoopForm.h"
 #include "TritonToGraph/BlockBatching/BatchLoopLegality.h"
@@ -703,6 +704,8 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   }
   if (request.factor > 64)
     return reject("FACTOR_EXCEEDS_LANE_CAPACITY");
+  if (!request.cv)
+    report.vvLowering = "vector_lanes_v1";
   if (request.cv && !llvm::isPowerOf2_64(request.factor))
     return reject("CV_FACTOR_REQUIRES_POWER_OF_TWO");
   // Memory-view folding is a VV optimization with a different proof. Do not
@@ -900,6 +903,19 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       diagnosticOp = access.operation;
     return reject(access.reason);
   }
+  if (request.axis < 0 && !request.cv && !request.semanticOnly) {
+    // Prefer a proven contiguous column region, without timing, factor
+    // selection or operator-specific patterns. Unknown/non-pointwise cases
+    // retain the deterministic axis picked above; explicit axes are fixed.
+    SmallVector<int64_t, 3> extents = staticGridExtents(module);
+    for (int candidate = 0; candidate < 3; ++candidate)
+      if (axes[candidate] && (extents.empty() || extents[candidate] > 1) &&
+          hasBatchColumnPointwiseRegion(function, access, candidate,
+                                        request.factor)) {
+        axis = candidate;
+        break;
+      }
+  }
   report.guardJSON = access.guardJSON;
   for (const auto &fact : access.accesses)
     if (fact.deviceAddress)
@@ -1046,6 +1062,56 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   object["terminal_read_ids"] = std::move(terminalReads);
   object["obligations"] = std::move(obligations);
   report.guardJSON = llvm::formatv("{0}", *guard).str();
+  // The same fact/coordinate/legality pipeline handles a single uniform
+  // in-program loop as well as the existing cyclic program-axis loop.
+  scf::ForOp scheduledLoop = form.programLoop;
+  const BatchLoopFact *scheduledFact = programLoop;
+  auto scheduledLegality = legality;
+  if (!scheduledLoop && access.loops.size() == 1 &&
+      report.operations.count("scf.for") && report.operations.at("scf.for") == 1) {
+    function.walk([&](scf::ForOp loop) {
+      if (loop->getParentOp() == function.getOperation() &&
+          !control.isVarying(loop.getLowerBound()) &&
+          !control.isVarying(loop.getUpperBound()) &&
+          !control.isVarying(loop.getStep()))
+        scheduledLoop = loop;
+    });
+    if (scheduledLoop) {
+      scheduledFact = &access.loops.front();
+      scheduledLegality = isSafeToBatchLoop(scheduledFact, ranges, axis);
+    }
+  }
+  auto loopLowering = selectBatchLoopLowering(
+      scheduledFact, scheduledLegality.axis ? &*scheduledLegality.axis : nullptr,
+      ranges, request.factor);
+  if (!request.cv && !request.semanticOnly &&
+      loopLowering == BatchLoopLowering::SequentialIterations) {
+    if (validated.size() > 8192 / request.factor)
+      return reject("LOOP_GROUP_CODE_SIZE_EXCEEDED");
+    object["loop_schedule"] = llvm::json::Object{
+        {"version", 1}, {"kind", "sequential_iterations_v1"},
+        {"grid_policy", "preserve"}, {"factor", request.factor},
+        {"loop", batchLoopJSON(*scheduledFact)}};
+    report.guardJSON = llvm::formatv("{0}", *guard).str();
+    report.vvLowering = "sequential_iterations_v1";
+    report.selectedAxis = axis;
+    report.laneWidth = request.factor;
+    report.layoutJSON = serializeBatchLayouts({});
+    if (failed(groupBatchLoopIterations(scheduledLoop, request.factor)))
+      return failure();
+    Builder builder(module.getContext());
+    module->setAttr("hacc.block_mapping_owner",
+                    builder.getStringAttr("block_batching"));
+    function->setAttr("hacc.block_mapping_owner",
+                      builder.getStringAttr("block_batching"));
+    // No program-grid transform or hidden extent arguments: program IDs,
+    // original loop strides and terminal recurrence slots keep their ABI.
+    if (failed(verify(module)))
+      return failure();
+    report.status = "REWRITTEN";
+    report.reason = "";
+    return report;
+  }
   bool maskedBatch = false;
   if (request.cv) {
     report.cvLowering = "rank3_batch_v1";
@@ -1231,7 +1297,31 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   auto &layouts = plan.layouts;
   layouts = planBatchLayouts(access, axis, request.factor);
   report.layoutJSON = serializeBatchLayouts(layouts);
-
+  // Extend the existing pointwise memory-view requirement to a proved
+  // uniform loop. Mere presence of scf.for is not a refusal: the loop facts
+  // must show no recurrence, and every independent row access must remain
+  // unbridged inside that same loop. Reductions and other layouts retain
+  // their established paths.
+  if (!request.cv && scheduledFact && !scheduledFact->carriesValues &&
+      scheduledLegality.safe && scheduledLegality.axis &&
+      scheduledLegality.axis->distribution == BatchLogicalAxis::Blocked &&
+      batchLoopBoundsAreLaneUniform(*scheduledFact, ranges) &&
+      !report.operations.count("scf.if") && !report.operations.count("tt.reduce") &&
+      !report.operations.count("tt.scan") && !report.operations.count("tt.dot") &&
+      !layouts.empty() &&
+      llvm::all_of(layouts, [&](const BatchLayoutPlan &layout) {
+        const auto &fact = access.accesses[layout.accessID];
+        return layout.action == BatchLayoutPlan::Keep &&
+               layout.reason == "ALREADY_STRUCTURED" &&
+               layout.maskClass == "independent_axes" &&
+               !fact.deviceAddress && !fact.isVolatile &&
+               !fact.shape.empty() &&
+               llvm::count_if(fact.shape, [](int64_t size) { return size != 1; }) <= 1 &&
+               fact.loops.size() == 1 && fact.loops.front().id == scheduledFact->id;
+      })) {
+    diagnosticOp = scheduledLoop;
+    return reject("LOOP_POINTWISE_MEMORY_VIEW_REQUIRED");
+  }
   // 新关卡：有程序轴循环时，圈内访存必须全部被布局层证下来。
   //
   // 没有循环时 Keep 是安全的：证不出就不改写，交回通用的 lane 加宽，程序号派生

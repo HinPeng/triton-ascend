@@ -2,6 +2,8 @@
 #include "TritonToGraph/BlockBatching/BatchFactsJSON.h"
 #include "TritonToGraph/BlockBatching/BatchLayoutPlan.h"
 #include "TritonToGraph/BlockBatching/BatchOpRegistry.h"
+#include "TritonToGraph/BlockBatching/ControlFlowModels.h"
+#include "TritonToGraph/BlockBatching/ElementwiseModels.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
@@ -435,6 +437,56 @@ struct PointwiseRegion {
   }
 };
 } // namespace
+bool hasBatchColumnPointwiseRegion(triton::FuncOp function,
+                                  const BatchAccessReport &accesses,
+                                  int axis, int64_t factor) {
+  auto plans = planBatchLayouts(accesses, axis, factor);
+  if (plans.empty())
+    return false;
+  PointwiseRegion region;
+  region.block = &function.getBody().front();
+  region.semanticShape = plans.front().shape;
+  for (const auto &plan : plans) {
+    if (plan.action != BatchLayoutPlan::PointwiseRegion ||
+        !plan.linearMemoryView || plan.shape != region.semanticShape ||
+        plan.localAxes != SmallVector<int64_t>{1} ||
+        !isConstant(plan.elementStride, 1) || !supportedUpper(plan.upper) ||
+        llvm::any_of(plan.residualMasks, [&](BatchExprRef predicate) {
+          return !supportedPredicate(predicate, axis, plan.localAxes);
+        }))
+      return false;
+    const auto &access = accesses.accesses[plan.accessID];
+    if (access.deviceAddress || !access.loops.empty() ||
+        access.operation->getBlock() != region.block)
+      return false;
+    if (isa<triton::LoadOp>(access.operation))
+      region.loads.insert(access.operation);
+    else if (isa<triton::StoreOp>(access.operation))
+      region.stores.insert(access.operation);
+    else
+      return false;
+  }
+  if (region.loads.empty() || region.stores.empty() || !region.verify())
+    return false;
+  auto control = analyzeBatchControlFlow(function, axis);
+  if (!control.reason.empty())
+    return false;
+  // A scalar program-id expression becomes lane-varying after batching;
+  // unlike a shared scalar parameter, it cannot be splatted into this map.
+  for (Value value : region.checked)
+    if (Value scalar = region.uniformScalar(value))
+      if (control.isVarying(scalar))
+        return false;
+  // Newly introduced lane masks are not part of the closed source region.
+  // Leave poison-sensitive arithmetic on the existing axis-selection path.
+  for (Operation *op : region.oldOperations)
+    if (const auto *descriptor = lookupBatchOp(op->getName().getStringRef()))
+      if (descriptor->model == BatchModel::Elementwise &&
+          needsBatchActiveMask(op, *descriptor))
+        return false;
+  return true;
+}
+
 LogicalResult rewriteBatchMemoryViews(ModuleOp module,
                                       const BatchAccessReport &accesses,
                                       SmallVectorImpl<BatchLayoutPlan> &plans,

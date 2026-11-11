@@ -7,7 +7,7 @@ compiler artifacts; rejected or guarded calls select the complete baseline.
 """
 from dataclasses import dataclass
 
-IMPLEMENTATION_VERSION = 40
+IMPLEMENTATION_VERSION = 44
 
 
 def _annotate_launch_grid(kwargs, grid, *, bind=None):
@@ -290,6 +290,9 @@ class BatchKernel:
         self.baseline, self.candidate = baseline, candidate
         self.request, self.block_batching = request, report
         self.positions = positions
+        from .block_batching_report import validate_vv_loop_contract
+        self._preserve_grid = (validate_vv_loop_contract(candidate.metadata._asdict())
+                               if candidate is not None else False)
         from .block_batching_guard import RuntimeGuard
         self._guard = RuntimeGuard(report["guard"], request.factor) if candidate is not None else None
         self._primary = candidate if candidate is not None else baseline
@@ -366,7 +369,8 @@ class BatchKernel:
                 # VV candidates protect partial groups with a lane mask and
                 # safe inactive operands. CV still requires complete groups.
                 reason = "CV_GRID_NOT_DIVISIBLE"
-            elif not _reduces_blocks(grid, self.block_batching["selected_axis"], self.request.factor):
+            elif not self._preserve_grid and not _reduces_blocks(
+                    grid, self.block_batching["selected_axis"], self.request.factor):
                 # The device task domain is one dimensional: prepareGrid divides
                 # the selected axis and then multiplies all three extents. An
                 # axis too short to divide leaves that product untouched while
@@ -374,7 +378,7 @@ class BatchKernel:
                 # the original extent is masked-off work bought for nothing.
                 reason = "GRID_NOT_REDUCED"
             elif _batched_blocks(grid, self.block_batching["selected_axis"],
-                                 self.request.factor) < _core_floor():
+                                 1 if self._preserve_grid else self.request.factor) < _core_floor():
                 # Apply the configured available-core scheduling floor. Its
                 # performance tradeoff is validated separately by workload.
                 reason = "GRID_BELOW_CORE_FLOOR"
@@ -392,7 +396,7 @@ class BatchKernel:
         result = selected.run(*forwarded)
         factor = self.request.factor if accepted else 1
         batch_grid = list(grid)
-        if accepted:
+        if accepted and not self._preserve_grid:
             axis = self.block_batching["selected_axis"]
             batch_grid[axis] = (grid[axis] + factor - 1) // factor
         self._local.launch = {
@@ -401,6 +405,7 @@ class BatchKernel:
             factor, "selected_axis": self.block_batching.get("selected_axis"), "original_grid": grid, "batch_grid":
             tuple(batch_grid), "reason": reason, "plan_id": self.hash
         }
+        self._local.launch['grouping'] = 'loop_iterations' if accepted and self._preserve_grid else 'programs'
         if knobs.ascend.compile_only:
             self._local.launch.update(runtime_status="NOT_LAUNCHED", reason="COMPILE_ONLY")
         return result
@@ -513,6 +518,8 @@ def compile_bundle(backend, src, options, compile_variant):
         if (not validate_plan_binding(guard)
                 or getattr(candidate.metadata, "block_batching_plan_sha256", None) != guard.get("plan_fingerprint")):
             raise BatchingRejected("CANDIDATE_PLAN_CHANGED")
+        from .block_batching_report import validate_vv_loop_contract
+        validate_vv_loop_contract(candidate.metadata._asdict())
         report = dict(native_report)
         if layout_fallback:
             report["layout"] = dict(report["layout"], requested_policy="auto", selected_policy="semantic_only",

@@ -154,6 +154,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
         report["operations"] = result->operations;
         report["cv_mode"] = result->cvMode;
         report["cv_lowering"] = result->cvLowering;
+        report["vv_lowering"] = result->vvLowering;
         report["structured_masks"] = result->structuredMasks;
         report["tail_policy"] = cv ? "full_groups_only" : "masked";
         return report;

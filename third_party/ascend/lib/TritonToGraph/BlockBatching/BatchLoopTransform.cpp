@@ -1,8 +1,20 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #include "TritonToGraph/BlockBatching/BatchLoopTransform.h"
+#include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 namespace mlir::triton::cfg {
+LogicalResult groupBatchLoopIterations(scf::ForOp loop, int64_t factor) {
+  MLIRContext *context = loop.getContext();
+  auto grouped = loopUnrollByFactor(loop, factor);
+  if (failed(grouped))
+    return failure();
+  // Match the existing Triton loop-unroll epilogue contract.
+  if (grouped->epilogueLoopOp)
+    (*grouped->epilogueLoopOp)->setAttr(
+        "tt.num_stages", IntegerAttr::get(IntegerType::get(context, 32), 1));
+  return success();
+}
 namespace {
 
 // 界表达式在实测 kernel 里都只有两三个 op，这个预算只是防病态输入。

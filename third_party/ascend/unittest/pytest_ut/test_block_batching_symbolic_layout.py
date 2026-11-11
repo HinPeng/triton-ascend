@@ -4,7 +4,7 @@ import pytest
 from triton._C.libtriton import ascend
 from triton.backends.ascend.block_batching_guard import RuntimeGuard
 from test_block_batching_rewrite import parse
-from block_batching_symbolic_cases import symbolic_memory_ir
+from block_batching_symbolic_cases import symbolic_memory_ir, symbolic_columns_ir
 
 pytestmark = pytest.mark.backend("native")
 
@@ -91,4 +91,59 @@ def test_symbolic_column_layout_is_not_silently_enabled(tmp_path):
     assert all(not p["rewritten"] and p["reason"] == "SYMBOLIC_LAYOUT_BRIDGE_UNSUPPORTED"
                for p in json.loads(report["layout_json"])["accesses"])
     assert "layout_checks" not in json.loads(report["guard_json"])
+    assert module.verify()
+
+
+@pytest.mark.parametrize("factor", [2, 3, 6])
+def test_unit_columns_with_dynamic_row_strides_use_closed_pointwise_region(tmp_path, factor):
+    module = parse(tmp_path, symbolic_columns_ir())
+    report = ascend.passes.ttir.rewrite_block_batching(module, factor, 1)
+    assert report['compile_status'] == 'REWRITTEN', report
+    plans = json.loads(report['layout_json'])['accesses']
+    assert all(p['action'] == 'PointwiseRegion' and p['rewritten'] for p in plans)
+    assert module.verify()
+    assert 'tt.trans' not in str(module)
+    assert f'tensor<2x{factor * 4}xf32>' in str(module)
+    guard = json.loads(report['guard_json'])
+    guard['axis'] = 1
+    assert len(guard['layout_checks']) == 2
+    runtime = RuntimeGuard(guard, factor)
+    assert runtime([1 << 32, 1 << 45, 3, 17, 31, 37], (2, 5, 1))[0]
+    assert runtime([1 << 32, 1 << 45, 3, 17, 32, 48], (2, 5, 1))[0]
+    assert not runtime([1 << 32, 1 << 45, 3, 17, 31, 2], (2, 5, 1))[0]
+    assert not runtime([1 << 32, 1 << 32, 3, 17, 31, 31], (2, 5, 1))[0]
+
+
+@pytest.mark.parametrize('axis,policy,selected', [(-1, 'auto', 1), (0, 'auto', 0),
+                                                (1, 'auto', 1), (-1, 'semantic_only', 0)])
+def test_auto_axis_uses_proven_column_region_and_preserves_explicit_axis(tmp_path, axis, policy, selected):
+    module = parse(tmp_path, symbolic_columns_ir())
+    report = ascend.passes.ttir.rewrite_block_batching(module, 2, axis, policy)
+    assert report['compile_status'] == 'REWRITTEN', report
+    assert report['selected_axis'] == selected
+    assert module.verify()
+
+
+def test_auto_column_selection_respects_singleton_grid_hint(tmp_path):
+    source = symbolic_columns_ir().replace('module {',
+        'module attributes {hacc.block_batching_grid = [128 : i32, 1 : i32, 1 : i32]} {')
+    module = parse(tmp_path, source)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 2, -1)
+    assert report['compile_status'] == 'REWRITTEN', report
+    assert report['selected_axis'] == 0
+
+
+@pytest.mark.parametrize('calculation', [
+    '%pf = arith.sitofp %column_p : i32 to f32\n'
+    '    %pv = tt.splat %pf : f32 -> tensor<2x4xf32>\n'
+    '    %out = arith.addf %v, %pv : tensor<2x4xf32>',
+    '%cast = arith.fptosi %v : tensor<2x4xf32> to tensor<2x4xi32>\n'
+    '    %out = arith.sitofp %cast : tensor<2x4xi32> to tensor<2x4xf32>',
+])
+def test_auto_column_selection_retains_old_axis_for_unbridged_dataflow(tmp_path, calculation):
+    source = symbolic_columns_ir().replace('%out = arith.addf %v, %one : tensor<2x4xf32>', calculation)
+    module = parse(tmp_path, source)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 2, -1)
+    assert report['compile_status'] == 'REWRITTEN', report
+    assert report['selected_axis'] == 0
     assert module.verify()

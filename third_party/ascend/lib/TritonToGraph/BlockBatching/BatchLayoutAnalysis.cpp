@@ -365,9 +365,13 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
         plan.symbolic = address->symbolic();
         plan.elementOrigin = origin->expression();
         plan.elementStride = stride->expression();
-        // First symbolic emitter supports leading (row) groups only. Column
-        // region propagation remains on the previously verified constant path.
-        if (plan.symbolic && !leading) {
+        // Unit-stride columns can use the same closed pointwise-region map
+        // with dynamic row pitches. The emitter preserves those pitches and
+        // publishes guards for every new wide address intermediate. Keep
+        // non-unit symbolic column strides on the original semantic path.
+        bool contiguousColumn = columnRegion && stride->parameters.empty() &&
+                                stride->constant == 1;
+        if (plan.symbolic && !leading && !contiguousColumn) {
           plan.action = BatchLayoutPlan::Keep;
           plan.reason = "SYMBOLIC_LAYOUT_BRIDGE_UNSUPPORTED";
           plans.push_back(std::move(plan));
@@ -393,13 +397,11 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
           if (key.first != K::Coordinate && key.first != K::Program &&
               key.first != K::Grid && key.first != K::Induction)
             simple = false;
-          // Defer nonfused dynamic strides until their target lowering has a
-          // dedicated contract; this slice is the dynamic row-stride model.
-          //
-          // 圈内偏移是那条契约的第一个持有者，所以单独放行：真实 kernel 的行步长
-          // 是运行期参数，圈内偏移的系数必然带参数，不放行它就永远到不了发射器。
-          // 其余种类仍然挡着——给它们放行是另一桩没验证过的行为变更。
-          if (!scaled->parameters.empty() && key.first != K::Induction)
+          // A closed unit-column region retains other coordinates and their
+          // parameter-affine pitches, without permuting its computation.
+          // Other layouts still require the previously supported loop term.
+          if (!scaled->parameters.empty() && key.first != K::Induction &&
+              !contiguousColumn)
             simple = false;
           int64_t c = scaled->constant;
           plan.restTerms.push_back(
