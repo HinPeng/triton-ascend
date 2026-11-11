@@ -66,6 +66,7 @@ def test_dangerous_operands_are_selected_before_evaluation(tmp_path, op):
             operands = re.findall(r"%[\w]+", body.split(":", 1)[0])
             assert operands
             assert all(definitions[value].startswith("arith.select ") for value in operands)
+            assert all("hacc.block_batching_safe_input" in definitions[value] for value in operands)
         definitions[name] = body
     assert computation is not None
 
@@ -92,3 +93,19 @@ def test_unsigned_ceildiv_avoids_overflowing_expansion(tmp_path):
     assert "arith.divui" in text and "arith.remui" in text
     assert "arith.cmpi ne" in text and "arith.extui" in text
     assert module.verify()
+
+
+@pytest.mark.parametrize("op, marker", [("arith.cmpf", " = true"), ("arith.maximumf", "")])
+def test_safety_hint_rejects_wrong_type_or_operation(tmp_path, op, marker):
+    text = case_ir(op)
+    if op == "arith.cmpf":
+        text = text.replace("%predicate, %v, %onef :", "%predicate, %v, %onef {hacc.block_batching_safe_input" + marker + "} :")
+    else:
+        text = text.replace('"arith.maximumf"(%v, %denomf)',
+                            '"arith.maximumf"(%v, %denomf) {hacc.block_batching_safe_input}')
+    module = parse(tmp_path, text)
+    original = str(module)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 2, 0)
+    assert report["compile_status"] == "REJECTED", report
+    assert report["reason"] == "UNSUPPORTED_OPERATION_ATTRIBUTE", report
+    assert str(module) == original

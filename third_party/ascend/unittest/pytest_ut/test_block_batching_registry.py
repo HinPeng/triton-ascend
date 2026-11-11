@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 
 import pytest
+from triton.backends.ascend.block_batching import IMPLEMENTATION_VERSION
 
 from block_batching_op_cases import W1_OPS, W2_OPS
 

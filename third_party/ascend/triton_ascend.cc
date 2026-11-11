@@ -16,6 +16,8 @@
 #include "ascend/include/TritonToAnnotation/Passes.h"
 #include "ascend/include/TritonToGraph/BlockBatching/BatchOpRegistry.h"
 #include "ascend/include/TritonToGraph/BlockBatching/BatchPlan.h"
+#include "ascend/include/TritonToGraph/BlockBatching/MemoryModels.h"
+#include "ascend/include/TritonToGraph/BlockBatching/ReductionModels.h"
 #include "ascend/include/TritonToGraph/GraphOptimization.h"
 #include "ascend/include/TritonToGraph/LayoutMemoryOptimization.h"
 #include "ascend/include/TritonToGraph/Passes.h"
@@ -89,6 +91,10 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
     }
     return result;
   });
+  m.def("block_batching_has_dynamic_contiguous_copy",
+        &mlir::triton::cfg::hasBatchDynamicContiguousCopy);
+  m.def("lower_block_batching_scans",
+        &mlir::triton::cfg::lowerBatchLaneScans);
   m.def("clear_block_batching_owner", [](mlir::ModuleOp module) {
     auto owner =
         module->getAttrOfType<mlir::StringAttr>("hacc.block_mapping_owner");
