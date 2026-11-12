@@ -24,6 +24,28 @@ CV_AUTO_BLOCKIFY_LOWERINGS = (
 )
 
 
+def validate_vv_loop_contract(metadata):
+    report = metadata.get('block_batching', {})
+    guard = report.get('guard', {})
+    grouped = report.get('vv_lowering') == 'sequential_iterations_v1'
+    if not grouped and 'loop_schedule' not in guard:
+        return False
+    from .block_batching_guard import GuardFailure
+    from .block_batching_guard_v3 import iteration_schedule
+    try:
+        loop = iteration_schedule(guard, report['lane_width'])
+    except (GuardFailure, KeyError, TypeError) as error:
+        raise BatchingRejected('VV_LOOP_SCHEDULE_MISMATCH') from error
+    if (not grouped or loop is None or report.get('cv_mode') != 'disabled'
+            or metadata.get('program_grid_transforms') is not None
+            or metadata.get('program_grid_mapping_applied') is not False
+            or metadata.get('row_coalescing_applied') is not False
+            or metadata.get('ptsm_cap_authorized') is not False
+            or metadata.get('coalesce_factor', 1) != 1):
+        raise BatchingRejected('VV_LOOP_GRID_CONTRACT_MISMATCH')
+    return True
+
+
 def _validate_cv_contract(metadata):
     from .program_grid import normalize_program_grid_transforms
     report = metadata["block_batching"]
@@ -113,6 +135,8 @@ def validate_compilation_result(metadata):
         raise BatchingRejected("UNSUPPORTED_FINAL_EXECUTION_MODE")
     if cv:
         _validate_cv_contract(metadata)
+    else:
+        validate_vv_loop_contract(metadata)
     metadata["block_batching"].update(
         compile_status="COMPILED_GUARDED",
         owner="block_batching",

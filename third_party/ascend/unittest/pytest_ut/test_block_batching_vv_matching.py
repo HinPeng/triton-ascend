@@ -68,3 +68,22 @@ def test_other_structures_keep_their_existing_admission(kind):
     elif kind == "unknown_mask":
         value["layout"]["accesses"][0]["mask_class"] = "unknown"
     assert batching.vv_layout_refusal(value) is None
+
+
+@pytest.mark.parametrize('shape', [[1, 256], [256, 1], [1, 256, 1]])
+def test_singleton_dimensions_preserve_independent_row_decision(shape):
+    value = report()
+    for access in value['layout']['accesses']:
+        access['original_shape'] = shape
+    assert batching.vv_layout_refusal(value) == 'VV_POINTWISE_MEMORY_VIEW_REQUIRED'
+
+
+@pytest.mark.parametrize('op', ['scf.if', 'scf.for'])
+def test_value_only_control_flow_keeps_memory_view_requirement(op):
+    value = report()
+    value['operations'][op] = 1
+    for access in value['layout']['accesses']:
+        access['control_flow_independent'] = True
+    assert batching.vv_layout_refusal(value) == 'VV_POINTWISE_MEMORY_VIEW_REQUIRED'
+    value['layout']['accesses'][0]['control_flow_independent'] = False
+    assert batching.vv_layout_refusal(value) is None

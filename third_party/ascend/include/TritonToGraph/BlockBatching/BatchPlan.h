@@ -51,6 +51,7 @@ struct BatchRewriteReport : BatchAnalysisReport {
   std::string guardJSON;
   std::string cvMode = "disabled";
   std::string cvLowering = "disabled";
+  std::string vvLowering = "disabled";
   unsigned structuredMasks = 0;
   int selectedAxis = -1;
   int64_t laneWidth = 1;

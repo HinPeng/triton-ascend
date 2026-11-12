@@ -1,8 +1,42 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #include "TritonToGraph/BlockBatching/BatchLoopTransform.h"
+#include "mlir/Dialect/SCF/Utils/Utils.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 namespace mlir::triton::cfg {
+LogicalResult groupBatchLoopIterations(scf::ForOp loop, int64_t factor) {
+  // Recheck the actual IR immediately before the upstream utility, which
+  // performs host arithmetic for static bounds. Keep direct callers safe too.
+  BatchLoopFact fact;
+  auto type = dyn_cast<IntegerType>(loop.getInductionVar().getType());
+  fact.bits = type ? type.getWidth() : 64;
+  auto bound = [&](Value value) -> BatchExprRef {
+    llvm::APInt constant;
+    if (!matchPattern(value, m_ConstantInt(&constant)))
+      return BatchExpr::leaf(BatchExpr::Argument, 0, fact.bits);
+    if (!constant.isSignedIntN(64))
+      return {};
+    return BatchExpr::leaf(BatchExpr::Constant, constant.getSExtValue(),
+                           fact.bits);
+  };
+  fact.lower = bound(loop.getLowerBound());
+  fact.upper = bound(loop.getUpperBound());
+  fact.step = bound(loop.getStep());
+  if (!fact.lower || !fact.upper || !fact.step ||
+      batchLoopIterationArithmetic(fact, BatchRangeFacts(0), factor) ==
+          BatchLoopArithmetic::Unsafe)
+    return failure();
+  MLIRContext *context = loop.getContext();
+  auto grouped = loopUnrollByFactor(loop, factor);
+  if (failed(grouped))
+    return failure();
+  // Match the existing Triton loop-unroll epilogue contract.
+  if (grouped->epilogueLoopOp)
+    (*grouped->epilogueLoopOp)->setAttr(
+        "tt.num_stages", IntegerAttr::get(IntegerType::get(context, 32), 1));
+  return success();
+}
 namespace {
 
 // 界表达式在实测 kernel 里都只有两三个 op，这个预算只是防病态输入。

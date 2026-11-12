@@ -417,7 +417,9 @@ def make_ttir(mod, metadata, opt):
         report["owner"] = "block_batching"
         refusal = batching_vv_layout_refusal(report)
         if refusal:
-            raise BatchingRejected(refusal)
+            raise BatchingRejected(refusal, analysis={
+                key: report[key] for key in ("selected_axis", "operations", "layout")
+            })
         report["plan_id"] = metadata["hash"]
         report["candidate_factor"] = opt.block_batching_factor
         metadata["block_batching"] = report

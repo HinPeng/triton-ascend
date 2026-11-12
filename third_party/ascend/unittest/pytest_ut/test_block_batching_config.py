@@ -10,7 +10,7 @@ from triton.runtime import driver
 @pytest.fixture
 def device(monkeypatch):
     utils = SimpleNamespace(get_device_core=lambda: (32, 64))
-    for name in ('_get_npu_device_limit_form_env', 'get_device_properties', 'get_aicore_num'):
+    for name in ('_get_npu_device_limit_form_env', 'get_device_properties', 'get_aicore_num', 'get_aivector_core_num'):
         setattr(utils, name, MethodType(getattr(NPUUtils, name), utils))
     monkeypatch.setattr(driver, '_active', SimpleNamespace(utils=utils))
     monkeypatch.delenv('TA_BLOCK_BATCHING_CORE_FLOOR', raising=False)
@@ -18,11 +18,11 @@ def device(monkeypatch):
     return utils
 
 
-@pytest.mark.parametrize('limit,expected', [(None, 32), ('16,32', 16), ('8,16', 8), (' 8, 16 ', 8)])
-def test_core_floor_uses_available_aic(device, monkeypatch, limit, expected):
+@pytest.mark.parametrize('limit,expected', [(None, 64), ('16,32', 32), ('8,16', 16), (' 8, 16 ', 16)])
+def test_core_floor_uses_available_aiv(device, monkeypatch, limit, expected):
     if limit is not None:
         monkeypatch.setenv('NPU_DEVICE_LIMIT', limit)
-    assert batching._core_floor() == device.get_aicore_num() == expected
+    assert batching._core_floor() == device.get_aivector_core_num() == expected
 
 
 @pytest.mark.parametrize('limit', ['0,0', '33,66', '8,8', 'invalid', '8', '-1,-2'])
@@ -32,7 +32,7 @@ def test_core_floor_preserves_device_validation(device, monkeypatch, limit, over
     if override is not None:
         monkeypatch.setenv('TA_BLOCK_BATCHING_CORE_FLOOR', override)
     with pytest.raises(ValueError) as expected:
-        device.get_aicore_num()
+        device.get_aivector_core_num()
     with pytest.raises(ValueError) as actual:
         batching._core_floor()
     assert str(actual.value) == str(expected.value)

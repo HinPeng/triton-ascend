@@ -12,24 +12,12 @@ namespace mlir::triton::cfg {
 // create or erase any operation, and must be callable before any rewrite has
 // happened. Mirrors llvm::isSafeToUnrollAndJam.
 
-// How one program's rows sit on the logical row axis. Only these two are
-// recognised; anything else is rejected rather than guessed.
-//
-//   Cyclic   成块发：lower = p*R, step = G*R。一圈取连续 R 行，圈与圈相隔
-//            G*R 行，所以圈之间**不**连续。合并要把 R 放大到 R*F，起点与步长
-//            同步放大，grid 不变。
-//   Blocked  定长分块：步长是正常数 c。每个原程序守着自己的一段连续行，
-//            lower = p*R、upper = min((p+1)*R, N)。折叠后 lane u 整个接管原程序
-//            g*F+u 那一段，步长不动——圈数各份可能差一个尾部，靠掩码处理。
-//
-// 判别依据是步长而不是起点：成块发的步长含 num_programs，定长分块的是常数。
-//
-// 2026-11-02 原文留档。Blocked 这一条原本写的是：「步长是正常数 c。圈与圈本来
-// 就相邻，合并只把步长变成 c*F，边界一个字不改。坐标归一对它是空操作，这里只
-// 负责认出来。」那描述的是不折叠的手写参照版（grid 不变、一个程序的行段按 F 行
-// 一组切开），与本设计服从的 grid 契约 v3（grid[axis] /= F）不符。按它写出来的
-// 改写会重新分组浮点累加，判定层因此长出了关卡 1.5a/1.5b 两道精度闸；订正后
-// 两关一并撤销，换成下面这条「段首段尾必须能按 lane 算出来」的要求。
+// Original program coordinates, independent of the selected lowering.
+// Cyclic: lower = p*R, step = G*R. Program-lane batching retains each
+// original program's rows and stride under a folded launch grid.
+// Blocked: constant positive step and a proved uniform or per-program segment.
+// SequentialIterations uses these same facts but retains the original grid,
+// tile width, recurrence ownership and order within each program.
 struct BatchLogicalAxis {
   enum Distribution : uint8_t { Cyclic, Blocked };
   Distribution distribution = Cyclic;
@@ -43,6 +31,15 @@ struct BatchLoopScheduleResult {
   std::optional<BatchLogicalAxis> axis;
   std::string reason; // 空表示成功
 };
+
+// The existing coordinate proof also identifies program-owned recurrences.
+// Group their consecutive iterations without moving rows between programs or
+// reassociating carried values. The runtime proof checks the new arithmetic.
+enum class BatchLoopLowering { ProgramLanes, SequentialIterations };
+BatchLoopLowering selectBatchLoopLowering(const BatchLoopFact *loop,
+                                          const BatchLogicalAxis *axis,
+                                          const BatchRangeFacts &ranges,
+                                          int64_t factor);
 
 // 入参是一条循环而不是一组访存：归一是循环的属性。"函数里有且只有一条程序轴
 // 循环、且在顶层"由 BatchLoopLegality 的形态检查负责，不在这里。

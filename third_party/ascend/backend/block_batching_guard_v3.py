@@ -1,7 +1,47 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """Evaluate one unified plan. Device SSA indices are never read on the host."""
-from .block_batching_guard import GuardFailure, I32_MAX, integer
+from .block_batching_guard import GuardFailure, I32_MAX, integer, checked
 from .block_batching_guard_v2 import ByteDomain, check_layout_guards
+
+
+def iteration_schedule(guard, factor):
+    """Validate the schedule against the existing original loop facts."""
+    schedule = guard.get('loop_schedule')
+    if schedule is None:
+        return None
+    if (type(schedule) is not dict or set(schedule) != {'version', 'kind', 'grid_policy', 'factor', 'loop'}
+            or type(schedule['version']) is not int or schedule['version'] != 1
+            or schedule['kind'] != 'sequential_iterations_v1' or schedule['grid_policy'] != 'preserve'
+            or type(schedule['factor']) is not int or schedule['factor'] != factor):
+        raise GuardFailure('INVALID_LOOP_SCHEDULE')
+    loop = schedule['loop']
+    if (type(loop) is not dict or set(loop) != {'id', 'bits', 'lower', 'upper', 'step'}
+            or not any(loop == fact for access in guard.get('accesses', []) for fact in access.get('loops', []))
+            or guard.get('layout_checks')):
+        raise GuardFailure('INVALID_LOOP_SCHEDULE')
+    return loop
+
+
+def check_iteration_arithmetic(loop, arguments, grid, factor):
+    # Reuse the original expression evaluator, including intermediate-width
+    # checks and the same scalar dependencies used by RuntimeGuard's cache.
+    domain = ByteDomain(arguments, grid, {'shape': []})
+    lower = domain.expression(loop['lower'])
+    upper = domain.expression(loop['upper'])
+    step = domain.expression(loop['step'])
+    if not upper.uniform or not step.uniform or step.offset <= 0:
+        raise GuardFailure('INVALID_LOOP_SCHEDULE')
+    for value, bits in domain.checks:
+        checked(*domain.bounds(value, domain.full), bits)
+    lo, hi = domain.bounds(lower, domain.full)
+    ub, stride, bits = upper.offset, step.offset, domain.bits(loop['bits'])
+    # SCF's dynamic unroller uses positive ceil-div for (ub-lb)/step.
+    # Require a complete group for every original program. Short/empty loops
+    # retain baseline, just as a singleton program grid does for program lanes.
+    if lo < 0 or ub <= hi or (ub - hi + stride - 1) // stride < factor:
+        raise GuardFailure('LOOP_GROUP_NOT_FORMED')
+    # Bound every new ceil-div, scaled step, group endpoint and IV increment.
+    checked(0, max(ub - lo + stride - 1, factor * stride, ub + factor * stride), bits)
 
 
 def check_guard_v3(guard, arguments, grid, factor):
@@ -21,8 +61,11 @@ def check_guard_v3(guard, arguments, grid, factor):
         if type(axis) is not int or axis not in (0, 1, 2) or type(factor) is not int or not 2 <= factor <= 64:
             raise GuardFailure('INVALID_BATCH_REQUEST')
         tasks = 1
+        loop = iteration_schedule(guard, factor)
+        if loop is not None:
+            check_iteration_arithmetic(loop, arguments, grid, factor)
         for d, n in enumerate(grid):
-            tasks *= (n + factor - 1) // factor if d == axis else n
+            tasks *= (n + factor - 1) // factor if d == axis and loop is None else n
         if tasks > I32_MAX:
             raise GuardFailure('G0_TASK_COUNT_OVERFLOW')
         accesses, obligations = guard['accesses'], guard['obligations']

@@ -44,3 +44,39 @@ def test_external_inputs_preserve_exceptional_values_and_guards(power, blocks):
     assert torch.equal(torch.signbit(outputs[1].cpu()[zeros]), torch.signbit(outputs[0].cpu()[zeros]))
     assert kernels[1].last_launch["applied_factor"] == 2
     assert kernels[0].kernel == kernels[1].baseline.kernel
+
+
+@triton.jit
+def constant_power(X, O, N, B: tl.constexpr, EXPONENT: tl.constexpr):
+    offsets = tl.program_id(0) * B + tl.arange(0, B)
+    valid = offsets < N
+    x = tl.load(X + offsets, valid, other=0)
+    tl.store(O + offsets, device_pow(x, EXPONENT), valid)
+
+
+@pytest.mark.parametrize("exponent", [2., -3., .5, 0.])
+@pytest.mark.parametrize("factor", [2, 3])
+def test_constant_power_preserves_values_tail_and_candidate(exponent, factor):
+    width, blocks = 128, 193
+    n = blocks * width - 3
+    values = torch.tensor([-float("inf"), -2., -0., 0., .5, 2., float("inf"), float("nan")])
+    x_cpu = values.repeat(triton.cdiv(n, len(values)))[:n]
+    x = x_cpu.npu()
+    storage = [torch.full((n + 32,), -123., device="npu") for _ in range(2)]
+    outputs = [value[16:16 + n] for value in storage]
+    kernels = [constant_power[(blocks,)](
+        x, out, n, width, exponent, block_batching_factor=f, num_warps=4, num_stages=1)
+        for f, out in zip((1, factor), outputs)]
+    torch.npu.synchronize()
+    # Tensor exponents exercise pow semantics. torch's scalar 0.5 shortcut
+    # uses sqrt, which differs at -Inf and signed zero from device_pow.
+    expected = torch.pow(x_cpu, torch.full_like(x_cpu, exponent))
+    for out, allocation in zip(outputs, storage):
+        torch.testing.assert_close(out.cpu(), expected, rtol=2e-4, atol=2e-5, equal_nan=True)
+        assert (allocation[:16].cpu() == -123.).all()
+        assert (allocation[16 + n:].cpu() == -123.).all()
+    torch.testing.assert_close(outputs[1].cpu(), outputs[0].cpu(), rtol=2e-4, atol=2e-5, equal_nan=True)
+    zeros = torch.isfinite(expected) & (expected == 0)
+    assert torch.equal(torch.signbit(outputs[1].cpu()[zeros]), torch.signbit(outputs[0].cpu()[zeros]))
+    assert kernels[1].last_launch["applied_factor"] == factor
+    assert "hacc.block_batching_safe_input" not in kernels[1].candidate.asm["ttir"]

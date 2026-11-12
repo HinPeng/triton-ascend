@@ -45,7 +45,7 @@ unsigned lowerBatchLaneScans(ModuleOp module, int64_t factor) {
          parallel.getValue() != "mix_simd_simt"))
       continue;
     auto source = dyn_cast<RankedTensorType>(call.getOperand(0).getType());
-    if (!source || source.getRank() != 2 || !source.hasStaticShape() ||
+    if (!source || source.getRank() < 2 || !source.hasStaticShape() ||
         source.getEncoding() || source.getDimSize(0) != factor ||
         source.getDimSize(1) <= 0 || call.getResult(0).getType() != source ||
         !(source.getElementType().isF32() ||
@@ -54,22 +54,30 @@ unsigned lowerBatchLaneScans(ModuleOp module, int64_t factor) {
         !call.getOperand(2).getType().isInteger(1))
       continue;
     APInt axis;
-    if (!matchPattern(call.getOperand(1), m_ConstantInt(&axis)) || axis != 1)
+    if (!matchPattern(call.getOperand(1), m_ConstantInt(&axis)) ||
+        axis.getSExtValue() <= 0 || axis.getSExtValue() >= source.getRank())
+      continue;
+    int64_t scanAxis = axis.getSExtValue();
+    bool independentRow = source.getDimSize(scanAxis) > 0;
+    for (int64_t dim = 1; dim < source.getRank(); ++dim)
+      if (dim != scanAxis && source.getDimSize(dim) != 1)
+        independentRow = false;
+    if (!independentRow)
       continue;
 
     // Each row is an original program's scan. Keep its axis, order and
     // direction independent of the new batch dimension; do not flatten a
     // scan across lanes. This avoids the backend's 2D transpose-based scan.
-    auto row = RankedTensorType::get({source.getDimSize(1)},
+    auto row = RankedTensorType::get({source.getDimSize(scanAxis)},
                                      source.getElementType());
     auto signature = rewriter.getFunctionType(
         {row, rewriter.getI32Type(), rewriter.getI1Type()}, {row});
     rewriter.setInsertionPoint(call);
     auto loc = call.getLoc();
     Value zeroAxis = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
-    SmallVector<OpFoldResult> sizes{rewriter.getIndexAttr(1),
-                                   rewriter.getIndexAttr(source.getDimSize(1))};
-    SmallVector<OpFoldResult> strides(2, rewriter.getIndexAttr(1));
+    SmallVector<OpFoldResult> sizes(source.getRank(), rewriter.getIndexAttr(1));
+    sizes[scanAxis] = rewriter.getIndexAttr(source.getDimSize(scanAxis));
+    SmallVector<OpFoldResult> strides(source.getRank(), rewriter.getIndexAttr(1));
     Value assembled = call.getOperand(0);
     for (int64_t lane = 0; lane < factor; ++lane) {
       func::FuncOp declaration;
@@ -84,8 +92,8 @@ unsigned lowerBatchLaneScans(ModuleOp module, int64_t factor) {
       // The downstream adapter erases a cumulative-call declaration after
       // consuming one call. Give each lane its own symbol, including when
       // several scans in this module had shared the original declaration.
-      SmallVector<OpFoldResult> offsets{rewriter.getIndexAttr(lane),
-                                       rewriter.getIndexAttr(0)};
+      SmallVector<OpFoldResult> offsets(source.getRank(), rewriter.getIndexAttr(0));
+      offsets[0] = rewriter.getIndexAttr(lane);
       Value input = rewriter.create<tensor::ExtractSliceOp>(
           loc, row, call.getOperand(0), offsets, sizes, strides);
       Value scanned = rewriter.create<func::CallOp>(
@@ -96,6 +104,14 @@ unsigned lowerBatchLaneScans(ModuleOp module, int64_t factor) {
     }
     rewriter.replaceOp(call, assembled);
     parent->setAttr("parallel_mode", rewriter.getStringAttr("mix_simd_simt"));
+    // Cumsum's external template contains SIMT work that VF-mode inference
+    // cannot see. Its D-cache reservation must participate in memory planning;
+    // otherwise a SIMD-sized UB allocation can compile but fault at runtime.
+    // Carry the downstream dialect attribute without coupling this analysis
+    // library to HIVM. The backend parses it before inferring VF mode.
+    parent->setAttr("hivm.vf_mode",
+                    OpaqueAttr::get(rewriter.getStringAttr("hivm"),
+                                    "vf_mode<MIX>", rewriter.getNoneType()));
     oldDeclarations.insert(callee.getOperation());
     ++changed;
   }

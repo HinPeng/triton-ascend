@@ -98,6 +98,30 @@ bool matchSegmentUpper(const BatchExprRef &upper, const BatchExprRef &width,
 }
 } // namespace
 
+BatchLoopLowering selectBatchLoopLowering(const BatchLoopFact *loop,
+                                          const BatchLogicalAxis *axis,
+                                          const BatchRangeFacts &ranges,
+                                          int64_t factor) {
+  if (!loop || !axis || loop->id != axis->loopID || !loop->carriesValues)
+    return BatchLoopLowering::ProgramLanes;
+  // nullopt trip counts include both dynamic inputs and unrepresentable
+  // static counts. Only the former may defer to a runtime guard.
+  if (batchLoopIterationArithmetic(*loop, ranges, factor) ==
+      BatchLoopArithmetic::Unsafe)
+    return BatchLoopLowering::ProgramLanes;
+  // No complete iteration group exists. Retain the original program-lane
+  // route when the existing trip-count analysis can prove this statically.
+  if (auto trips = batchLoopConstantTripCount(*loop, ranges);
+      trips && *trips < factor)
+    return BatchLoopLowering::ProgramLanes;
+  if ((axis->distribution == BatchLogicalAxis::Cyclic) ||
+      (axis->distribution == BatchLogicalAxis::Blocked &&
+       ranges.isLaneUniform(loop->lower) && ranges.isLaneUniform(loop->upper) &&
+       ranges.isLaneUniform(loop->step)))
+    return BatchLoopLowering::SequentialIterations;
+  return BatchLoopLowering::ProgramLanes;
+}
+
 BatchLoopScheduleResult
 normalizeBatchLoopCoordinates(const BatchLoopFact &loop,
                               const BatchRangeFacts &ranges, int gridAxis) {

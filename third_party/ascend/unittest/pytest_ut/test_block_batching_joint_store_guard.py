@@ -61,7 +61,7 @@ def test_covered_members_still_check_original_arithmetic():
 def test_layout_access_ids_remain_valid_for_covered_members():
     spec = deepcopy(joint_spec())
     spec["layout_checks"] = [dict(version=1, access_id=2, axis=0, factor=3, root=0,
-                                  bytes=4, shape=[3], positive=[arg(2)], checks=[const(0)],
+                                  bytes=4, shape=[3], loops=[], positive=[arg(2)], checks=[const(0)],
                                   pointer_checks=[const(0), const(8)])]
     assert guard.check_guard(spec, [0x100000, 0x200000, 3], (7, 1, 1), 3)[0]
 

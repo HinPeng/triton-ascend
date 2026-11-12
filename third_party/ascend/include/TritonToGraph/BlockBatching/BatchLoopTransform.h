@@ -6,6 +6,10 @@
 
 namespace mlir::triton::cfg {
 
+// Sequential composition threads every yielded value into the next copy;
+// neither original program ownership nor reduction order changes.
+LogicalResult groupBatchLoopIterations(scf::ForOp loop, int64_t factor);
+
 // 第 3 层：变换。这里只重算程序轴循环的三个界；循环体、iter_args、零迭代分支
 // 都由既有的重建逻辑照常处理（BatchRewrite.cpp:457-493），不新建一条路径。
 //
