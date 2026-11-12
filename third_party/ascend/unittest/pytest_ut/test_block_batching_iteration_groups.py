@@ -90,6 +90,10 @@ def test_iteration_guard_cache_tracks_bounds_and_program_count(tmp_path):
     assert cached(args, (64, 1, 1)) == (False, 'LOOP_GROUP_NOT_FORMED')
     args[2] = 513
     assert cached(args, (64, 1, 1))[0]
+    args[2] = (1 << 31) - 1
+    assert cached(args, (64, 1, 1)) == (False, 'INDEX_OVERFLOW')
+    args[2] = 513
+    assert cached(args, (64, 1, 1))[0]
     assert cached(args, (256, 1, 1)) == (False, 'LOOP_GROUP_NOT_FORMED')
 
 

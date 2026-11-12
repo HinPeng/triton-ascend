@@ -1,6 +1,7 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #include "TritonToGraph/BlockBatching/BatchRangeAnalysis.h"
 
+#include "llvm/ADT/APInt.h"
 #include "llvm/Support/MathExtras.h"
 
 #include <algorithm>
@@ -288,7 +289,59 @@ batchLoopConstantTripCount(const BatchLoopFact &loop,
     return std::nullopt;
   if (*upper <= *lower)
     return 0;
-  return (*upper - *lower + *step - 1) / *step;
+  // Two signed i64 bounds can span UINT64_MAX. Keep both the subtraction and
+  // ceil-div numerator wide; widening an already evaluated i64 sum is too late.
+  const llvm::APInt lo(128, *lower, true), hi(128, *upper, true);
+  const llvm::APInt stride(128, *step, true);
+  const llvm::APInt trips = (hi - lo + stride - 1).udiv(stride);
+  if (!trips.isSignedIntN(64))
+    return std::nullopt;
+  return trips.getSExtValue();
+}
+
+BatchLoopArithmetic batchLoopIterationArithmetic(const BatchLoopFact &loop,
+                                                const BatchRangeFacts &facts,
+                                                int64_t factor) {
+  using Result = BatchLoopArithmetic;
+  if (factor <= 0 || !loop.bits || loop.bits > 64)
+    return Result::Unsafe;
+  auto wide = [](int64_t value) { return llvm::APInt(128, value, true); };
+  auto fits = [&](const llvm::APInt &value) {
+    return value.isSignedIntN(loop.bits);
+  };
+  auto lower = facts.constant(loop.lower);
+  auto upper = facts.constant(loop.upper);
+  auto step = facts.constant(loop.step);
+  if (!fits(wide(factor)) || (lower && !fits(wide(*lower))) ||
+      (upper && !fits(wide(*upper))) ||
+      (step && (*step <= 0 || !fits(wide(*step)) ||
+               !fits(wide(*step) * wide(factor)))))
+    return Result::Unsafe;
+
+  // These checks also apply when another bound is dynamic. The guard cannot
+  // repair a statically overflowing step, difference or endpoint.
+  if (lower && upper && *upper > *lower && !fits(wide(*upper) - wide(*lower)))
+    return Result::Unsafe;
+  if (upper && step && !fits(wide(*upper) + wide(*step) * wide(factor)))
+    return Result::Unsafe;
+  if (!lower || !upper || !step)
+    return Result::NeedsRuntimeGuard;
+
+  auto trips = batchLoopConstantTripCount(loop, facts);
+  if (!trips)
+    return Result::Unsafe;
+  if (*trips == 0)
+    return Result::StaticSafe;
+  const llvm::APInt stride = wide(*step);
+  const llvm::APInt span = wide(*upper) - wide(*lower);
+  // SCF may use a dynamic ceil-div if constants are not materialized as
+  // ConstantOps. Its static path also forms groupedTrips * step in int64_t
+  // before adding lower. Check the intermediates, not only the final bound.
+  const llvm::APInt groupedTrips = wide(*trips - *trips % factor);
+  const llvm::APInt offset = groupedTrips * stride;
+  if (!fits(span + stride - 1) || !fits(offset) || !fits(wide(*lower) + offset))
+    return Result::Unsafe;
+  return Result::StaticSafe;
 }
 
 int64_t batchLoopTripCountDivisor(const BatchLoopFact &loop,
