@@ -13,7 +13,7 @@ IMPLEMENTATION_VERSION = 45
 def _annotate_launch_grid(kwargs, grid, *, bind=None):
     """Attach launch extents before cache selection; return the launch grid.
 
-    Auto VV axis selection needs callable extents as well as static ones.
+    Automatic axis selection needs callable extents as well as static ones.
     The batching continuation binds arguments only for actual launches, keeping
     warmup callbacks unevaluated. Returning the resolved value also keeps
     reuse and launch from invoking the callback a second time.
@@ -21,12 +21,10 @@ def _annotate_launch_grid(kwargs, grid, *, bind=None):
     factor = kwargs.get("block_batching_factor", 1)
     # An explicit axis is already selected; launch extents must not split
     # the candidate or its baseline cache, for static or callable grids.
-    if (factor == 1 or "block_batching_grid" in kwargs
-            or kwargs.get("block_batching_axis", -1) != -1):
+    if (factor == 1 or "block_batching_grid" in kwargs or kwargs.get("block_batching_axis", -1) != -1):
         return grid
     if callable(grid):
-        if (bind is None or type(factor) is not int or factor <= 1
-                or kwargs.get("block_batching_cv", False)):
+        if bind is None or type(factor) is not int or factor <= 1:
             return grid
         grid = grid(bind())
     if not isinstance(grid, (tuple, list)) or not 1 <= len(grid) <= 3:
@@ -93,11 +91,9 @@ def vv_layout_refusal(report):
 
     independent = [access for access in accesses if access.get("mask_class") == "independent_axes"]
     if independent and all(
-            access.get("action") == "Keep" and access.get("rewritten") is False
-            and ((access.get("mask_class") == "independent_axes"
-                  and row_rank(access) == 1)
-                 or (access.get("mask_class") == "shared"
-                     and row_rank(access) in (0, 1))) for access in accesses):
+            access.get("action") == "Keep" and access.get("rewritten") is False and (
+                (access.get("mask_class") == "independent_axes" and row_rank(access) == 1) or
+                (access.get("mask_class") == "shared" and row_rank(access) in (0, 1))) for access in accesses):
         return "VV_POINTWISE_MEMORY_VIEW_REQUIRED"
     return None
 
@@ -123,15 +119,29 @@ def memory_compile_options(metadata, compiler_path, supports_inlining):
 class BatchRequest:
     factor: int = 1
     axis: int = -1
-    cv: bool = False
 
     def __post_init__(self):
         if type(self.factor) is not int or self.factor <= 0:
             raise ValueError("block_batching_factor must be a positive integer (not bool)")
         if type(self.axis) is not int or self.axis not in (-1, 0, 1, 2):
             raise ValueError("block_batching_axis must be -1, 0, 1 or 2 (not bool)")
-        if type(self.cv) is not bool:
-            raise ValueError("block_batching_cv must be bool")
+
+
+def _has_dot(mod):
+    """Classify actual IR operations, including dots inside nested regions."""
+    found = False
+
+    def visit(op):
+        nonlocal found
+        if op.get_name() == "tt.dot":
+            found = True
+
+    mod.walk(visit)
+    return found
+
+
+def _is_cv_report(report):
+    return report.get("cv_mode") in ("independent_batch_v1", "spatial_concat_v1")
 
 
 def analyze_request(mod, request, binding):
@@ -151,7 +161,7 @@ def analyze_request(mod, request, binding):
     analyze = getattr(binding, "analyze_block_batching", None)
     if analyze is None:
         raise RuntimeError("block_batching requires a matching rebuilt Ascend C++ extension")
-    return dict(analyze(mod, request.factor, request.axis, request.cv))
+    return dict(analyze(mod, request.factor, request.axis, _has_dot(mod)))
 
 
 class BatchingRejected(RuntimeError):
@@ -300,15 +310,15 @@ class BatchKernel:
         self._ready = False
         self._local = threading.local()
         self.hash = candidate.hash if candidate is not None else hashlib.sha256(
-            f"{baseline.hash}:block_batching:{request.factor}:{request.axis}:{request.cv}:{IMPLEMENTATION_VERSION}".
-            encode()).hexdigest()
+            f"{baseline.hash}:block_batching:{request.factor}:{request.axis}:{IMPLEMENTATION_VERSION}".encode(
+            )).hexdigest()
         fields = dict(self._primary.metadata._asdict(), block_batching=report)
         self.metadata = namedtuple("BatchKernelMetadata", sorted(fields))(**fields)
         from triton.runtime.cache import get_cache_manager
         manifest = {
             "version": 1, "baseline_hash": baseline.hash, "candidate_hash":
             candidate.hash if candidate is not None else None, "request":
-            {"factor": request.factor, "axis": request.axis, "cv": request.cv}, "report": report
+            {"factor": request.factor, "axis": request.axis}, "report": report
         }
         get_cache_manager(self.hash).put(json.dumps(manifest, sort_keys=True), "block_batching.bundle.json")
 
@@ -365,12 +375,12 @@ class BatchKernel:
         arguments = launch[9:]
         if self.candidate is not None:
             capture = _capture_state()
-            if self.request.cv and grid[self.block_batching["selected_axis"]] % self.request.factor:
+            if _is_cv_report(self.block_batching) and grid[self.block_batching["selected_axis"]] % self.request.factor:
                 # VV candidates protect partial groups with a lane mask and
                 # safe inactive operands. CV still requires complete groups.
                 reason = "CV_GRID_NOT_DIVISIBLE"
-            elif not self._preserve_grid and not _reduces_blocks(
-                    grid, self.block_batching["selected_axis"], self.request.factor):
+            elif not self._preserve_grid and not _reduces_blocks(grid, self.block_batching["selected_axis"],
+                                                                 self.request.factor):
                 # The device task domain is one dimensional: prepareGrid divides
                 # the selected axis and then multiplies all three extents. An
                 # axis too short to divide leaves that product untouched while
@@ -468,10 +478,9 @@ def compile_bundle(backend, src, options, compile_variant):
     import subprocess
     import hashlib
     from triton.compiler.errors import MLIRCompilationError
-    request = BatchRequest(options.get("block_batching_factor", 1), options.get("block_batching_axis", -1),
-                           options.get("block_batching_cv", False))
+    request = BatchRequest(options.get("block_batching_factor", 1), options.get("block_batching_axis", -1))
     normalized = backend.parse_options(options)
-    baseline_options = dict(options, block_batching_factor=1, block_batching_axis=-1, block_batching_cv=False)
+    baseline_options = dict(options, block_batching_factor=1, block_batching_axis=-1)
     # Grid hints specialize candidate axis selection, never the original kernel.
     baseline_options.pop("block_batching_grid", None)
     freeze_rejection = None
@@ -501,14 +510,15 @@ def compile_bundle(backend, src, options, compile_variant):
         candidate, layout_fallback = _compile_layout_candidate(compile_variant, options, frozen, request)
         from .block_batching_report import VALIDATION_POLICY, CV_VALIDATION_POLICY
         native_report = getattr(candidate.metadata, "block_batching", {})
-        if (native_report.get("compile_status") != "COMPILED_GUARDED" or native_report.get("validation_policy")
-                != (CV_VALIDATION_POLICY if request.cv else VALIDATION_POLICY)):
+        cv = _is_cv_report(native_report)
+        if (native_report.get("cv_mode") not in ("disabled", "independent_batch_v1", "spatial_concat_v1")
+                or native_report.get("compile_status") != "COMPILED_GUARDED"
+                or native_report.get("validation_policy") != (CV_VALIDATION_POLICY if cv else VALIDATION_POLICY)):
             raise BatchingRejected("CANDIDATE_VALIDATION_MISSING")
         if (native_report.get("implementation_version") != IMPLEMENTATION_VERSION
                 or native_report.get("lane_width") != request.factor):
             raise BatchingRejected("CANDIDATE_LAYOUT_MISMATCH")
-        if request.cv and (native_report.get("cv_mode") not in ("independent_batch_v1", "spatial_concat_v1")
-                           or native_report.get("tail_policy") != "full_groups_only"):
+        if cv and native_report.get("tail_policy") != "full_groups_only":
             raise BatchingRejected("CV_CONTRACT_MISMATCH")
         expected = getattr(candidate.metadata, "block_batching_binary_sha256", None)
         if expected != hashlib.sha256(candidate.kernel).hexdigest():
@@ -544,10 +554,9 @@ def compile_bundle(backend, src, options, compile_variant):
                 errors="replace") if isinstance(cause.stderr, bytes) else str(cause.stderr or "")
             if _internal_backend_error(cause.returncode, detail):
                 raise
-            reason = ("BATCH_TARGET_RESOURCE_REJECTED" if _cv_resource_refusal(cause.returncode, detail)
-                      else "BACKEND_COMPILE_REJECTED")
-            report.update(reason=reason, backend_returncode=cause.returncode,
-                          backend_diagnostic=detail[-16000:])
+            reason = ("BATCH_TARGET_RESOURCE_REJECTED"
+                      if _cv_resource_refusal(cause.returncode, detail) else "BACKEND_COMPILE_REJECTED")
+            report.update(reason=reason, backend_returncode=cause.returncode, backend_diagnostic=detail[-16000:])
         else:
             # Internal verifier/runtime errors and unknown compiler failures
             # retain their original wrapped diagnostics instead of disappearing

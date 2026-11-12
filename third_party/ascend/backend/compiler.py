@@ -77,7 +77,10 @@ from triton.backends.ascend.block_batching import BatchRequest, analyze_request,
 from triton.backends.ascend.block_batching import memory_compile_options as batching_memory_compile_options
 from triton.backends.ascend.block_batching import vv_layout_refusal as batching_vv_layout_refusal
 from triton.backends.ascend.block_batching_report import (
-    VALIDATION_POLICY, CV_AUTO_BLOCKIFY_LOWERINGS, CV_MASKED_BATCH_LOWERINGS, validate_compilation_result,
+    VALIDATION_POLICY,
+    CV_AUTO_BLOCKIFY_LOWERINGS,
+    CV_MASKED_BATCH_LOWERINGS,
+    validate_compilation_result,
 )
 from triton.backends.ascend.program_grid import (
     DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK,
@@ -254,8 +257,7 @@ def _finalize_program_launch_policy(metadata, opt):
     if cv_report.get("cv_mode") in ("independent_batch_v1", "spatial_concat_v1"):
         # The admitted CV lowerings retain the original-grid ABI while
         # AutoBlockify loops over grouped programs, including uniform regions.
-        auto_blockify_enabled &= (cv_report.get("cv_lowering")
-                                  in CV_AUTO_BLOCKIFY_LOWERINGS
+        auto_blockify_enabled &= (cv_report.get("cv_lowering") in CV_AUTO_BLOCKIFY_LOWERINGS
                                   and metadata["mix_mode"] == "mix")
 
     if auto_blockify_enabled and ptsm_cap_authorized:
@@ -388,9 +390,12 @@ def make_ttir(mod, metadata, opt):
             _extents = ", ".join(f"{extent} : i32" for extent in opt.block_batching_grid)
             mod.set_attr("hacc.block_batching_grid", _builder.parse_attr(f"[{_extents}]"))
         batch_source = str(mod)
+        from .block_batching import _has_dot
+        cv = _has_dot(mod)
+        layout_policy = "semantic_only" if cv else opt.block_batching_layout
         report = dict(
-            rewrite(mod, opt.block_batching_factor, opt.block_batching_axis, opt.block_batching_layout,
-                    opt.block_batching_cv, opt.block_batching_cv and opt.enable_hivm_batch_matmul))
+            rewrite(mod, opt.block_batching_factor, opt.block_batching_axis, layout_policy, cv, cv
+                    and opt.enable_hivm_batch_matmul))
         # Selection is done; hivmc rejects hacc.* module attrs it does not know.
         _remove_attr = getattr(ascend.ir, "remove_attr", None)
         if _remove_attr is not None:
@@ -403,7 +408,7 @@ def make_ttir(mod, metadata, opt):
             raise BatchingRejected(report["reason"])
         report["layout"] = json.loads(report.pop("layout_json"))
         report["layout"]["requested_policy"] = opt.block_batching_layout
-        report["layout"]["selected_policy"] = opt.block_batching_layout
+        report["layout"]["selected_policy"] = layout_policy
         report["guard"] = json.loads(report.pop("guard_json"))
         report["guard"]["axis"] = report["selected_axis"]
         if report.get("cv_lowering") in CV_MASKED_BATCH_LOWERINGS:
@@ -417,9 +422,9 @@ def make_ttir(mod, metadata, opt):
         report["owner"] = "block_batching"
         refusal = batching_vv_layout_refusal(report)
         if refusal:
-            raise BatchingRejected(refusal, analysis={
-                key: report[key] for key in ("selected_axis", "operations", "layout")
-            })
+            raise BatchingRejected(refusal,
+                                   analysis={key: report[key]
+                                             for key in ("selected_axis", "operations", "layout")})
         report["plan_id"] = metadata["hash"]
         report["candidate_factor"] = opt.block_batching_factor
         metadata["block_batching"] = report
@@ -1009,7 +1014,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += _full_row_copy_compile_options(metadata, npu_compiler_path)
             if "block_batching" in metadata:
                 for option in batching_memory_compile_options(metadata, npu_compiler_path,
-                                                               _supports_full_row_copy_inlining):
+                                                              _supports_full_row_copy_inlining):
                     if option not in _compile_option_list:
                         _compile_option_list.append(option)
             # Temporary until the NPU compiler enables batch matmul by default in Q4.
@@ -1057,8 +1062,8 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             diagnostic = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else str(e.stderr or "")
             layout = metadata.get("block_batching", {}).get("layout", {})
             applied = any(row.get("rewritten") for row in layout.get("accesses", ()))
-            from .block_batching import LayoutTargetRejected, _layout_resource_refusal, CVTargetRejected, _cv_resource_refusal
-            if opt.block_batching_cv and _cv_resource_refusal(e.returncode, diagnostic):
+            from .block_batching import LayoutTargetRejected, _layout_resource_refusal, CVTargetRejected, _cv_resource_refusal, _is_cv_report
+            if _is_cv_report(metadata.get("block_batching", {})) and _cv_resource_refusal(e.returncode, diagnostic):
                 raise CVTargetRejected(diagnostic[-16000:]) from e
             if (opt.block_batching_layout == "auto" and applied and _layout_resource_refusal(e.returncode, diagnostic)):
                 raise LayoutTargetRejected(opt.block_batching_factor, opt.block_batching_axis,
@@ -1408,10 +1413,9 @@ class NPUOptions:
     instrumentation_mode: str = ""
     enable_graph_optimize: bool = True
     block_batching_factor: int = 1
-    block_batching_cv: bool = False
     block_batching_axis: int = -1
-    # Original launch extents, including resolved callable grids for auto VV
-    # selection. This compile option distinguishes cached axis choices when
+    # Original launch extents, including resolved callable grids for automatic
+    # axis selection. This compile option distinguishes cached axis choices when
     # runtime grid dimensions change. VV permits partial final groups.
     block_batching_grid: Tuple[int] = None
     block_batching_layout: str = "auto"
@@ -1540,7 +1544,7 @@ class NPUOptions:
     use_bytecode: bool = field(default=False, init=False)
 
     def __post_init__(self, arch, rule_mask):
-        BatchRequest(self.block_batching_factor, self.block_batching_axis, self.block_batching_cv)
+        BatchRequest(self.block_batching_factor, self.block_batching_axis)
         if self.block_batching_grid is not None:
             grid = tuple(self.block_batching_grid)
             if len(grid) != 3 or any(type(x) is not int or x < 1 for x in grid):
@@ -1548,7 +1552,7 @@ class NPUOptions:
             object.__setattr__(self, "block_batching_grid", grid)
         if self.block_batching_layout not in ("auto", "semantic_only"):
             raise ValueError("block_batching_layout must be auto or semantic_only")
-        if self.block_batching_factor == 1 or self.block_batching_cv:
+        if self.block_batching_factor == 1:
             object.__setattr__(self, "block_batching_layout", "semantic_only")
         if self.block_batching_factor > 1:
             compiler_path, _ = _get_npucompiler_path()
