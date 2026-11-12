@@ -6,6 +6,7 @@ from test_block_batching_rewrite import parse
 
 pytestmark = pytest.mark.backend('native')
 
+
 @pytest.fixture(scope='session', autouse=True)
 def assign_npu():
     yield
@@ -117,9 +118,8 @@ def test_final_compilation_checks_grid_and_schedule_together(tmp_path, mutation)
     from triton.backends.ascend.block_batching_report import validate_vv_loop_contract
     report = dict(vv_lowering='sequential_iterations_v1', cv_mode='disabled', lane_width=2,
                   guard=generated_guard(tmp_path))
-    metadata = dict(block_batching=report, program_grid_transforms=None,
-                    program_grid_mapping_applied=False, row_coalescing_applied=False,
-                    ptsm_cap_authorized=False, coalesce_factor=1)
+    metadata = dict(block_batching=report, program_grid_transforms=None, program_grid_mapping_applied=False,
+                    row_coalescing_applied=False, ptsm_cap_authorized=False, coalesce_factor=1)
     assert validate_vv_loop_contract(metadata)
     if mutation == 'mapping':
         metadata['program_grid_mapping_applied'] = True
@@ -146,7 +146,7 @@ def row_stream_ir(strided=False, conditional=False):
 '''
     if strided:
         body = body.replace('%xi = arith.addi %xbv, %col',
-            '%twocol = arith.addi %col, %col : tensor<8xi32>\n      %xi = arith.addi %xbv, %twocol')
+                            '%twocol = arith.addi %col, %col : tensor<8xi32>\n      %xi = arith.addi %xbv, %twocol')
     if conditional:
         body = '      scf.if %positive {\n' + body + '      }\n'
     return '''module {
@@ -183,7 +183,7 @@ def test_unbridged_uniform_pointwise_loop_requires_memory_view(tmp_path, factor)
 
 def test_uniform_recurrence_reuses_coordinate_and_carry_proof(tmp_path):
     source = recurrent_ir().replace('%sum = scf.for %iv = %lo to %n step %step',
-        '%zero = arith.constant 0 : i32\n    %sum = scf.for %iv = %zero to %n step %c')
+                                    '%zero = arith.constant 0 : i32\n    %sum = scf.for %iv = %zero to %n step %c')
     module = parse(tmp_path, source)
     report = ascend.passes.ttir.rewrite_block_batching(module, 2, 0)
     assert report['compile_status'] == 'REWRITTEN', report

@@ -50,25 +50,25 @@ llvm::json::Value exprJSON(const BatchExpr &self) {
   case BatchExpr::EQ:
     return A{self.kind == BatchExpr::SLT   ? "slt"
              : self.kind == BatchExpr::ULT ? "ult"
-                           : "eq",
+                                           : "eq",
              batchExprJSON(self.lhs), batchExprJSON(self.rhs), self.bits};
   case BatchExpr::ExtSI:
   case BatchExpr::ExtUI:
   case BatchExpr::Trunc:
     return A{self.kind == BatchExpr::ExtSI   ? "extsi"
              : self.kind == BatchExpr::ExtUI ? "extui"
-                             : "trunci",
+                                             : "trunci",
              self.bits, batchExprJSON(self.lhs), self.extent};
   case BatchExpr::MinSI:
   case BatchExpr::MaxSI:
-    return A{self.kind == BatchExpr::MinSI ? "minsi" : "maxsi", self.bits, batchExprJSON(self.lhs),
-             batchExprJSON(self.rhs)};
+    return A{self.kind == BatchExpr::MinSI ? "minsi" : "maxsi", self.bits,
+             batchExprJSON(self.lhs), batchExprJSON(self.rhs)};
   case BatchExpr::Add:
   case BatchExpr::Sub:
   case BatchExpr::Mul:
     return A{self.kind == BatchExpr::Add   ? "addi"
              : self.kind == BatchExpr::Sub ? "subi"
-                           : "muli",
+                                           : "muli",
              self.bits, batchExprJSON(self.lhs), batchExprJSON(self.rhs)};
   }
   llvm_unreachable("unhandled batch coordinate expression");

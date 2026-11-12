@@ -82,8 +82,9 @@ struct Analysis {
         continue;
       }
       if (auto loop = dyn_cast<scf::ForOp>(op)) {
-        // 界随程序轴变化不再在这里拒。认不认得出这条循环、能不能按 lane 重分块，
-        // 是关卡 0（BatchLoopForm.h）和关卡 1（BatchLoopSchedule.h）的事：它们
+        // 界随程序轴变化不再在这里拒。认不认得出这条循环、能不能按 lane
+        // 重分块， 是关卡 0（BatchLoopForm.h）和关卡
+        // 1（BatchLoopSchedule.h）的事：它们
         // 看得见两种分布的形态，这里看不见。三个界里任何一个变都归关卡 0 接管，
         // 所以这里放行不会留下无人认领的形状。
         if (!provenPositiveStep(loop.getStep()))
@@ -93,10 +94,10 @@ struct Analysis {
         // 程序轴循环的循环变量按 lane 变化，普通循环的不变。
         //
         // 看着矛盾：合并之后 scf.for 的界只能是标量，循环变量当然也是标量。但这
-        // 一位管的不是界，是**体**——lane u 这一圈处理的行是 iv + u*R，由它派生的
-        // 下标因此各 lane 不同，语义体必须给它们加上 lane 轴，否则桥折不成一条宽
-        // 访存。界由 retileBatchLoopBounds 另算，走的不是这条映射
-        // （BatchRewrite.cpp 的循环重建）。
+        // 一位管的不是界，是**体**——lane u 这一圈处理的行是 iv +
+        // u*R，由它派生的 下标因此各 lane 不同，语义体必须给它们加上 lane
+        // 轴，否则桥折不成一条宽 访存。界由 retileBatchLoopBounds
+        // 另算，走的不是这条映射 （BatchRewrite.cpp 的循环重建）。
         //
         // 判据和关卡 0 一致：三个界里任一随程序轴变化。
         record(loop.getInductionVar(),
@@ -151,8 +152,9 @@ struct Analysis {
   }
 };
 } // namespace
-BatchControlFlowPlan analyzeBatchControlFlow(triton::FuncOp function,
-    int axis, const llvm::DenseSet<Operation *> &replicatedLoads) {
+BatchControlFlowPlan
+analyzeBatchControlFlow(triton::FuncOp function, int axis,
+                        const llvm::DenseSet<Operation *> &replicatedLoads) {
   Analysis analysis(axis, replicatedLoads);
   for (Value arg : function.getArguments())
     analysis.record(arg, false);

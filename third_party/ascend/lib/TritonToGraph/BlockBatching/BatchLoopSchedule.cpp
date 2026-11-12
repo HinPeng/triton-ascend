@@ -10,7 +10,9 @@ using K = BatchExpr;
 // binding constraint; it only stops a pathological DAG.
 constexpr unsigned kBudget = 256;
 
-BatchLoopScheduleResult reject(const char *reason) { return {std::nullopt, reason}; }
+BatchLoopScheduleResult reject(const char *reason) {
+  return {std::nullopt, reason};
+}
 
 // The coefficient of exactly one named leaf, when the form holds nothing else.
 // "Nothing else" is the point: p*16 + arg is not a shape we can scale, and
@@ -29,7 +31,8 @@ std::optional<int64_t> soleCoefficient(const BatchLinearForm &form,
 // arith.extsi，结构匹配必须先把这层剥掉。
 const BatchExprRef &stripWidening(const BatchExprRef &e) {
   const BatchExprRef *cursor = &e;
-  while (*cursor && ((*cursor)->kind == K::ExtSI || (*cursor)->kind == K::ExtUI))
+  while (*cursor &&
+         ((*cursor)->kind == K::ExtSI || (*cursor)->kind == K::ExtUI))
     cursor = &(*cursor)->lhs;
   return *cursor;
 }
@@ -43,9 +46,9 @@ bool laneUniform(const BatchExprRef &e, const BatchRangeFacts &ranges) {
 // 匹配 p*R（两种操作数次序都认），返回 R。R 只要求各份相同，可以是常数，也可以
 // 是运行期参数——rms_norm_backward 的 rows_per_program 就是个 i32 参数，拆不进
 // 仿射形式，所以这里走结构而不是 batchLinearForm。
-std::optional<BatchExprRef> matchProgramTimesWidth(const BatchExprRef &e,
-                                                   int gridAxis,
-                                                   const BatchRangeFacts &ranges) {
+std::optional<BatchExprRef>
+matchProgramTimesWidth(const BatchExprRef &e, int gridAxis,
+                       const BatchRangeFacts &ranges) {
   const BatchExprRef &root = stripWidening(e);
   if (!root || root->kind != K::Mul)
     return std::nullopt;
@@ -136,7 +139,8 @@ normalizeBatchLoopCoordinates(const BatchLoopFact &loop,
   // 关卡二：步长是常数就是定长分块。折叠之后 lane u 就是原程序 g*F+u，要守住
   // 它自己那一段，所以上下界必须能按 lane 算出来。只认两种形态：
   //   U 形  上下界都各份相同——F 条 lane 跑一模一样的循环，不分段。
-  //   S 形  下界恰是 p*R，上界各份相同或 min((p+1)*R, 各份相同式)，两个 R 同一个。
+  //   S 形  下界恰是 p*R，上界各份相同或 min((p+1)*R, 各份相同式)，两个 R
+  //   同一个。
   // 其余拒。2026-11-02 之前这里对边界零要求，那条放开的依据是"合并只把步长乘
   // F、边界一个字不动"的不折叠手写版方案，与本设计服从的 grid /= F 不符。
   if (batchLoopConstantStep(loop, ranges)) {
@@ -187,9 +191,9 @@ BatchExprRef normalizeBatchAccessOnLogicalAxis(const BatchExprRef &e,
     if (!node)
       return node;
     if (node->kind == BatchExpr::Induction && node->value == int64_t(loop.id))
-      return loop.lower ? BatchExpr::node(BatchExpr::Add, node->bits,
-                                          loop.lower, node)
-                        : BatchExprRef();
+      return loop.lower
+                 ? BatchExpr::node(BatchExpr::Add, node->bits, loop.lower, node)
+                 : BatchExprRef();
     if (!node->lhs && !node->rhs)
       return node; // 其余叶子与这条循环无关。
     auto it = seen.find(node.get());
@@ -206,10 +210,10 @@ BatchExprRef normalizeBatchAccessOnLogicalAxis(const BatchExprRef &e,
     // range 节点要用 range() 重建：它带 rangeOrigin 标志，而 node() 不带，丢了
     // 它多轴来源的证明（rangeGroup）会无故证不出。_block_rms_norm_backward 的
     // row_idx = start + arange(0,16) 正是这种节点，且 start 就是循环变量。
-    return seen[node.get()] = node->rangeOrigin
-                                  ? BatchExpr::range(lhs, rhs)
-                                  : BatchExpr::node(node->kind, node->bits,
-                                                    lhs, rhs);
+    return seen[node.get()] =
+               node->rangeOrigin
+                   ? BatchExpr::range(lhs, rhs)
+                   : BatchExpr::node(node->kind, node->bits, lhs, rhs);
   };
   return rebuild(rebuild, e);
 }

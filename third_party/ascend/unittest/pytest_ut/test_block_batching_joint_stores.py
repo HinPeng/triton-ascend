@@ -56,8 +56,7 @@ def rewritten_guard(tmp_path, text, factor=3):
 @pytest.mark.parametrize("factor", [2, 3])
 def test_identity_reduction_reshape_is_normalized(tmp_path, kind, factor):
     text = reduction_ir(kind).replace(
-        '%reduced = "tt.reduce"(%v)',
-        '%flat = tt.reshape %v allow_reorder : tensor<4xf32> -> tensor<4xf32>\n'
+        '%reduced = "tt.reduce"(%v)', '%flat = tt.reshape %v allow_reorder : tensor<4xf32> -> tensor<4xf32>\n'
         '    %reduced = "tt.reduce"(%flat)')
     assert "%flat" in text
     ir, _ = rewritten_guard(tmp_path, text, factor)
@@ -108,8 +107,7 @@ def test_unproven_groups_keep_original_effects(tmp_path, columns, masked):
 
 def test_disabled_request_preserves_identity_reshape(tmp_path):
     text = reduction_ir("sum").replace(
-        '%reduced = "tt.reduce"(%v)',
-        '%flat = tt.reshape %v allow_reorder : tensor<4xf32> -> tensor<4xf32>\n'
+        '%reduced = "tt.reduce"(%v)', '%flat = tt.reshape %v allow_reorder : tensor<4xf32> -> tensor<4xf32>\n'
         '    %reduced = "tt.reduce"(%flat)')
     ir = parse(tmp_path, text)
     before = str(ir)
@@ -121,8 +119,7 @@ def test_disabled_request_preserves_identity_reshape(tmp_path):
 def test_loop_store_alias_remains_guarded_after_identity_normalization(tmp_path):
     from block_batching_control_flow_cases import control_ir
     text = control_ir("for_accumulate").replace(
-        "scf.yield %updated : f32",
-        "%v = tt.splat %updated : f32 -> tensor<4xf32>\n"
+        "scf.yield %updated : f32", "%v = tt.splat %updated : f32 -> tensor<4xf32>\n"
         "%flat = tt.reshape %v allow_reorder : tensor<4xf32> -> tensor<4xf32>\n"
         '%r = "tt.reduce"(%flat) <{axis = 0 : i32}> ({\n'
         '^bb0(%a: f32, %b: f32):\n'

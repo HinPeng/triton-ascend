@@ -99,7 +99,8 @@ def test_unsigned_ceildiv_avoids_overflowing_expansion(tmp_path):
 def test_safety_hint_rejects_wrong_type_or_operation(tmp_path, op, marker):
     text = case_ir(op)
     if op == "arith.cmpf":
-        text = text.replace("%predicate, %v, %onef :", "%predicate, %v, %onef {hacc.block_batching_safe_input" + marker + "} :")
+        text = text.replace("%predicate, %v, %onef :",
+                            "%predicate, %v, %onef {hacc.block_batching_safe_input" + marker + "} :")
     else:
         text = text.replace('"arith.maximumf"(%v, %denomf)',
                             '"arith.maximumf"(%v, %denomf) {hacc.block_batching_safe_input}')

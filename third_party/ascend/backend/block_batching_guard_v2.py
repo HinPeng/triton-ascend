@@ -47,7 +47,8 @@ class ByteDomain:
             # axis. Register its split BEFORE evaluating those expressions.
             # No nested IV is invented: unsupported outer captures still fail.
             domain = ByteDomain(arguments, grid, {
-                "shape": [], "pointer_checks": [loop[name] for name in ("lower", "upper", "step")],
+                "shape": [],
+                "pointer_checks": [loop[name] for name in ("lower", "upper", "step")],
             })
             # A program-axis loop starts at pid*R by definition, so its lower
             # bound is not a scalar. The VV absorbed-axis rule below still
@@ -75,8 +76,7 @@ class ByteDomain:
                 # push the proved address range a whole step past the buffer.
                 axes = [a for a, c in enumerate(lower.coefficients) if c]
                 rows = lower.coefficients[axes[0]] if len(axes) == 1 else 0
-                if (not upper_expr.uniform or rows <= 0 or axes[0] >= 3
-                        or step != grid[axes[0]] * rows):
+                if (not upper_expr.uniform or rows <= 0 or axes[0] >= 3 or step != grid[axes[0]] * rows):
                     raise GuardFailure("NON_UNIFORM_LOOP_DOMAIN")
                 stride, absorbed = rows, axes[0]
             checked(min(lower.offset, upper_lo), max(lower.offset, upper), bits)

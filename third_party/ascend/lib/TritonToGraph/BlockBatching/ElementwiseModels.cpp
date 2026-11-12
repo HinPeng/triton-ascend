@@ -35,8 +35,8 @@ BatchInactivePolicy inactivePolicy(Operation *op,
     if ((call.getSymbol() == "__hmf_tanhf" ||
          (call.getSymbol() == "__hmf_pow_fp32" &&
           (operand == 0 || hasSafeConstantPowExponent(call)))) &&
-        call.getPure() &&
-        call.getLibname().empty() && call.getLibpath().empty())
+        call.getPure() && call.getLibname().empty() &&
+        call.getLibpath().empty())
       return BatchInactivePolicy::IEEE;
   return descriptor.inactiveInputs;
 }
@@ -51,11 +51,9 @@ bool needsBatchActiveMask(Operation *op, const BatchOpDescriptor &descriptor) {
   return false;
 }
 
-SmallVector<Value>
-prepareBatchElementwiseOperands(Operation *op,
-                                const BatchOpDescriptor &descriptor,
-                                ValueRange operands, Value activeMask,
-                                Location loc, IRRewriter &rewriter) {
+SmallVector<Value> prepareBatchElementwiseOperands(
+    Operation *op, const BatchOpDescriptor &descriptor, ValueRange operands,
+    Value activeMask, Location loc, IRRewriter &rewriter) {
   SmallVector<Value> result(operands.begin(), operands.end());
   if (!needsBatchActiveMask(op, descriptor))
     return result;
@@ -67,8 +65,7 @@ prepareBatchElementwiseOperands(Operation *op,
       continue;
     int64_t fill = 0;
     if (policy == BatchInactivePolicy::Positive ||
-        (policy == BatchInactivePolicy::Divide &&
-         index == 1))
+        (policy == BatchInactivePolicy::Divide && index == 1))
       fill = 1;
     auto type = cast<RankedTensorType>(operand.getType());
     Type element = type.getElementType();

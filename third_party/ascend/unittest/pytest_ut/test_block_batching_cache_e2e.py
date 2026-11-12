@@ -28,7 +28,7 @@ def test_explicit_axis_static_and_callable_grid_reuse(monkeypatch, tmp_path):
     torch.manual_seed(881)
     source = torch.randn(256, 256)
     x = source.npu()
-    y = torch.full((257,), -12345., device='npu')
+    y = torch.full((257, ), -12345., device='npu')
     compilations, callable_evaluations, kernels = [], [], []
     original = cached_row_sum._do_compile
 
@@ -44,8 +44,8 @@ def test_explicit_axis_static_and_callable_grid_reuse(monkeypatch, tmp_path):
 
     for rows, grid in [(128, (128, 1)), (256, (256, 1)), (128, dynamic)]:
         y.fill_(-12345.)
-        kernel = cached_row_sum[grid](x, y, 256, block_batching_factor=2,
-                                      block_batching_axis=0, num_warps=4, num_stages=1)
+        kernel = cached_row_sum[grid](x, y, 256, block_batching_factor=2, block_batching_axis=0, num_warps=4,
+                                      num_stages=1)
         torch.npu.synchronize()
         torch.testing.assert_close(y[:rows].cpu(), source[:rows].sum(1), atol=1e-4, rtol=1e-4)
         assert torch.all(y[rows:].cpu() == -12345.)
@@ -55,20 +55,22 @@ def test_explicit_axis_static_and_callable_grid_reuse(monkeypatch, tmp_path):
         kernels.append(kernel)
     assert kernels[0] is kernels[1] is kernels[2]
     assert len(compilations) == 1 and len(callable_evaluations) == 1
-    record(tmp_path, 'explicit_axis_cache', dict(jit_compilations=len(compilations), same_bundle=True,
-            callable_evaluations=len(callable_evaluations), launch=kernels[-1].last_launch))
+    record(
+        tmp_path, 'explicit_axis_cache',
+        dict(jit_compilations=len(compilations), same_bundle=True, callable_evaluations=len(callable_evaluations),
+             launch=kernels[-1].last_launch))
 
 
 def test_automatic_axis_candidates_share_baseline_without_grid_hint(tmp_path):
     torch.manual_seed(881)
     source = torch.randn(128, 256)
     x = source.npu()
-    y = torch.full((129,), -12345., device='npu')
+    y = torch.full((129, ), -12345., device='npu')
     kernels, launches = [], []
     for grid, axis in [((128, 1), 0), ((1, 128), 1)]:
         y.fill_(-12345.)
-        kernel = cached_row_sum[grid](x, y, 256, block_batching_factor=2,
-                                      block_batching_axis=-1, num_warps=4, num_stages=1)
+        kernel = cached_row_sum[grid](x, y, 256, block_batching_factor=2, block_batching_axis=-1, num_warps=4,
+                                      num_stages=1)
         torch.npu.synchronize()
         torch.testing.assert_close(y[:128].cpu(), source.sum(1), atol=1e-4, rtol=1e-4)
         assert y[128].item() == -12345.

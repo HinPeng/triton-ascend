@@ -6,8 +6,7 @@ import triton.language as tl
 
 
 @triton.jit(do_not_specialize=["NR", "NC", "SX", "SY", "SO"])
-def _symbolic_columns(X, Y, O, NR, NC, SX, SY, SO, SCALE,
-                      M: tl.constexpr, D: tl.constexpr):
+def _symbolic_columns(X, Y, O, NR, NC, SX, SY, SO, SCALE, M: tl.constexpr, D: tl.constexpr):
     row = tl.program_id(0) * M + tl.arange(0, M)
     col = tl.program_id(1) * D + tl.arange(0, D)
     mask = (row[:, None] < NR) & (col[None, :] < NC)
@@ -27,12 +26,13 @@ def test_symbolic_column_pointwise_region_preserves_strides_and_tails(factor, ax
         xc = torch.randn((nr, sx), generator=gen)
         yc = torch.randn((nr, sy), generator=gen)
         x, y = xc.npu(), yc.npu()
-        allocations = [torch.full((nr * so + 32,), -123., device='npu') for _ in range(2)]
+        allocations = [torch.full((nr * so + 32, ), -123., device='npu') for _ in range(2)]
         outputs = [v[16:-16].reshape(nr, so) for v in allocations]
         grid = (triton.cdiv(nr, 2), triton.cdiv(nc, 32))
-        kernels = [_symbolic_columns[grid](x, y, out, nr, nc, sx, sy, so, .25, 2, 32,
-                    block_batching_factor=f, block_batching_axis=axis, num_warps=4)
-                   for f, out in zip((1, factor), outputs)]
+        kernels = [
+            _symbolic_columns[grid](x, y, out, nr, nc, sx, sy, so, .25, 2, 32, block_batching_factor=f,
+                                    block_batching_axis=axis, num_warps=4) for f, out in zip((1, factor), outputs)
+        ]
         torch.npu.synchronize()
         expected = xc[:, :nc] * torch.sigmoid(xc[:, :nc]) * yc[:, :nc] + .25
         for out, allocation in zip(outputs, allocations):

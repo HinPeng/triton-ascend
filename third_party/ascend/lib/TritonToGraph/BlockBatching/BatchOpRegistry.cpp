@@ -1,7 +1,7 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #include "TritonToGraph/BlockBatching/BatchOpRegistry.h"
-#include "TritonToGraph/BlockBatching/MemoryModels.h"
 #include "TritonToGraph/BlockBatching/ElementwiseModels.h"
+#include "TritonToGraph/BlockBatching/MemoryModels.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/Support/ErrorHandling.h"

@@ -77,7 +77,10 @@ from triton.backends.ascend.block_batching import BatchRequest, analyze_request,
 from triton.backends.ascend.block_batching import memory_compile_options as batching_memory_compile_options
 from triton.backends.ascend.block_batching import vv_layout_refusal as batching_vv_layout_refusal
 from triton.backends.ascend.block_batching_report import (
-    VALIDATION_POLICY, CV_AUTO_BLOCKIFY_LOWERINGS, CV_MASKED_BATCH_LOWERINGS, validate_compilation_result,
+    VALIDATION_POLICY,
+    CV_AUTO_BLOCKIFY_LOWERINGS,
+    CV_MASKED_BATCH_LOWERINGS,
+    validate_compilation_result,
 )
 from triton.backends.ascend.program_grid import (
     DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK,
@@ -254,8 +257,7 @@ def _finalize_program_launch_policy(metadata, opt):
     if cv_report.get("cv_mode") in ("independent_batch_v1", "spatial_concat_v1"):
         # The admitted CV lowerings retain the original-grid ABI while
         # AutoBlockify loops over grouped programs, including uniform regions.
-        auto_blockify_enabled &= (cv_report.get("cv_lowering")
-                                  in CV_AUTO_BLOCKIFY_LOWERINGS
+        auto_blockify_enabled &= (cv_report.get("cv_lowering") in CV_AUTO_BLOCKIFY_LOWERINGS
                                   and metadata["mix_mode"] == "mix")
 
     if auto_blockify_enabled and ptsm_cap_authorized:
@@ -417,9 +419,9 @@ def make_ttir(mod, metadata, opt):
         report["owner"] = "block_batching"
         refusal = batching_vv_layout_refusal(report)
         if refusal:
-            raise BatchingRejected(refusal, analysis={
-                key: report[key] for key in ("selected_axis", "operations", "layout")
-            })
+            raise BatchingRejected(refusal,
+                                   analysis={key: report[key]
+                                             for key in ("selected_axis", "operations", "layout")})
         report["plan_id"] = metadata["hash"]
         report["candidate_factor"] = opt.block_batching_factor
         metadata["block_batching"] = report
@@ -1009,7 +1011,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += _full_row_copy_compile_options(metadata, npu_compiler_path)
             if "block_batching" in metadata:
                 for option in batching_memory_compile_options(metadata, npu_compiler_path,
-                                                               _supports_full_row_copy_inlining):
+                                                              _supports_full_row_copy_inlining):
                     if option not in _compile_option_list:
                         _compile_option_list.append(option)
             # Temporary until the NPU compiler enables batch matmul by default in Q4.

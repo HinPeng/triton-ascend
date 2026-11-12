@@ -220,8 +220,8 @@ class SpatialBuilder {
         if (op == coordinate.getOperation() || isa<scf::YieldOp>(op))
           continue;
         if (auto loop = dyn_cast<scf::ForOp>(op)) {
-          if (dim(loop.getLowerBound()) >= 0 || dim(loop.getUpperBound()) >= 0 ||
-              dim(loop.getStep()) >= 0)
+          if (dim(loop.getLowerBound()) >= 0 ||
+              dim(loop.getUpperBound()) >= 0 || dim(loop.getStep()) >= 0)
             return reject("CV_SPATIAL_VARYING_CONTROL");
           auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
           for (auto [init, arg, end, result] :
@@ -274,10 +274,11 @@ class SpatialBuilder {
           auto order = trans.getOrder();
           d = std::find(order.begin(), order.end(), d) - order.begin();
         } else if (auto broadcast = dyn_cast<triton::BroadcastOp>(op)) {
-          if (cast<RankedTensorType>(broadcast.getSrc().getType()).getDimSize(d) !=
-              broadcast.getType().getDimSize(d))
+          if (cast<RankedTensorType>(broadcast.getSrc().getType())
+                  .getDimSize(d) != broadcast.getType().getDimSize(d))
             return reject("CV_SPATIAL_BROADCAST_AXIS_NOT_PROVEN");
-        } else if (!(elementwise(op) || isa<triton::LoadOp, triton::StoreOp>(op)))
+        } else if (!(elementwise(op) ||
+                     isa<triton::LoadOp, triton::StoreOp>(op)))
           return reject("CV_SPATIAL_OPERATION_NOT_SUPPORTED");
         for (Value result : op->getResults())
           if (failed(mark(result, d)))
@@ -307,15 +308,17 @@ class SpatialBuilder {
     OpBuilder::InsertionGuard guard(rw);
     SmallVector<Type> types;
     for (Value result : op->getResults())
-      types.push_back(dim(result) < 0 ? result.getType()
-                                     : Type(wider(result.getType(), dim(result))));
+      types.push_back(dim(result) < 0
+                          ? result.getType()
+                          : Type(wider(result.getType(), dim(result))));
     Operation *replacement;
     if (auto branch = dyn_cast<scf::IfOp>(op)) {
       auto created = rw.create<scf::IfOp>(op->getLoc(), types,
                                           mapped.lookup(branch.getCondition()),
                                           !branch.getElseRegion().empty());
       created->setAttrs(op->getAttrs());
-      for (auto [from, to] : llvm::zip(op->getRegions(), created->getRegions())) {
+      for (auto [from, to] :
+           llvm::zip(op->getRegions(), created->getRegions())) {
         if (from.empty())
           continue;
         while (!to.front().empty())
@@ -327,7 +330,8 @@ class SpatialBuilder {
     } else {
       auto loop = cast<scf::ForOp>(op);
       SmallVector<Value> init;
-      for (auto [value, result] : llvm::zip(loop.getInitArgs(), loop.getResults())) {
+      for (auto [value, result] :
+           llvm::zip(loop.getInitArgs(), loop.getResults())) {
         Value next = materialize(value, dim(result));
         if (!next)
           return reject("CV_SPATIAL_UNIFORM_INIT_NOT_PROVEN");
@@ -349,12 +353,14 @@ class SpatialBuilder {
             rw.eraseOp(&region.front().back());
         rw.setInsertionPointToEnd(&gate.getThenRegion().front());
       }
-      auto created = rw.create<scf::ForOp>(op->getLoc(), lower, upper, step, init);
+      auto created =
+          rw.create<scf::ForOp>(op->getLoc(), lower, upper, step, init);
       created->setAttrs(op->getAttrs());
       while (!created.getBody()->empty())
         rw.eraseOp(&created.getBody()->back());
       mapped.map(loop.getInductionVar(), created.getInductionVar());
-      for (auto [from, to] : llvm::zip(loop.getRegionIterArgs(), created.getRegionIterArgs()))
+      for (auto [from, to] :
+           llvm::zip(loop.getRegionIterArgs(), created.getRegionIterArgs()))
         mapped.map(from, to);
       if (failed(rewriteRegion(*loop.getBody(), *created.getBody())))
         return failure();
@@ -368,7 +374,8 @@ class SpatialBuilder {
         replacement = created;
       }
     }
-    for (auto [from, to] : llvm::zip(op->getResults(), replacement->getResults()))
+    for (auto [from, to] :
+         llvm::zip(op->getResults(), replacement->getResults()))
       mapped.map(from, to);
     return success();
   }
@@ -398,7 +405,8 @@ class SpatialBuilder {
     if (auto yield = dyn_cast<scf::YieldOp>(op)) {
       Operation *parent = op->getParentOp();
       SmallVector<Value> operands;
-      for (auto [value, result] : llvm::zip(yield.getOperands(), parent->getResults())) {
+      for (auto [value, result] :
+           llvm::zip(yield.getOperands(), parent->getResults())) {
         Value next = materialize(value, dim(result));
         if (!next)
           return reject("CV_SPATIAL_UNIFORM_YIELD_NOT_PROVEN");
@@ -427,10 +435,10 @@ class SpatialBuilder {
                     : DenseFPElementsAttr{};
         auto integer = c ? dyn_cast<DenseIntElementsAttr>(c.getValue())
                          : DenseIntElementsAttr{};
-        bool zero = (fp && fp.isSplat() &&
-                     fp.getSplatValue<APFloat>().isZero()) ||
-                    (integer && integer.isSplat() &&
-                     integer.getSplatValue<APInt>().isZero());
+        bool zero =
+            (fp && fp.isSplat() && fp.getSplatValue<APFloat>().isZero()) ||
+            (integer && integer.isSplat() &&
+             integer.getSplatValue<APInt>().isZero());
         if (!zero)
           return reject("CV_SPATIAL_REQUIRES_ZERO_ACCUMULATOR");
       }

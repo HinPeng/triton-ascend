@@ -6,6 +6,7 @@ from triton.runtime import driver
 
 pytestmark = pytest.mark.backend("native")
 
+
 @pytest.mark.parametrize('aic,aiv', [(28, 56), (16, 32), (8, 16)])
 def test_vector_kernel_floor_uses_vector_cores(monkeypatch, aic, aiv):
     utils = SimpleNamespace(get_aicore_num=lambda: aic, get_aivector_core_num=lambda: aiv)

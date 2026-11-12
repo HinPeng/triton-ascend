@@ -35,8 +35,8 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor);
 // Read-only proof for automatic axis selection. Uses the same closed-region
 // check as the memory rewrite and requires unit-stride column accesses.
 bool hasBatchColumnPointwiseRegion(triton::FuncOp function,
-                                  const BatchAccessReport &accesses,
-                                  int axis, int64_t factor);
+                                   const BatchAccessReport &accesses, int axis,
+                                   int64_t factor);
 std::string serializeBatchLayouts(ArrayRef<BatchLayoutPlan> plans);
 LogicalResult rewriteBatchMemoryViews(ModuleOp module,
                                       const BatchAccessReport &accesses,

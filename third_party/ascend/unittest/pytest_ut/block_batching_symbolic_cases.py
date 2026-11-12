@@ -5,8 +5,7 @@
 def symbolic_columns_ir():
     source = symbolic_memory_ir()
     return source.replace(
-        "%cw = arith.extsi %cc : tensor<4xi32> to tensor<4xi64>",
-        """%column_p = tt.get_program_id y : i32
+        "%cw = arith.extsi %cc : tensor<4xi32> to tensor<4xi64>", """%column_p = tt.get_program_id y : i32
     %column_pw = arith.extsi %column_p : i32 to i64
     %four = arith.constant 4 : i64
     %column_base = arith.muli %column_pw, %four : i64

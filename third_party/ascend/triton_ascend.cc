@@ -93,8 +93,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
   });
   m.def("block_batching_has_dynamic_contiguous_copy",
         &mlir::triton::cfg::hasBatchDynamicContiguousCopy);
-  m.def("lower_block_batching_scans",
-        &mlir::triton::cfg::lowerBatchLaneScans);
+  m.def("lower_block_batching_scans", &mlir::triton::cfg::lowerBatchLaneScans);
   m.def("clear_block_batching_owner", [](mlir::ModuleOp module) {
     auto owner =
         module->getAttrOfType<mlir::StringAttr>("hacc.block_mapping_owner");

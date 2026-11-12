@@ -152,10 +152,8 @@ def test_sum_reduce_and_shared_weight(tmp_path):
 @pytest.mark.parametrize('rows', [2, 4, 5, 7])
 def test_auto_axis_accepts_partial_groups_and_skips_singletons(tmp_path, rows):
     text = pointwise(1).replace(
-        'module {',
-        f'module attributes {{hacc.block_batching_grid = [1 : i64, {rows} : i64, 1 : i64]}} {{', 1)
-    text = text.replace('%p = tt.get_program_id y',
-                        '%unused = tt.get_program_id x : i32\n    %p = tt.get_program_id y')
+        'module {', f'module attributes {{hacc.block_batching_grid = [1 : i64, {rows} : i64, 1 : i64]}} {{', 1)
+    text = text.replace('%p = tt.get_program_id y', '%unused = tt.get_program_id x : i32\n    %p = tt.get_program_id y')
     module = parse(tmp_path, text)
     report = ascend.passes.ttir.rewrite_block_batching(module, 3, -1)
     assert report['compile_status'] == 'REWRITTEN', report

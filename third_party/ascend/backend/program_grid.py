@@ -135,7 +135,7 @@ def normalize_program_grid_transforms(raw: Any) -> dict[str, Any]:
     transforms_raw = contract["transforms"]
     if isinstance(transforms_raw, (str, bytes)) or not isinstance(transforms_raw, Sequence):
         raise ProgramGridContractError("transforms must be a sequence")
-    if len(transforms_raw) not in ((1,) if batch else (1, 2)):
+    if len(transforms_raw) not in ((1, ) if batch else (1, 2)):
         raise ProgramGridContractError("transforms must contain one or two entries")
 
     transforms: list[dict[str, Any]] = []

@@ -1,6 +1,6 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-#include "TritonToGraph/BlockBatching/BatchFactsJSON.h"
 #include "TritonToGraph/BlockBatching/BatchAccessAnalysis.h"
+#include "TritonToGraph/BlockBatching/BatchFactsJSON.h"
 #include "TritonToGraph/BlockBatching/BatchLoopForm.h"
 #include "TritonToGraph/BlockBatching/MemoryModels.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -342,19 +342,19 @@ struct Analysis {
         unsigned bytes = width(arg, normalizedBool);
         if (!bytes)
           return {};
-        E iteration = K::node(
-            K::Sub, 64,
-            K::leaf(K::Induction,
-                    inductionVariables.lookup(loop.getInductionVar()),
-                    bits(loop.getInductionVar().getType())),
-            integer(loop.getLowerBound(), {}));
+        E iteration =
+            K::node(K::Sub, 64,
+                    K::leaf(K::Induction,
+                            inductionVariables.lookup(loop.getInductionVar()),
+                            bits(loop.getInductionVar().getType())),
+                    integer(loop.getLowerBound(), {}));
         // Pointer arithmetic is summarized, not rewritten. The byte-domain
         // guard checks the complete original loop range and every pointer
         // intermediate for overflow, allocation bounds and noninterference.
-        base.offset = add(
-            std::move(base.offset),
-            scale(K::node(K::Mul, 64, std::move(iteration),
-                          integer(recurrence->second, axes)), bytes));
+        base.offset = add(std::move(base.offset),
+                          scale(K::node(K::Mul, 64, std::move(iteration),
+                                        integer(recurrence->second, axes)),
+                                bytes));
         base.checks.push_back(base.offset);
         return base;
       }
@@ -497,7 +497,8 @@ struct Analysis {
       if (!rhs || rhs->kind != K::Constant || rhs->value != 0)
         return K::leaf(K::Unknown);
       return K::node(K::SLT, bits(cmp.getLhs().getType()),
-                     constant(-1, bits(cmp.getLhs().getType())), std::move(lhs));
+                     constant(-1, bits(cmp.getLhs().getType())),
+                     std::move(lhs));
     }
     return K::node(kind, bits(cmp.getLhs().getType()), std::move(lhs),
                    std::move(rhs));
@@ -616,8 +617,8 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
         fact.lower = analysis.integer(loop.getLowerBound(), {});
         fact.upper = analysis.integer(loop.getUpperBound(), {});
         fact.step = analysis.integer(loop.getStep(), {});
-        // 跨行归约在 IR 里的对应物就是 iter_args，判定层的关卡 1.5a 查的是这一位
-        // （设计 §2.4 第 13 行）。这里是它全程唯一的生产者。
+        // 跨行归约在 IR 里的对应物就是 iter_args，判定层的关卡 1.5a
+        // 查的是这一位 （设计 §2.4 第 13 行）。这里是它全程唯一的生产者。
         fact.carriesValues = batchLoopCarriesValues(loop);
         loops.push_back(std::move(fact));
       }

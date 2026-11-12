@@ -15,21 +15,21 @@ def joint_spec():
     accesses = []
     for column in range(3):
         offset = add(base, const(4 * column))
-        accesses.append(dict(root=0, shape=[], bytes=4, write=True, offset=offset,
-                             mask=None, pointer_checks=[base, offset], loops=[]))
+        accesses.append(
+            dict(root=0, shape=[], bytes=4, write=True, offset=offset, mask=None, pointer_checks=[base, offset],
+                 loops=[]))
     accesses[0]["shape"] = [3]
     accesses[0]["offset"] = add(base, mul(coord(0, 3), const(4)))
     accesses[1]["mask"] = accesses[2]["mask"] = ["false"]
-    accesses.append(dict(root=1, shape=[], bytes=4, write=False,
-                         offset=mul(["extsi", 64, pid(0), 32], const(4)),
-                         mask=None, pointer_checks=[], loops=[]))
+    accesses.append(
+        dict(root=1, shape=[], bytes=4, write=False, offset=mul(["extsi", 64, pid(0), 32], const(4)), mask=None,
+             pointer_checks=[], loops=[]))
     return dict(version=2, axis=0, accesses=accesses)
 
 
 @pytest.mark.parametrize("rows,stride,factor", itertools.product([1, 2, 7, 512], [0, 1, 2, 3, 5], [2, 3]))
 def test_joint_injectivity_matches_explicit_byte_sets(rows, stride, factor):
-    writes = [set(range(4 * (r * stride + c), 4 * (r * stride + c + 1)))
-              for r in range(rows) for c in range(3)]
+    writes = [set(range(4 * (r * stride + c), 4 * (r * stride + c + 1))) for r in range(rows) for c in range(3)]
     disjoint = sum(map(len, writes)) == len(set().union(*writes))
     result = guard.check_guard(joint_spec(), [0x100000, 0x200000, stride], (rows, 1, 1), factor)
     assert result[0] == disjoint
@@ -60,16 +60,17 @@ def test_covered_members_still_check_original_arithmetic():
 
 def test_layout_access_ids_remain_valid_for_covered_members():
     spec = deepcopy(joint_spec())
-    spec["layout_checks"] = [dict(version=1, access_id=2, axis=0, factor=3, root=0,
-                                  bytes=4, shape=[3], loops=[], positive=[arg(2)], checks=[const(0)],
-                                  pointer_checks=[const(0), const(8)])]
+    spec["layout_checks"] = [
+        dict(version=1, access_id=2, axis=0, factor=3, root=0, bytes=4, shape=[3], loops=[], positive=[arg(2)],
+             checks=[const(0)], pointer_checks=[const(0), const(8)])
+    ]
     assert guard.check_guard(spec, [0x100000, 0x200000, 3], (7, 1, 1), 3)[0]
 
 
 def test_joint_effect_does_not_hide_other_output_aliases():
     spec = joint_spec()
-    spec["accesses"].append(dict(root=3, shape=[], bytes=4, write=True,
-                                  offset=mul(pid(0), const(4)), mask=None,
-                                  pointer_checks=[], loops=[]))
+    spec["accesses"].append(
+        dict(root=3, shape=[], bytes=4, write=True, offset=mul(pid(0), const(4)), mask=None, pointer_checks=[],
+             loops=[]))
     args = [0x100000, 0x200000, 3, 0x100008]
     assert guard.check_guard(spec, args, (7, 1, 1), 3) == (False, "WRITE_ALIAS")

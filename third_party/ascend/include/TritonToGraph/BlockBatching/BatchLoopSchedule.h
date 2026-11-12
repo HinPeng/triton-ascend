@@ -59,7 +59,8 @@ normalizeBatchLoopCoordinates(const BatchLoopFact &loop,
 // 集中在 lower 里（成块发与定长分块的 lower 都是 p*R，step 各份相同），所以代换
 // 之后程序号显式出现在地址里，圈内偏移则是一个各份相同的量。
 //
-// 存在的理由：布局分析整套机制挂在"byteOffset 里有没有 K::Program"上，而带程序轴
+// 存在的理由：布局分析整套机制挂在"byteOffset 里有没有
+// K::Program"上，而带程序轴
 // 循环时程序号住在循环下界里，不在地址里——于是一条按行走的访存会被判成
 // SHARED_ACCESS（"不随程序轴变化"）。代换是把它接上去的那一步。
 //

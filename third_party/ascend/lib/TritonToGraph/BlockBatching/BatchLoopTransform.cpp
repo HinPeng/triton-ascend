@@ -33,8 +33,9 @@ LogicalResult groupBatchLoopIterations(scf::ForOp loop, int64_t factor) {
     return failure();
   // Match the existing Triton loop-unroll epilogue contract.
   if (grouped->epilogueLoopOp)
-    (*grouped->epilogueLoopOp)->setAttr(
-        "tt.num_stages", IntegerAttr::get(IntegerType::get(context, 32), 1));
+    (*grouped->epilogueLoopOp)
+        ->setAttr("tt.num_stages",
+                  IntegerAttr::get(IntegerType::get(context, 32), 1));
   return success();
 }
 namespace {

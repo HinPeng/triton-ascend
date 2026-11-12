@@ -20,7 +20,8 @@ DOT = "%d = tt.dot %a, %bmat, %acc, inputPrecision = ieee : tensor<4x4xf32> * te
 
 
 def loop_dot():
-    return dot_module().replace(DOT, """
+    return dot_module().replace(
+        DOT, """
     %zero_i = arith.constant 0 : i32
     %one_i = arith.constant 1 : i32
     %d = scf.for %iv = %zero_i to %n step %one_i
@@ -53,8 +54,8 @@ def test_loop_accumulators_and_nested_grid_queries_stay_per_lane(tmp_path, facto
     assert f"tensor<{factor}x4x4xf32>" not in text
     assert module.verify()
     proof = json.loads(report["guard_json"])["cv_control_flow_contract"]
-    assert proof == dict(version=1, lane_semantics="original_program_clone",
-                         uniform_bounds=True, dot_rank=2, for_count=1, if_count=0)
+    assert proof == dict(version=1, lane_semantics="original_program_clone", uniform_bounds=True, dot_rank=2,
+                         for_count=1, if_count=0)
 
 
 @pytest.mark.parametrize("change,reason", [
@@ -70,7 +71,8 @@ def test_loop_rejection_is_transactional(tmp_path, change, reason):
 
 
 def test_program_id_only_inside_uniform_if_is_remapped(tmp_path):
-    text = dot_module().replace("    %p =", """
+    text = dot_module().replace(
+        "    %p =", """
     %z = arith.constant 0 : i32
     %cond = arith.cmpi sgt, %n, %z : i32
     scf.if %cond {
@@ -85,7 +87,8 @@ def test_program_id_only_inside_uniform_if_is_remapped(tmp_path):
 
 
 def test_varying_if_inside_loop_is_rejected(tmp_path):
-    text = loop_dot().replace("      %next =", """
+    text = loop_dot().replace(
+        "      %next =", """
       %cond = arith.cmpi sgt, %nested_p, %zero_i : i32
       scf.if %cond { scf.yield }
       %next =""")
@@ -159,9 +162,10 @@ def test_uniform_control_auto_blockify_requires_owned_contract_and_launch_checks
     with pytest.raises(BatchingRejected, match="CV_UNIFORM_CONTROL_CONTRACT_MISSING"):
         validate_compilation_result(metadata)
     metadata["block_batching"]["guard"] = {}
-    metadata["block_batching"]["guard"]["cv_control_flow_contract"] = dict(
-        version=1, lane_semantics="original_program_clone", uniform_bounds=True,
-        dot_rank=2, for_count=1, if_count=0)
+    metadata["block_batching"]["guard"]["cv_control_flow_contract"] = dict(version=1,
+                                                                           lane_semantics="original_program_clone",
+                                                                           uniform_bounds=True, dot_rank=2, for_count=1,
+                                                                           if_count=0)
     metadata["auto_blockify_enabled"] = False
     validate_compilation_result(metadata)
     metadata["auto_blockify_enabled"] = True
@@ -182,13 +186,15 @@ def test_uniform_control_auto_blockify_requires_owned_contract_and_launch_checks
 
 @pytest.mark.parametrize('data_dependent', [False, True])
 def test_control_lower_bound_mask_keeps_stronger_memory_guard(tmp_path, data_dependent):
-    text = loop_dot().replace('    %v = tt.load %xa :', '''
+    text = loop_dot().replace(
+        '    %v = tt.load %xa :', '''
     %zi = arith.constant dense<0> : tensor<4xi32>
     %lower = arith.cmpi sge, %range, %zi : tensor<4xi32>
     %both = arith.andi %lower, %mask : tensor<4xi1>
     %v = tt.load %xa, %both, %zero :''')
     if data_dependent:
-        text = text.replace('    %lower = arith.cmpi sge, %range, %zi : tensor<4xi32>', '''
+        text = text.replace(
+            '    %lower = arith.cmpi sge, %range, %zi : tensor<4xi32>', '''
         %data = tt.load %xa : tensor<4x!tt.ptr<f32>>
         %lower = arith.cmpf ogt, %data, %zero : tensor<4xf32>''')
     module = parse(tmp_path, text)
@@ -208,7 +214,8 @@ def test_control_lower_bound_mask_keeps_stronger_memory_guard(tmp_path, data_dep
 
 @pytest.mark.parametrize('other', ['0.0', '1.0', '0x7FC00000'])
 def test_normalized_block_pointer_zero_padding_is_recognized(tmp_path, other):
-    text = loop_dot().replace('%zero = arith.constant dense<0.0> : tensor<4xf32>',
+    text = loop_dot().replace(
+        '%zero = arith.constant dense<0.0> : tensor<4xf32>',
         f'%scalar_zero = arith.constant {other} : f32\n    %zero = tt.splat %scalar_zero : f32 -> tensor<4xf32>')
     text = text.replace('tt.load %xa :', 'tt.load %xa, %mask, %zero :')
     module = parse(tmp_path, text)

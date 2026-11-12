@@ -12,8 +12,8 @@ from triton.runtime import driver
 
 
 @triton.jit
-def scan_combinations(X, A, C, N: tl.constexpr, STRIDE: tl.constexpr,
-                      B: tl.constexpr, REVERSE: tl.constexpr, COMBINATION: tl.constexpr):
+def scan_combinations(X, A, C, N: tl.constexpr, STRIDE: tl.constexpr, B: tl.constexpr, REVERSE: tl.constexpr,
+                      COMBINATION: tl.constexpr):
     row = tl.program_id(0)
     col = tl.arange(0, B)
     x = tl.load(X + row * STRIDE + col, col < N, other=0)
@@ -31,18 +31,16 @@ def scan_combinations(X, A, C, N: tl.constexpr, STRIDE: tl.constexpr,
 
 
 # (factor, columns, grouping, dtype, reverse, combination, values, resource_case)
-CASES = [
-    (f, 31 if f >= 8 else 127, 'full' if i % 2 == 0 else 'tail',
-     'i32' if i % 2 else 'f32', bool(i % 2), 0, 'integers', False)
-    for i, f in enumerate((2, 3, 6, 8, 16, 32, 64))
-]
+CASES = [(f, 31 if f >= 8 else 127, 'full' if i % 2 == 0 else 'tail', 'i32' if i % 2 else 'f32', bool(i % 2), 0,
+          'integers', False) for i, f in enumerate((2, 3, 6, 8, 16, 32, 64))]
 CASES += [(2, n, 'tail', 'f32', bool(i % 2), i % 3, 'random', n == 4097)
           for i, n in enumerate((15, 16, 17, 255, 256, 257, 4095, 4096, 4097))]
 CASES += [(3, 257, 'tail', 'f32', bool(i % 2), 0, kind, False)
-          for i, kind in enumerate(('mixed', 'cancellation', 'zeros', 'nan', 'positive_inf', 'negative_inf', 'both_inf'))]
+          for i, kind in enumerate(('mixed', 'cancellation', 'zeros', 'nan', 'positive_inf', 'negative_inf',
+                                    'both_inf'))]
 CASES += [(f, 63, grouping, 'i32', reverse, combination, 'integers', False)
-          for f, grouping, reverse, combination in ((3, 'full', False, 1), (6, 'tail', True, 2),
-                                                   (8, 'tail', False, 1), (16, 'full', True, 2))]
+          for f, grouping, reverse, combination in ((3, 'full', False, 1), (6, 'tail', True, 2), (8, 'tail', False, 1),
+                                                    (16, 'full', True, 2))]
 CASES += [(2, 127, grouping, 'f32', False, 0, 'integers', False)
           for grouping in ('below_floor', 'at_floor_tail', 'at_floor')]
 CASES += [(f, 8193, 'tail', 'f32', False, 2, 'integers', True) for f in (32, 64)]
@@ -67,8 +65,8 @@ def source_values(rows, width, dtype, kind):
         value.zero_()
         value[:, ::2] = -0.
     elif kind in ('nan', 'positive_inf', 'negative_inf', 'both_inf'):
-        value[:, width // 3] = dict(nan=float('nan'), positive_inf=float('inf'),
-                                  negative_inf=-float('inf'), both_inf=float('inf'))[kind]
+        value[:, width // 3] = dict(nan=float('nan'), positive_inf=float('inf'), negative_inf=-float('inf'),
+                                    both_inf=float('inf'))[kind]
         if kind == 'both_inf':
             value[:, 2 * width // 3] = -float('inf')
     return value
@@ -123,7 +121,7 @@ def test_scan_generalization(case, tmp_path):
     for f, out in zip((1, factor), outputs):
         args = (x, *out, columns, stride, triton.next_power_of_2(columns), reverse, combination)
         options = dict(block_batching_factor=f, num_warps=4, num_stages=1)
-        compiled = scan_combinations.warmup(*args, grid=(rows,), **options)
+        compiled = scan_combinations.warmup(*args, grid=(rows, ), **options)
         kernel = compiled if f == 1 else compiled.candidate
         label = 'baseline' if f == 1 else 'candidate'
         if kernel is not None:
@@ -132,7 +130,7 @@ def test_scan_generalization(case, tmp_path):
             (folder / (label + '.json')).write_text(json.dumps(kernel.metadata._asdict(), default=str, indent=2))
         if f != 1:
             (folder / 'compile_report.json').write_text(json.dumps(compiled.block_batching, default=str, indent=2))
-        kernels.append(scan_combinations[(rows,)](*args, **options))
+        kernels.append(scan_combinations[(rows, )](*args, **options))
         torch.npu.synchronize()
     wrapper = kernels[1]
     record = dict(case=case, rows=rows, available_aiv=cores, launch=dict(wrapper.last_launch),
@@ -149,8 +147,7 @@ def test_scan_generalization(case, tmp_path):
     for pair in host:
         for index, (out, expected) in enumerate(zip(pair, (first, second))):
             inputs = source * 2 + 1 if index == 1 and combination == 1 else source
-            check_values(out[:rows, :columns], expected, inputs, reverse, dtype,
-                         combination if index else 0)
+            check_values(out[:rows, :columns], expected, inputs, reverse, dtype, combination if index else 0)
             assert torch.all(out[:rows, columns:] == -12345)
             assert torch.all(out[rows:] == -12345)
     for index, (base, batched) in enumerate(zip(host[0], host[1])):

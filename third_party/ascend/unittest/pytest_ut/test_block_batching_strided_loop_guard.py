@@ -30,10 +30,9 @@ def mul(a, b):
 
 def strided_access(strides=(256, 64, 8), *, write=True):
     p, r, s = strides
-    offset = add(mul(['pid', 0, 32], c(p)),
-                 add(mul(['coord', 0, 2, 32], c(r)), mul(['coord', 1, 3, 32], c(s))))
-    return dict(root=0, shape=[2, 3], offset=offset, mask=None, bytes=4,
-                write=write, volatile=False, pointer_checks=[offset], loops=[])
+    offset = add(mul(['pid', 0, 32], c(p)), add(mul(['coord', 0, 2, 32], c(r)), mul(['coord', 1, 3, 32], c(s))))
+    return dict(root=0, shape=[2, 3], offset=offset, mask=None, bytes=4, write=write, volatile=False,
+                pointer_checks=[offset], loops=[])
 
 
 def test_gapped_reads_and_writes_have_a_conservative_byte_interval():
@@ -83,13 +82,12 @@ def test_gapped_write_proof_against_enumerated_bytes():
 
 def varying_upper_access():
     offset = add(mul(['pid', 0, 32], c(2048)),
-                 add(mul(['pid', 1, 32], c(256)),
-                     add(mul(['iv', 0, 32], c(32)), mul(['coord', 0, 4, 32], c(8)))))
-    return dict(root=0, shape=[4], offset=offset, mask=None, bytes=4, write=True,
-                volatile=False, pointer_checks=[offset], loops=[
-                    dict(id=0, bits=32, lower=['const', 0, 32],
-                         upper=['pid_rem', 1, 4, 32], step=['const', 1, 32]),
-                ])
+                 add(mul(['pid', 1, 32], c(256)), add(mul(['iv', 0, 32], c(32)), mul(['coord', 0, 4, 32], c(8)))))
+    return dict(
+        root=0, shape=[4], offset=offset, mask=None, bytes=4, write=True, volatile=False, pointer_checks=[offset],
+        loops=[
+            dict(id=0, bits=32, lower=['const', 0, 32], upper=['pid_rem', 1, 4, 32], step=['const', 1, 32]),
+        ])
 
 
 def test_nonmerged_program_loop_upper_is_proved_by_a_superset():
@@ -107,7 +105,7 @@ def test_nonmerged_program_loop_upper_is_proved_by_a_superset():
     # p_other=0 has zero iterations; an envelope may include those phantom
     # accesses, which can only cause conservative rejection, never acceptance.
     assert interval[0] < min(touched)
-    assert domain.loop_counts == (3,)
+    assert domain.loop_counts == (3, )
 
 
 def test_loop_bound_split_and_arithmetic_are_not_ignored():
@@ -128,8 +126,7 @@ def test_loop_envelope_does_not_relax_vv_axis_absorption_or_aliases():
         ByteDomain([], (2, 4, 1), invalid)
     output = strided_access()
     output['root'] = 1
-    assert not check_guard_v2(dict(version=2, axis=0, accesses=[spec, output]),
-                             [4096, 4096], (2, 4, 1), 2)[0]
+    assert not check_guard_v2(dict(version=2, axis=0, accesses=[spec, output]), [4096, 4096], (2, 4, 1), 2)[0]
 
 
 def test_all_zero_trip_envelopes_have_no_effect():

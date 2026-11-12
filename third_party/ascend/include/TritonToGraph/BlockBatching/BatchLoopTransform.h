@@ -14,8 +14,9 @@ LogicalResult groupBatchLoopIterations(scf::ForOp loop, int64_t factor);
 // 都由既有的重建逻辑照常处理（BatchRewrite.cpp:457-493），不新建一条路径。
 //
 // 不认 triton::GetProgramIdOp，改为由调用方把"原来的程序号"和"合并后的标量
-// group*F"一并传进来。驱动层本来就已经找到了那个 op（BatchRewrite.cpp:298-303），
-// 这样本文件只依赖 arith 与 scf，不把 Triton dialect 拖进变换层。
+// group*F"一并传进来。驱动层本来就已经找到了那个
+// op（BatchRewrite.cpp:298-303）， 这样本文件只依赖 arith 与 scf，不把 Triton
+// dialect 拖进变换层。
 //
 // 没有 factor 入参：成块发的界只换程序号、步长不动，F 全部体现在调用方算好的
 // foldedProgramId 里；块宽放大 F 倍是布局层按 axis.chunk * F 做的，不在这里。

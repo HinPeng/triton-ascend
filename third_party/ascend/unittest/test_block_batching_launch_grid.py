@@ -17,6 +17,7 @@ def assign_npu():
 
 @pytest.fixture(params=[False, True], ids=["native", "reuse-continuation"])
 def frontend(monkeypatch, request):
+
     @triton.jit
     def kernel(out, rows, N: tl.constexpr, BLOCK_N: tl.constexpr = 4096):
         row = tl.program_id(1)
@@ -38,14 +39,14 @@ def frontend(monkeypatch, request):
 
     def compile_kernel(key, signature, device, constexprs, options, attrs, warmup):
         events.append("compile")
-        result = SimpleNamespace(options=options, function=0, packed_metadata=(),
-                                 launch_metadata=lambda *a: None,
+        result = SimpleNamespace(options=options, function=0, packed_metadata=(), launch_metadata=lambda *a: None,
                                  run=lambda *a: launches.append(a[:3]))
         compiled.append(result)
         kernel.device_caches[0][0][key] = result
         return result
 
     class Handler:
+
         def run(self, fn, args, kwargs, grid, warmup, device, stream, backend, tail):
             events.append(("handler", kwargs.get("block_batching_grid"), callable(grid)))
             return tail(args, kwargs, grid, warmup, device, stream, frame=InvocationFrame())
@@ -57,8 +58,9 @@ def frontend(monkeypatch, request):
     kernel.device_caches[0] = ({}, {}, None, backend, binder)
     monkeypatch.setattr(kernel, "_pack_args", pack)
     monkeypatch.setattr(kernel, "_do_compile", compile_kernel)
-    monkeypatch.setattr(jit_module, "driver", SimpleNamespace(active=SimpleNamespace(
-        get_current_device=lambda: 0, get_current_stream=lambda d: 0)))
+    monkeypatch.setattr(
+        jit_module, "driver",
+        SimpleNamespace(active=SimpleNamespace(get_current_device=lambda: 0, get_current_stream=lambda d: 0)))
 
     def grid(meta):
         callback_calls.append(dict(meta))
@@ -70,8 +72,8 @@ def frontend(monkeypatch, request):
         options.setdefault("block_batching_axis", -1)
         return kernel.run(0, rows, N=4096, grid=launch_grid, warmup=warmup, **options)
 
-    return SimpleNamespace(run=run, grid=grid, compiled=compiled, launches=launches,
-                           calls=callback_calls, events=events, reuse=request.param)
+    return SimpleNamespace(run=run, grid=grid, compiled=compiled, launches=launches, calls=callback_calls,
+                           events=events, reuse=request.param)
 
 
 def test_callable_hint_precedes_cache_and_reuse(frontend):
@@ -88,7 +90,6 @@ def test_callable_hint_precedes_cache_and_reuse(frontend):
     if f.reuse:
         handlers = [e for e in f.events if isinstance(e, tuple)]
         assert all(e[1] is not None and e[2] is False for e in handlers)
-
 
 
 def test_callable_closure_changes_axis_without_argument_changes(frontend):
@@ -118,8 +119,10 @@ def test_static_and_callable_share_cache_identity(frontend):
 
 
 @pytest.mark.parametrize("options", [
-    {"block_batching_factor": 1}, {"block_batching_axis": 0},
-    {"block_batching_cv": True}, {"block_batching_grid": (1, 16, 1)},
+    {"block_batching_factor": 1},
+    {"block_batching_axis": 0},
+    {"block_batching_cv": True},
+    {"block_batching_grid": (1, 16, 1)},
 ])
 def test_explicit_and_unmerged_callable_keep_late_resolution(frontend, options):
     f = frontend
@@ -175,13 +178,15 @@ def test_explicit_axis_grid_changes_reuse_one_compilation(frontend, axis):
     calls = []
 
     def callable_grid(extent):
+
         def grid(meta):
             calls.append(extent)
-            return (extent,)
+            return (extent, )
+
         return grid
 
-    first = f.run(launch_grid=(128,), block_batching_axis=axis)
-    for grid in ((256,), [128], callable_grid(256), callable_grid(128)):
+    first = f.run(launch_grid=(128, ), block_batching_axis=axis)
+    for grid in ((256, ), [128], callable_grid(256), callable_grid(128)):
         assert f.run(launch_grid=grid, block_batching_axis=axis) is first
     assert len(f.compiled) == 1
     assert "block_batching_grid" not in first.options
@@ -191,7 +196,7 @@ def test_explicit_axis_grid_changes_reuse_one_compilation(frontend, axis):
 
 def test_explicit_axis_warmup_reuses_compilation_for_other_grid(frontend):
     f = frontend
-    first = f.run(launch_grid=(128,), block_batching_axis=0, warmup=True)
+    first = f.run(launch_grid=(128, ), block_batching_axis=0, warmup=True)
     assert not f.launches
-    assert f.run(launch_grid=(256,), block_batching_axis=0) is first
+    assert f.run(launch_grid=(256, ), block_batching_axis=0) is first
     assert len(f.compiled) == 1 and f.launches == [(256, 1, 1)]

@@ -300,8 +300,8 @@ batchLoopConstantTripCount(const BatchLoopFact &loop,
 }
 
 BatchLoopArithmetic batchLoopIterationArithmetic(const BatchLoopFact &loop,
-                                                const BatchRangeFacts &facts,
-                                                int64_t factor) {
+                                                 const BatchRangeFacts &facts,
+                                                 int64_t factor) {
   using Result = BatchLoopArithmetic;
   if (factor <= 0 || !loop.bits || loop.bits > 64)
     return Result::Unsafe;
@@ -314,8 +314,8 @@ BatchLoopArithmetic batchLoopIterationArithmetic(const BatchLoopFact &loop,
   auto step = facts.constant(loop.step);
   if (!fits(wide(factor)) || (lower && !fits(wide(*lower))) ||
       (upper && !fits(wide(*upper))) ||
-      (step && (*step <= 0 || !fits(wide(*step)) ||
-               !fits(wide(*step) * wide(factor)))))
+      (step &&
+       (*step <= 0 || !fits(wide(*step)) || !fits(wide(*step) * wide(factor)))))
     return Result::Unsafe;
 
   // These checks also apply when another bound is dynamic. The guard cannot

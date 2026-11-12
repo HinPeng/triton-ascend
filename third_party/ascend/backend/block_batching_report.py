@@ -12,7 +12,10 @@ CV_VALIDATION_POLICY = "ta_cv_integer_rank_two_v23"
 
 CV_MASKED_BATCH_LOWERINGS = ("rank3_masked_batch_v1", "rank3_uniform_control_batch_v1")
 CV_SPATIAL_LOWERINGS = (
-    "spatial_m_v1", "spatial_n_v1", "spatial_m_uniform_control_v1", "spatial_n_uniform_control_v1",
+    "spatial_m_v1",
+    "spatial_n_v1",
+    "spatial_m_uniform_control_v1",
+    "spatial_n_uniform_control_v1",
 )
 
 # Both launch-policy selection and final validation must use the same set.
@@ -20,7 +23,10 @@ CV_SPATIAL_LOWERINGS = (
 # over the transformed grid. Eligibility still requires MIX, no blacklist,
 # no persistent cap, and the owned v3 grid/effect contract below.
 CV_AUTO_BLOCKIFY_LOWERINGS = (
-    *CV_MASKED_BATCH_LOWERINGS, *CV_SPATIAL_LOWERINGS, "static_uniform_control_lanes_v1", "static_integer_lanes_v1",
+    *CV_MASKED_BATCH_LOWERINGS,
+    *CV_SPATIAL_LOWERINGS,
+    "static_uniform_control_lanes_v1",
+    "static_integer_lanes_v1",
 )
 
 
@@ -39,8 +45,7 @@ def validate_vv_loop_contract(metadata):
     if (not grouped or loop is None or report.get('cv_mode') != 'disabled'
             or metadata.get('program_grid_transforms') is not None
             or metadata.get('program_grid_mapping_applied') is not False
-            or metadata.get('row_coalescing_applied') is not False
-            or metadata.get('ptsm_cap_authorized') is not False
+            or metadata.get('row_coalescing_applied') is not False or metadata.get('ptsm_cap_authorized') is not False
             or metadata.get('coalesce_factor', 1) != 1):
         raise BatchingRejected('VV_LOOP_GRID_CONTRACT_MISMATCH')
     return True
@@ -51,19 +56,19 @@ def _validate_cv_contract(metadata):
     report = metadata["block_batching"]
     full_tile_lowerings = ("rank3_full_tile_batch_v1", "rank3_full_tile_batch_v2")
     lowerings = {
-        "independent_batch_v1":
-        ("rank3_batch_v1", "static_masked_lanes_v1", "static_uniform_control_lanes_v1", "static_integer_lanes_v1",
-         *CV_MASKED_BATCH_LOWERINGS, *full_tile_lowerings),
-        "spatial_concat_v1": CV_SPATIAL_LOWERINGS,
+        "independent_batch_v1": ("rank3_batch_v1", "static_masked_lanes_v1", "static_uniform_control_lanes_v1",
+                                 "static_integer_lanes_v1", *CV_MASKED_BATCH_LOWERINGS, *full_tile_lowerings),
+        "spatial_concat_v1":
+        CV_SPATIAL_LOWERINGS,
     }
     if report.get("cv_lowering") not in lowerings.get(report.get("cv_mode"), ()):
         raise BatchingRejected("CV_LOWERING_CONTRACT_MISSING")
     if report.get("cv_lowering") == "static_integer_lanes_v1":
-        expected = dict(version=1, input_bits=8, accumulator_bits=32,
-                        lane_semantics="original_program_clone", dot_rank=2)
+        expected = dict(version=1, input_bits=8, accumulator_bits=32, lane_semantics="original_program_clone",
+                        dot_rank=2)
         proof = report.get("guard", {}).get("cv_integer_contract")
-        if type(proof) is not dict or proof != expected or any(type(proof.get(k)) is not int for k in
-                ('version', 'input_bits', 'accumulator_bits', 'dot_rank')):
+        if type(proof) is not dict or proof != expected or any(
+                type(proof.get(k)) is not int for k in ('version', 'input_bits', 'accumulator_bits', 'dot_rank')):
             raise BatchingRejected("CV_INTEGER_LANE_CONTRACT_MISSING")
     uniform_contracts = {
         "static_uniform_control_lanes_v1": ("original_program_clone", 2),
@@ -74,8 +79,7 @@ def _validate_cv_contract(metadata):
     if report.get("cv_lowering") in uniform_contracts:
         semantics, rank = uniform_contracts[report["cv_lowering"]]
         proof = report.get("guard", {}).get("cv_control_flow_contract", {})
-        if (type(proof) is not dict or proof.get("version") != 1
-                or proof.get("lane_semantics") != semantics
+        if (type(proof) is not dict or proof.get("version") != 1 or proof.get("lane_semantics") != semantics
                 or proof.get("uniform_bounds") is not True or proof.get("dot_rank") != rank
                 or type(proof.get("for_count")) is not int or proof["for_count"] < 0
                 or type(proof.get("if_count")) is not int or proof["if_count"] < 0
@@ -110,9 +114,8 @@ def _validate_cv_contract(metadata):
     auto_blockify = metadata.get("auto_blockify_enabled")
     if auto_blockify is not False and auto_blockify is not True:
         raise BatchingRejected("CV_MAPPING_CONFLICT")
-    if auto_blockify and (report.get("cv_lowering") not in CV_AUTO_BLOCKIFY_LOWERINGS
-                          or metadata.get("mix_mode") != "mix"
-                          or metadata.get("has_auto_blockify_blacklist_op") is not False):
+    if auto_blockify and (report.get("cv_lowering") not in CV_AUTO_BLOCKIFY_LOWERINGS or metadata.get("mix_mode")
+                          != "mix" or metadata.get("has_auto_blockify_blacklist_op") is not False):
         raise BatchingRejected("CV_AUTO_BLOCKIFY_NOT_PROVEN")
     # v1 validates independent programs, not cross-program synchronization.
     # Standard MIX/AIC workspace and per-core CV synchronization are retained.

@@ -27,8 +27,8 @@ def parse(tmp_path, text):
 def fixture(shape="2x512", dtype="f32", axis=1, reverse=False, owner="block_batching", calls=1, mode="aiv"):
     ty = f"tensor<{shape}x{dtype}>"
     attr = f'attributes {{hacc.block_mapping_owner = "{owner}"}}' if owner else ''
-    body = '\n'.join(f'%r{i} = func.call @triton_cumsum(%x, %axis, %reverse) : ({ty}, i32, i1) -> {ty}'
-                     for i in range(calls))
+    body = '\n'.join(
+        f'%r{i} = func.call @triton_cumsum(%x, %axis, %reverse) : ({ty}, i32, i1) -> {ty}' for i in range(calls))
     return f'''module {attr} {{
       func.func private @triton_cumsum({ty}, i32, i1) -> {ty}
       func.func @kernel(%x: {ty}) -> {ty} attributes {{mix_mode = "{mode}", parallel_mode = "simd"}} {{
@@ -63,9 +63,17 @@ def test_lane_scan_preserves_axis_direction_and_type(tmp_path, factor, dtype, re
     assert str(module) == text
 
 
-@pytest.mark.parametrize("change", [dict(owner=None), dict(owner="legacy"), dict(shape="512", axis=0),
-                                      dict(shape="2x8x64", axis=2), dict(shape="3x512"), dict(shape="2x?"),
-                                      dict(axis=0), dict(dtype="f16"), dict(mode="mix")])
+@pytest.mark.parametrize("change", [
+    dict(owner=None),
+    dict(owner="legacy"),
+    dict(shape="512", axis=0),
+    dict(shape="2x8x64", axis=2),
+    dict(shape="3x512"),
+    dict(shape="2x?"),
+    dict(axis=0),
+    dict(dtype="f16"),
+    dict(mode="mix")
+])
 def test_nonmatching_scan_is_unchanged(tmp_path, change):
     module = parse(tmp_path, fixture(**change))
     before = str(module)

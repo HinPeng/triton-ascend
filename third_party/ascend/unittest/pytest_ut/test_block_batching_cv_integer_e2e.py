@@ -8,8 +8,8 @@ import triton.language as tl
 
 
 @triton.jit
-def integer_dot(A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-                MODE: tl.constexpr, BM: tl.constexpr = 32, BN: tl.constexpr = 32):
+def integer_dot(A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, MODE: tl.constexpr, BM: tl.constexpr = 32,
+                BN: tl.constexpr = 32):
     p = tl.program_id(0)
     if MODE == 0:
         rr = p * BM + tl.arange(0, BM)
@@ -49,23 +49,21 @@ def test_integer_cv_device(mode, tail, factor):
     expected = (acpu.double() @ bcpu.double()).to(torch.int32)
     a, b = acpu.npu(), bcpu.npu()
     count = expected.numel()
-    storage = torch.full((count + 128,), 0x13572468, device='npu', dtype=torch.int32)
+    storage = torch.full((count + 128, ), 0x13572468, device='npu', dtype=torch.int32)
     c = storage[64:-64].view(cshape)
-    compiled = integer_dot[(4,)](a, b, c, m, n, k, mode, block_batching_cv=True,
-                                block_batching_factor=factor, block_batching_axis=0,
-                                enable_hivm_batch_matmul=True)
+    compiled = integer_dot[(4, )](a, b, c, m, n, k, mode, block_batching_cv=True, block_batching_factor=factor,
+                                  block_batching_axis=0, enable_hivm_batch_matmul=True)
     torch.npu.synchronize()
     assert compiled.last_launch['runtime_status'] == 'APPLIED', compiled.last_launch
-    assert compiled.block_batching['cv_lowering'] == [
-        'spatial_m_v1', 'spatial_n_v1', 'static_integer_lanes_v1'][mode]
+    assert compiled.block_batching['cv_lowering'] == ['spatial_m_v1', 'spatial_n_v1', 'static_integer_lanes_v1'][mode]
     torch.testing.assert_close(c.cpu(), expected, rtol=0, atol=0)
     assert bool((storage[:64] == 0x13572468).all()) and bool((storage[-64:] == 0x13572468).all())
     assert torch.equal(a.cpu(), acpu) and torch.equal(b.cpu(), bcpu)
 
 
 @triton.jit
-def packed_integer_loop(A, B, C, M: tl.constexpr = 128, N: tl.constexpr = 32,
-                        K: tl.constexpr = 256, BM: tl.constexpr = 32, BK: tl.constexpr = 32):
+def packed_integer_loop(A, B, C, M: tl.constexpr = 128, N: tl.constexpr = 32, K: tl.constexpr = 256,
+                        BM: tl.constexpr = 32, BK: tl.constexpr = 32):
     """Liger-style packed int2 decode, with directly provable MN coordinates."""
     rows = tl.program_id(0) * BM + tl.arange(0, BM)
     cols = tl.arange(0, N)
@@ -90,11 +88,10 @@ def test_packed_integer_nested_loop_device(factor):
     bcpu = torch.cat([((packed.int() >> (2 * plane)) & 3) - 1 for plane in range(4)])
     expected = (acpu.double() @ bcpu.double()).to(torch.int32)
     a, b = acpu.npu(), packed.npu()
-    storage = torch.full((128 * 32 + 128,), 0x13572468, device='npu', dtype=torch.int32)
+    storage = torch.full((128 * 32 + 128, ), 0x13572468, device='npu', dtype=torch.int32)
     c = storage[64:-64].view(128, 32)
-    compiled = packed_integer_loop[(4,)](a, b, c, block_batching_cv=True,
-                                        block_batching_factor=factor, block_batching_axis=0,
-                                        enable_hivm_batch_matmul=True)
+    compiled = packed_integer_loop[(4, )](a, b, c, block_batching_cv=True, block_batching_factor=factor,
+                                          block_batching_axis=0, enable_hivm_batch_matmul=True)
     torch.npu.synchronize()
     assert compiled.last_launch['runtime_status'] == 'APPLIED', compiled.last_launch
     assert compiled.block_batching['cv_lowering'] == 'spatial_m_uniform_control_v1'

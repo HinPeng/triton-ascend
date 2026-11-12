@@ -11,9 +11,9 @@ from triton.runtime import driver
 
 
 @triton.jit
-def equivalent_rows(X, Y, Z, Alpha, Gamma, N: tl.constexpr, STRIDE: tl.constexpr,
-                    B: tl.constexpr, SINGLETON: tl.constexpr, BROADCAST: tl.constexpr,
-                    CONTROL: tl.constexpr, SCANS: tl.constexpr, flag, repeats):
+def equivalent_rows(X, Y, Z, Alpha, Gamma, N: tl.constexpr, STRIDE: tl.constexpr, B: tl.constexpr,
+                    SINGLETON: tl.constexpr, BROADCAST: tl.constexpr, CONTROL: tl.constexpr, SCANS: tl.constexpr, flag,
+                    repeats):
     row = tl.program_id(0)
     col = tl.arange(0, B)
     if SINGLETON:
@@ -91,7 +91,7 @@ def test_equivalent_kernel_decisions(pair, tmp_path, monkeypatch, compiled_rewri
     torch.manual_seed(881)
     # Dyadic inputs make both scans and all equivalent arithmetic exact here.
     source = torch.randint(-4, 5, (rows, columns)).float() * .125
-    gamma_host = torch.randint(-2, 3, (columns,)).float() * .125
+    gamma_host = torch.randint(-2, 3, (columns, )).float() * .125
     x = torch.full((rows + 2, stride), -12345., device='npu')
     x[:rows, :columns] = source.npu()
     alpha = torch.tensor([.5], device='npu')
@@ -106,9 +106,11 @@ def test_equivalent_kernel_decisions(pair, tmp_path, monkeypatch, compiled_rewri
     expected_second = expected.cumsum(1) if scans == 2 else expected
     for label, flags in [('plain', (False, False, 0)), ('transformed', (singleton, broadcast, control))]:
         outputs = [[torch.full_like(x, -12345.) for _ in range(2)] for _ in range(2)]
-        kernels = [equivalent_rows[(rows,)](x, *out, alpha, gamma, columns, stride, 256, *flags,
-                    scans, 2, 2, block_batching_factor=factor, num_warps=4, num_stages=1)
-                   for out, factor in zip(outputs, (1, 2))]
+        kernels = [
+            equivalent_rows[(rows, )](x, *out, alpha, gamma, columns, stride, 256, *flags, scans, 2, 2,
+                                      block_batching_factor=factor, num_warps=4, num_stages=1)
+            for out, factor in zip(outputs, (1, 2))
+        ]
         torch.npu.synchronize()
         wrapper = kernels[1]
         if captures:
@@ -169,8 +171,8 @@ def test_control_flow_affecting_memory_keeps_existing_path(flag, tmp_path):
     outputs = [torch.full_like(x, -12345.) for _ in range(2)]
     kernels = []
     for factor, out in zip((1, 2), outputs):
-        kernels.append(conditional_access[(rows,)](x, out, columns, stride, 256, flag,
-                        block_batching_factor=factor, num_warps=4, num_stages=1))
+        kernels.append(conditional_access[(rows, )](x, out, columns, stride, 256, flag, block_batching_factor=factor,
+                                                    num_warps=4, num_stages=1))
         torch.npu.synchronize()
     expected = source if flag > 0 else torch.cat((source[:, 1:], torch.zeros(rows, 1)), 1)
     for out in outputs:
@@ -185,4 +187,5 @@ def test_control_flow_affecting_memory_keeps_existing_path(flag, tmp_path):
     folder.mkdir(parents=True, exist_ok=True)
     save_variant(folder, 'baseline', kernels[0])
     save_variant(folder, 'candidate', wrapper.candidate)
-    (folder / 'result.json').write_text(json.dumps(dict(launch=wrapper.last_launch, report=wrapper.block_batching), default=str, indent=2))
+    (folder / 'result.json').write_text(
+        json.dumps(dict(launch=wrapper.last_launch, report=wrapper.block_batching), default=str, indent=2))

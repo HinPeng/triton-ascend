@@ -149,8 +149,8 @@ struct Emitter {
   SmallVector<int64_t> coordinateMap;
   // 循环编号到循环变量。布局分析把圈内偏移留成一个 K::Induction 的 rest term，
   // 这里是把它还原成 SSA 值的唯一依据。按访存逐条填，见 inductionVariables()。
-  // 显式写出初值：DenseMap 的默认构造函数是 explicit，聚合初始化省略它会编不过，
-  // 而现有的三个构造点都不传这一项。
+  // 显式写出初值：DenseMap 的默认构造函数是
+  // explicit，聚合初始化省略它会编不过， 而现有的三个构造点都不传这一项。
   llvm::DenseMap<int64_t, Value> inductionVars{};
   Value constant(int64_t n) {
     return r.create<arith::ConstantIntOp>(loc, n, 64);
@@ -219,8 +219,8 @@ struct Emitter {
   Value axisMask(Value base, Value limit, unsigned axis) {
     // inductionVars 要跟着传：局部 Emitter 也会走 expression()，拿不到映射的话
     // 一个圈内偏移叶子就会在 upper() 里取到空值。
-    Emitter local{r,  loc, function, originalArgs, {targetShape[axis]}, {},
-                  inductionVars};
+    Emitter local{r,  loc,          function, originalArgs, {targetShape[axis]},
+                  {}, inductionVars};
     Value index =
         r.create<arith::AddIOp>(loc, local.splat(base), local.range(0));
     Value mask = r.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, index,
@@ -245,8 +245,9 @@ struct Emitter {
       return splat(expression(expr));
     unsigned axis = *axes.begin();
     SmallVector<int64_t> projection(coordinateMap.size(), 0);
-    Emitter local{r,          loc, function, originalArgs, {targetShape[axis]},
-                  projection, inductionVars};
+    Emitter local{
+        r,          loc,          function, originalArgs, {targetShape[axis]},
+        projection, inductionVars};
     return expandAxis(local.expression(expr), axis);
   }
   Value expression(BatchExprRef e) {
@@ -256,8 +257,7 @@ struct Emitter {
     // 分支，对空的 e->lhs 解引用——不是报错，是直接崩。圈内偏移正是以这种叶子的
     // 形式出现在 rest term 里的。
     if (e->kind == K::Constant || e->kind == K::Argument ||
-        e->kind == K::Grid || e->kind == K::Program ||
-        e->kind == K::Induction)
+        e->kind == K::Grid || e->kind == K::Program || e->kind == K::Induction)
       return upper(e);
     if (e->kind == K::ExtSI)
       return expression(e->lhs);
@@ -438,8 +438,8 @@ struct PointwiseRegion {
 };
 } // namespace
 bool hasBatchColumnPointwiseRegion(triton::FuncOp function,
-                                  const BatchAccessReport &accesses,
-                                  int axis, int64_t factor) {
+                                   const BatchAccessReport &accesses, int axis,
+                                   int64_t factor) {
   auto plans = planBatchLayouts(accesses, axis, factor);
   if (plans.empty())
     return false;
@@ -552,8 +552,8 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
           return !supportedPredicate(predicate, axis, plan.localAxes);
         }))
       continue;
-    bool inColumnRegion = columnRegion &&
-                          plan.action == BatchLayoutPlan::PointwiseRegion;
+    bool inColumnRegion =
+        columnRegion && plan.action == BatchLayoutPlan::PointwiseRegion;
     const auto &fact = accesses.accesses[plan.accessID];
     Operation *semantic = semanticAccesses[plan.accessID];
     if (!semantic)
@@ -580,9 +580,10 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
     // 这里用同样的次序走回来，按位置配上编号。两边对不上就整条放弃——那说明
     // 克隆改变了嵌套结构，继续发射只会得到一条地址错了的访存。
     //
-    // 还原的是**圈内偏移**（0, step, 2*step, …）而不是循环变量本身：布局分析对每
-    // 一条循环都做过代换 Induction(id) ≡ lower + Induction(id)'
-    // （BatchLayoutAnalysis.cpp:249，经 normalizeBatchAccessOnLogicalAxis），剩下
+    // 还原的是**圈内偏移**（0, step, 2*step,
+    // …）而不是循环变量本身：布局分析对每 一条循环都做过代换 Induction(id) ≡
+    // lower + Induction(id)' （BatchLayoutAnalysis.cpp:249，经
+    // normalizeBatchAccessOnLogicalAxis），剩下
     // 的这个节点代表的是等号右边那一项。还整个循环变量的话下界会被算两遍——程序轴
     // 循环上这正是 g*F*R 那一项，地址直接错掉。
     SmallVector<Value> enclosing;
@@ -612,9 +613,9 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
       logicalBase =
           rewriter.create<arith::AddIOp>(e.loc, base, e.constant(plan.origin));
     // 掩码必须界住地址真正落到的那一行。logicalBase 只含程序号那一项，圈内偏移
-    // 在下面以 rest term 的形式加进 offsetBase——两边不同步的话第 k 圈会拿第 0 圈
-    // 的掩码，越界就拦不住了。没有循环时 rest term 里不会有 Induction，这一段是
-    // 空转。
+    // 在下面以 rest term 的形式加进 offsetBase——两边不同步的话第 k 圈会拿第 0
+    // 圈 的掩码，越界就拦不住了。没有循环时 rest term 里不会有
+    // Induction，这一段是 空转。
     //
     // 只在元素步长为 1、元素起点为 0 时成立：那时 offsetBase = base，元素单位和
     // 逻辑单位是同一个量，圈内偏移可以直接加到 logicalBase 上。别的比例关系要另
@@ -623,8 +624,8 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
     for (const auto &term : plan.restTerms) {
       if (term.kind != K::Induction)
         continue;
-      // logicalBase 是**行单位**，而 term.coefficient 是**元素单位**。两者的换算
-      // 系数必须精确知道，不能估。认两种情形：
+      // logicalBase 是**行单位**，而 term.coefficient
+      // 是**元素单位**。两者的换算 系数必须精确知道，不能估。认两种情形：
       //   元素步长为 1  两种单位本来就是同一个，照搬系数。
       //   系数恰是元素步长  循环变量就是行号，换算系数精确为 1，行偏移即 iv。
       //      正例 #7/#8 的二维按行访存全落在这一支；少了它，它们会静悄悄地退回
@@ -654,9 +655,10 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
                                                 e.constant(plan.origin));
     // 没有圈内偏移时两条界融成一条 min，这是已发布的形状，原样保留。
     //
-    // 有圈内偏移就不能融：两条界管的不是一回事。plan.upper 界的是这条访存真正落到
-    // 的行，圈内偏移要算进去；endpoint = G*tileExtent 界的是 lane 活没活，它说的是
-    // "原网格只有 G 份"，和走到第几圈无关。把圈内偏移塞进 min 里，第 k 圈的活 lane
+    // 有圈内偏移就不能融：两条界管的不是一回事。plan.upper
+    // 界的是这条访存真正落到 的行，圈内偏移要算进去；endpoint = G*tileExtent
+    // 界的是 lane 活没活，它说的是 "原网格只有 G
+    // 份"，和走到第几圈无关。把圈内偏移塞进 min 里，第 k 圈的活 lane
     // 会被当成越界挡掉——少读，不是多读，但一样是算错。
     Value mask;
     if (shifted) {
@@ -719,8 +721,9 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
       if (originalType.getShape() != ArrayRef<int64_t>(semanticShape))
         return module.emitError("invalid semantic load shape for memory view"),
                failure();
-      Value other = inColumnRegion ? region.materialize(load.getOther(), rewriter)
-                                 : e.reshape(load.getOther(), targetShape);
+      Value other = inColumnRegion
+                        ? region.materialize(load.getOther(), rewriter)
+                        : e.reshape(load.getOther(), targetShape);
       auto replacement = rewriter.create<triton::LoadOp>(
           e.loc, pointer, mask, other, load.getBoundaryCheck(),
           load.getPadding(), load.getCache(), load.getEvict(),

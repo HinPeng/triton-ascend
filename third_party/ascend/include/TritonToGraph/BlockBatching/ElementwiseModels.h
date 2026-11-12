@@ -16,11 +16,9 @@ bool needsBatchActiveMask(Operation *op, const BatchOpDescriptor &descriptor);
 
 // Operands already have their final common shape; activeMask has the same
 // shape with i1 elements. Only newly inactive lanes may have inputs replaced.
-SmallVector<Value>
-prepareBatchElementwiseOperands(Operation *op,
-                                const BatchOpDescriptor &descriptor,
-                                ValueRange operands, Value activeMask,
-                                Location loc, IRRewriter &rewriter);
+SmallVector<Value> prepareBatchElementwiseOperands(
+    Operation *op, const BatchOpDescriptor &descriptor, ValueRange operands,
+    Value activeMask, Location loc, IRRewriter &rewriter);
 Operation *rewriteBatchElementwise(Operation *op,
                                    const BatchOpDescriptor &descriptor,
                                    ValueRange operands,

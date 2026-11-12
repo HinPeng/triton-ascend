@@ -45,11 +45,12 @@ bool batchLoopBoundsAreLaneUniform(const BatchLoopFact &loop,
 std::optional<int64_t> batchLoopConstantTripCount(const BatchLoopFact &loop,
                                                   const BatchRangeFacts &facts);
 // Unknown scalar inputs are checked by the existing per-launch guard. Known
-// unsafe arithmetic must never reach the SCF unroller, even in a dead candidate.
+// unsafe arithmetic must never reach the SCF unroller, even in a dead
+// candidate.
 enum class BatchLoopArithmetic { StaticSafe, NeedsRuntimeGuard, Unsafe };
 BatchLoopArithmetic batchLoopIterationArithmetic(const BatchLoopFact &loop,
-                                                const BatchRangeFacts &facts,
-                                                int64_t factor);
+                                                 const BatchRangeFacts &facts,
+                                                 int64_t factor);
 // Largest d dividing every possible trip count. 1 when nothing is proven;
 // d % factor == 0 is what lets the rewrite skip the tail mask.
 int64_t batchLoopTripCountDivisor(const BatchLoopFact &loop,

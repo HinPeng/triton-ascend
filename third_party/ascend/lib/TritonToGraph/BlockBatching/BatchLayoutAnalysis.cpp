@@ -106,8 +106,8 @@ std::optional<ParameterAffine> parameterAffine(E e, unsigned &budget) {
   }
   // Induction 在这里和坐标同级：normalizeBatchAccessOnLogicalAxis 已经把循环
   // 变量换成「下界 + 圈内偏移」，剩下的这个叶子代表圈内偏移，各份相同。
-  if (e->kind == K::Coordinate || e->kind == K::Program ||
-      e->kind == K::Grid || e->kind == K::Induction) {
+  if (e->kind == K::Coordinate || e->kind == K::Program || e->kind == K::Grid ||
+      e->kind == K::Induction) {
     ParameterAffine value;
     value.terms[{e->kind, e->value}] = Scalar{1, {}};
     return value;
@@ -246,7 +246,8 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
     BatchAccessFact fact = originalFact;
     bool normalized = true;
     for (const BatchLoopFact &loop : originalFact.loops) {
-      fact.byteOffset = normalizeBatchAccessOnLogicalAxis(fact.byteOffset, loop);
+      fact.byteOffset =
+          normalizeBatchAccessOnLogicalAxis(fact.byteOffset, loop);
       fact.mask = normalizeBatchAccessOnLogicalAxis(fact.mask, loop);
       normalized &= bool(fact.byteOffset);
     }
@@ -259,7 +260,8 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
     plan.controlFlowIndependent =
         isa<triton::FuncOp>(fact.operation->getParentOp()) &&
         !fact.deviceAddress && fact.byteOffset &&
-        !contains(fact.byteOffset, K::Unknown) && !contains(fact.mask, K::Unknown);
+        !contains(fact.byteOffset, K::Unknown) &&
+        !contains(fact.mask, K::Unknown);
     llvm::raw_string_ostream stream(plan.location);
     fact.operation->getLoc().print(stream);
     if (!normalized) {
@@ -344,8 +346,9 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
         bool columnRegion =
             fact.shape.size() == 2 && plan.localAxes == SmallVector<int64_t>{1};
         // 这里原本还带一条 fact.loops.empty()。它挡住的不只是程序轴循环——块内
-        // 循环今天就放行，这类访存一路证得出 PROVEN_DIRECTION_AND_STRIDE_CHAIN，
-        // 却因为这一条而 linearMemoryView 为假，于是 BatchMemoryView.cpp:451
+        // 循环今天就放行，这类访存一路证得出
+        // PROVEN_DIRECTION_AND_STRIDE_CHAIN， 却因为这一条而 linearMemoryView
+        // 为假，于是 BatchMemoryView.cpp:451
         // 一律跳过：证出来了从不改写。删掉之后它们第一次进入改写路径，这是本步
         // 唯一一处改变已发布行为的地方，干跑 diff 要逐行过目。
         //
@@ -369,8 +372,8 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
         // with dynamic row pitches. The emitter preserves those pitches and
         // publishes guards for every new wide address intermediate. Keep
         // non-unit symbolic column strides on the original semantic path.
-        bool contiguousColumn = columnRegion && stride->parameters.empty() &&
-                                stride->constant == 1;
+        bool contiguousColumn =
+            columnRegion && stride->parameters.empty() && stride->constant == 1;
         if (plan.symbolic && !leading && !contiguousColumn) {
           plan.action = BatchLayoutPlan::Keep;
           plan.reason = "SYMBOLIC_LAYOUT_BRIDGE_UNSUPPORTED";

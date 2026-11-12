@@ -13,8 +13,8 @@ import subprocess
 def _supported_options(path, size, mtime_ns):
     # The file identity invalidates cached probes after an in-place upgrade.
     try:
-        result = subprocess.run([path, "--help-hidden"], stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, timeout=15, check=False)
+        result = subprocess.run([path, "--help-hidden"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                timeout=15, check=False)
     except (OSError, subprocess.SubprocessError) as error:
         raise RuntimeError(f"Cannot query NPU compiler capabilities: {path}") from error
     if result.returncode:

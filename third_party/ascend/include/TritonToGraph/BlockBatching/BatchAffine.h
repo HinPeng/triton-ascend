@@ -38,9 +38,8 @@ inline constexpr BatchLeafMask kBatchLoopLeaves =
 // coefficient overflows int64, or when `budget` runs out. `budget` is consumed
 // across the whole traversal and is deliberately by reference, so a caller
 // cannot be amplified by a deeply shared subexpression.
-std::optional<BatchLinearForm> batchLinearForm(const BatchExprRef &e,
-                                               unsigned &budget,
-                                               BatchLeafMask leaves);
+std::optional<BatchLinearForm>
+batchLinearForm(const BatchExprRef &e, unsigned &budget, BatchLeafMask leaves);
 
 // Structural equality: same kind, same payload, same children, recursively.
 // Deliberately no canonicalization -- it does not see that 2*R and R*2 are the

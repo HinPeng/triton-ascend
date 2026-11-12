@@ -114,8 +114,8 @@ def test_unit_columns_with_dynamic_row_strides_use_closed_pointwise_region(tmp_p
     assert not runtime([1 << 32, 1 << 32, 3, 17, 31, 31], (2, 5, 1))[0]
 
 
-@pytest.mark.parametrize('axis,policy,selected', [(-1, 'auto', 1), (0, 'auto', 0),
-                                                (1, 'auto', 1), (-1, 'semantic_only', 0)])
+@pytest.mark.parametrize('axis,policy,selected', [(-1, 'auto', 1), (0, 'auto', 0), (1, 'auto', 1),
+                                                  (-1, 'semantic_only', 0)])
 def test_auto_axis_uses_proven_column_region_and_preserves_explicit_axis(tmp_path, axis, policy, selected):
     module = parse(tmp_path, symbolic_columns_ir())
     report = ascend.passes.ttir.rewrite_block_batching(module, 2, axis, policy)
@@ -125,8 +125,8 @@ def test_auto_axis_uses_proven_column_region_and_preserves_explicit_axis(tmp_pat
 
 
 def test_auto_column_selection_respects_singleton_grid_hint(tmp_path):
-    source = symbolic_columns_ir().replace('module {',
-        'module attributes {hacc.block_batching_grid = [128 : i32, 1 : i32, 1 : i32]} {')
+    source = symbolic_columns_ir().replace(
+        'module {', 'module attributes {hacc.block_batching_grid = [128 : i32, 1 : i32, 1 : i32]} {')
     module = parse(tmp_path, source)
     report = ascend.passes.ttir.rewrite_block_batching(module, 2, -1)
     assert report['compile_status'] == 'REWRITTEN', report

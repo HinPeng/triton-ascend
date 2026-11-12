@@ -30,12 +30,12 @@ def integer_module(mode='m', loop=False, unpack=False):
             if 'tt.load' in line:
                 line = line.replace('tensor<4x4xi32>', 'tensor<4x4xi8>')
         if 'tt.dot ' in line:
-            line = line.replace('tensor<4x4xi32> * tensor<4x4xi32>',
-                                'tensor<4x4xi8> * tensor<4x4xi8>')
+            line = line.replace('tensor<4x4xi32> * tensor<4x4xi32>', 'tensor<4x4xi8> * tensor<4x4xi8>')
         lines.append(line)
     text = '\n'.join(lines)
     if unpack:
-        text = text.replace('%b = tt.load %bp : tensor<4x4x!tt.ptr<i8>>', '''
+        text = text.replace(
+            '%b = tt.load %bp : tensor<4x4x!tt.ptr<i8>>', '''
       %packed = tt.load %bp : tensor<4x4x!tt.ptr<i8>>
       %wide = arith.extui %packed : tensor<4x4xi8> to tensor<4x4xi32>
       %bits = arith.constant dense<3> : tensor<4x4xi32>
@@ -79,8 +79,8 @@ def test_integer_rejection_does_not_mutate_input(tmp_path, change, reason):
 
 
 def test_integer_cv_does_not_bypass_overflow_attributes(tmp_path):
-    text = integer_module(loop=True, unpack=True).replace(
-        'arith.subi %byte, %one_byte :', 'arith.subi %byte, %one_byte overflow<nsw> :')
+    text = integer_module(loop=True, unpack=True).replace('arith.subi %byte, %one_byte :',
+                                                          'arith.subi %byte, %one_byte overflow<nsw> :')
     module = parse(tmp_path, text)
     before = str(module)
     report = ascend.passes.ttir.rewrite_block_batching(module, 2, 0, 'auto', True, True)
@@ -107,8 +107,10 @@ def test_integer_independent_pairs_retain_rank_two_dots(tmp_path, factor, batch_
     assert module.verify()
 
 
-@pytest.mark.parametrize('proof', [None, {}, dict(version=True, input_bits=8, accumulator_bits=32,
-                                                lane_semantics='original_program_clone', dot_rank=2)])
+@pytest.mark.parametrize('proof', [
+    None, {},
+    dict(version=True, input_bits=8, accumulator_bits=32, lane_semantics='original_program_clone', dot_rank=2)
+])
 def test_integer_lane_report_requires_owned_contract(proof):
     from test_block_batching_guard import cv_metadata
     from triton.backends.ascend.block_batching_report import validate_compilation_result
@@ -124,9 +126,9 @@ def test_integer_lane_contract_allows_owned_auto_blockify_grid():
     from test_block_batching_guard import cv_metadata
     from triton.backends.ascend.block_batching_report import validate_compilation_result
     metadata = cv_metadata()
-    metadata['block_batching'].update(cv_lowering='static_integer_lanes_v1', guard=dict(
-        cv_integer_contract=dict(version=1, input_bits=8, accumulator_bits=32,
-                                 lane_semantics='original_program_clone', dot_rank=2)))
+    metadata['block_batching'].update(
+        cv_lowering='static_integer_lanes_v1', guard=dict(cv_integer_contract=dict(
+            version=1, input_bits=8, accumulator_bits=32, lane_semantics='original_program_clone', dot_rank=2)))
     metadata.update(auto_blockify_enabled=True, has_auto_blockify_blacklist_op=False)
     validate_compilation_result(metadata)
     assert metadata['block_batching']['compile_status'] == 'COMPILED_GUARDED'

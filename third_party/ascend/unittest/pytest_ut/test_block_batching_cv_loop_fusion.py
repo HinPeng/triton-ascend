@@ -64,7 +64,7 @@ def test_loop_spatial_fusion_preserves_one_dot_and_one_recurrence(tmp_path, mode
     grid = [1, 1, 1]
     grid[axis] = factor
     for trips in [0, 1, 3]:
-        args = [1 << 30, 1 << 40, 1 << 45, factor*4, trips, 1]
+        args = [1 << 30, 1 << 40, 1 << 45, factor * 4, trips, 1]
         checked = check_guard(guard, args, grid, factor)
         assert checked[0], checked
     args[2] = args[0]
@@ -80,7 +80,8 @@ def independent_loop(masked=False):
     body = body.replace('    %zero = arith.constant dense<0.0> : tensor<4x4xf32>\n', '')
     body = body.replace('%dot = tt.dot', '%next = tt.dot').replace('%bv, %zero :', '%bv, %carry :')
     if masked:
-        body = body.replace('%av = tt.load %ptr :', '''
+        body = body.replace(
+            '%av = tt.load %ptr :', '''
       %bound = tt.splat %limit : i32 -> tensor<4x8xi32>
       %mask = arith.cmpi slt, %kk, %bound : tensor<4x8xi32>
       %pad = arith.constant dense<0.0> : tensor<4x8xf32>
@@ -95,7 +96,8 @@ def independent_loop(masked=False):
 
 def periodic_head_loop(period, axis):
     text = independent_loop().replace('tt.get_program_id x', f'tt.get_program_id {"xyz"[axis]}')
-    return text.replace('%base = arith.muli %p, %c32 : i32', f'''
+    return text.replace(
+        '%base = arith.muli %p, %c32 : i32', f'''
     %heads = arith.constant {period} : i32
     %batch_stride = arith.constant {period * 64} : i32
     %batch = arith.divsi %p, %heads : i32
@@ -118,7 +120,8 @@ def test_aligned_periodic_program_addresses_keep_scalar_quotient(tmp_path, axis,
     assert text.count('tt.dot ') == 1 and module.verify()
     guard = json.loads(report['guard_json'])
     guard['require_same_fractal_bounds'] = True
-    grid = [1, 1, 1]; grid[axis] = period * 2
+    grid = [1, 1, 1]
+    grid[axis] = period * 2
     assert check_guard(guard, [1 << 30, 1 << 40, 1 << 45, 3, 8], grid, factor)[0]
 
 
@@ -150,7 +153,8 @@ def independent_pointer_loop(delta=32):
     text = text.replace('iter_args(%carry = %zero) -> (tensor<4x4xf32>)',
                         'iter_args(%carry = %zero, %input = %ptr) -> (tensor<4x4xf32>, tensor<4x8x!tt.ptr<f32>>)')
     text = text.replace('%av = tt.load %ptr', '%av = tt.load %input')
-    text = text.replace('scf.yield %next : tensor<4x4xf32>', f'''
+    text = text.replace(
+        'scf.yield %next : tensor<4x4xf32>', f'''
       %nextptr = tt.addptr %input, %advance : tensor<4x8x!tt.ptr<f32>>, tensor<4x8xi32>
       scf.yield %next, %nextptr : tensor<4x4xf32>, tensor<4x8x!tt.ptr<f32>>''')
     return text.replace('tt.store %cptr, %dot', 'tt.store %cptr, %loop#0')
@@ -195,7 +199,8 @@ def test_loop_batch_preserves_independent_accumulators_and_transposed_load(tmp_p
 
 
 def test_unprovable_spatial_local_bias_rolls_back_to_original_lane_regions(tmp_path):
-    text = spatial_loop().replace('tt.store %cp, %dot,', '''
+    text = spatial_loop().replace(
+        'tt.store %cp, %dot,', '''
     %local = arith.sitofp %range : tensor<4xi32> to tensor<4xf32>
     %localcol = tt.expand_dims %local {axis = 1 : i32} : tensor<4xf32> -> tensor<4x1xf32>
     %localmatrix = tt.broadcast %localcol : tensor<4x1xf32> -> tensor<4x4xf32>
@@ -258,7 +263,8 @@ def test_canonical_nonnegative_mask_keeps_full_domain_proof(tmp_path, negative):
       %negative_one = arith.constant dense<-1> : tensor<4x8xi32>
       %shifted = arith.addi %kk, %negative_one : tensor<4x8xi32>
 '''
-    text = text.replace('%mask = arith.cmpi slt, %kk, %bound : tensor<4x8xi32>', extra + f'''
+    text = text.replace(
+        '%mask = arith.cmpi slt, %kk, %bound : tensor<4x8xi32>', extra + f'''
       %integer_zero = arith.constant dense<0> : tensor<4x8xi32>
       %nonnegative = arith.cmpi sge, {coord}, %integer_zero : tensor<4x8xi32>
       %upper = arith.cmpi slt, %kk, %bound : tensor<4x8xi32>
@@ -280,7 +286,8 @@ def test_canonical_nonnegative_mask_keeps_full_domain_proof(tmp_path, negative):
 
 
 def test_batch_loop_allows_proved_auxiliary_vector_access(tmp_path):
-    text = independent_loop().replace('    %av = tt.load', '''
+    text = independent_loop().replace(
+        '    %av = tt.load', '''
     %aux_base = tt.splat %b : !tt.ptr<f32> -> tensor<8x!tt.ptr<f32>>
     %aux_ptr = tt.addptr %aux_base, %r8 : tensor<8x!tt.ptr<f32>>, tensor<8xi32>
     %aux = tt.load %aux_ptr : tensor<8x!tt.ptr<f32>>
@@ -311,9 +318,9 @@ def test_loop_lowering_contract_requires_matching_region_and_memory_proofs(lower
         metadata['enable_hivm_batch_matmul'] = True
         report['cv_memory_lowering'] = 'full_reduction_guard_v3'
         report['guard'].update(require_same_fractal_bounds=True,
-                              cv_mask_contract=dict(version=1, inputs=[{}, {}], outputs=[{}]))
-    report['guard']['cv_control_flow_contract'] = dict(version=1, lane_semantics=semantics,
-        uniform_bounds=True, dot_rank=rank, for_count=1, if_count=0)
+                               cv_mask_contract=dict(version=1, inputs=[{}, {}], outputs=[{}]))
+    report['guard']['cv_control_flow_contract'] = dict(version=1, lane_semantics=semantics, uniform_bounds=True,
+                                                       dot_rank=rank, for_count=1, if_count=0)
     metadata.update(auto_blockify_enabled=True, has_auto_blockify_blacklist_op=False)
     validate_compilation_result(metadata)
     report['guard']['cv_control_flow_contract']['uniform_bounds'] = False

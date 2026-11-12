@@ -37,7 +37,8 @@ def parse(tmp_path, text):
 def test_copy_layout_analysis_is_read_only(tmp_path, shape, src_layout, dst_layout, expected):
     source = f"memref<{shape}xf32, {src_layout}>"
     dest = f"memref<{shape}xf32, {dst_layout}>"
-    module = parse(tmp_path, f'''module attributes {{hacc.block_mapping_owner = "block_batching"}} {{
+    module = parse(
+        tmp_path, f'''module attributes {{hacc.block_mapping_owner = "block_batching"}} {{
       tt.func public @copy(%src: {source}, %dst: {dest}) {{
         memref.copy %src, %dst : {source} to {dest}
         tt.return
@@ -51,7 +52,8 @@ def test_copy_layout_analysis_is_read_only(tmp_path, shape, src_layout, dst_layo
 @pytest.mark.parametrize("owner,expected", [("block_batching", True), ("legacy", False), (None, False)])
 def test_store_analysis_requires_batch_owner(tmp_path, owner, expected):
     attr = f'attributes {{hacc.block_mapping_owner = "{owner}"}}' if owner else ''
-    module = parse(tmp_path, f'''module {attr} {{
+    module = parse(
+        tmp_path, f'''module {attr} {{
       tt.func public @store(%src: tensor<?x64xf32>, %dst: memref<?x64xf32>) {{
         bufferization.materialize_in_destination %src in writable %dst :
           (tensor<?x64xf32>, memref<?x64xf32>) -> ()
@@ -64,12 +66,14 @@ def test_store_analysis_requires_batch_owner(tmp_path, owner, expected):
 
 
 def metadata():
-    return dict(block_batching_factor=2, target=SimpleNamespace(arch="Ascend950PR_9579"), mix_mode="aiv",
-                parallel_mode="simd", block_batching=dict(owner="block_batching", cv_mode="disabled",
-                memory_lowering=dict(dynamic_contiguous_copy=True)))
+    return dict(
+        block_batching_factor=2, target=SimpleNamespace(arch="Ascend950PR_9579"), mix_mode="aiv", parallel_mode="simd",
+        block_batching=dict(owner="block_batching", cv_mode="disabled",
+                            memory_lowering=dict(dynamic_contiguous_copy=True)))
 
 
-@pytest.mark.parametrize("change", ["none", "baseline", "no_report", "wrong_owner", "cv", "no_copy", "arch", "mix", "simt"])
+@pytest.mark.parametrize("change",
+                         ["none", "baseline", "no_report", "wrong_owner", "cv", "no_copy", "arch", "mix", "simt"])
 def test_compile_policy_is_candidate_only(change):
     value = metadata()
     if change == "baseline":
@@ -89,9 +93,11 @@ def test_compile_policy_is_candidate_only(change):
     if change == "simt":
         value["parallel_mode"] = "simt"
     calls = []
+
     def supported(path):
         calls.append(path)
         return True
+
     options = batching.memory_compile_options(value, "/compiler", supported)
     assert options == (["--enable-lib-call-no-inline=false"] if change == "none" else [])
     assert calls == (["/compiler"] if change == "none" else [])

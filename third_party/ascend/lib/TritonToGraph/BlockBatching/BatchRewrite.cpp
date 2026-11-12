@@ -6,8 +6,8 @@
 #include "TritonToGraph/BlockBatching/BatchLoopLegality.h"
 #include "TritonToGraph/BlockBatching/BatchLoopTransform.h"
 #include "TritonToGraph/BlockBatching/BatchOpRegistry.h"
-#include "TritonToGraph/BlockBatching/BatchRangeAnalysis.h"
 #include "TritonToGraph/BlockBatching/BatchPlan.h"
+#include "TritonToGraph/BlockBatching/BatchRangeAnalysis.h"
 #include "TritonToGraph/BlockBatching/BatchValueMapping.h"
 #include "TritonToGraph/BlockBatching/CVSpatial.h"
 #include "TritonToGraph/BlockBatching/ControlFlowModels.h"
@@ -53,8 +53,8 @@ bool isSelectedProgramDivision(Operation *op, int axis) {
 
 std::optional<int64_t> programDivisor(Operation *op) {
   auto constant = op->getOperand(1).getDefiningOp<arith::ConstantOp>();
-  auto value = constant ? dyn_cast<IntegerAttr>(constant.getValue())
-                        : IntegerAttr{};
+  auto value =
+      constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr{};
   if (!value || !value.getType().isInteger(32))
     return std::nullopt;
   return value.getInt();
@@ -98,7 +98,7 @@ Value rebuildCVPointerRecurrence(Value argument, Value initial, Value yielded,
   auto asI64 = [&](Value value) -> Value {
     if (ivType.isIndex())
       return rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(),
-                                                value);
+                                                 value);
     if (integer.getWidth() < 64)
       return rewriter.create<arith::ExtSIOp>(loc, rewriter.getI64Type(), value);
     return value;
@@ -107,12 +107,11 @@ Value rebuildCVPointerRecurrence(Value argument, Value initial, Value yielded,
       loc, asI64(loop.getInductionVar()), asI64(loop.getLowerBound()));
   // The accepted loop has a positive step. Unsigned distance also represents
   // a signed range spanning zero without introducing signed-overflow flags.
-  Value iteration = rewriter.create<arith::DivUIOp>(
-      loc, distance, asI64(loop.getStep()));
+  Value iteration =
+      rewriter.create<arith::DivUIOp>(loc, distance, asI64(loop.getStep()));
   Value advance = rewriter.create<arith::ConstantIntOp>(
       loc, delta.getValue().getSExtValue(), 64);
-  Value displacement =
-      rewriter.create<arith::MulIOp>(loc, iteration, advance);
+  Value displacement = rewriter.create<arith::MulIOp>(loc, iteration, advance);
   // Repeated i32 addptr deltas are sign-extended for each pointer addition.
   // Accumulate in i64, not i32: truncating the total could change an address
   // after crossing 2 Gi elements even though each individual delta fits i32.
@@ -285,12 +284,12 @@ bool byteOperationSupported(Operation *op, bool cv) {
   // loop recurrence. These are lane-wise operations, not byte host ABI or
   // a new cross-lane reduction. Existing control/effect/attribute proofs
   // still apply; in particular nsw/nuw arithmetic is not admitted.
-  if (cv && (isa<scf::ForOp, scf::IfOp, scf::YieldOp, triton::DotOp>(op) ||
-             name == "arith.extsi" || name == "arith.extui" ||
-             name == "arith.trunci" || name == "arith.addi" ||
-             name == "arith.subi" || name == "arith.muli" ||
-             name == "arith.andi" || name == "arith.ori" ||
-             name == "arith.xori"))
+  if (cv &&
+      (isa<scf::ForOp, scf::IfOp, scf::YieldOp, triton::DotOp>(op) ||
+       name == "arith.extsi" || name == "arith.extui" ||
+       name == "arith.trunci" || name == "arith.addi" || name == "arith.subi" ||
+       name == "arith.muli" || name == "arith.andi" || name == "arith.ori" ||
+       name == "arith.xori"))
     return true;
   if (name == "tt.bitcast") {
     if (isBatchBoolToByteCast(op)) {
@@ -425,8 +424,8 @@ bool structuredControlMask(Value value, triton::FuncOp function,
   Operation *op = value.getDefiningOp();
   if (!op || !isa<IntegerType>(scalar(value.getType())))
     return false;
-  if (isa<arith::ConstantOp, triton::GetProgramIdOp,
-          triton::GetNumProgramsOp, triton::MakeRangeOp>(op))
+  if (isa<arith::ConstantOp, triton::GetProgramIdOp, triton::GetNumProgramsOp,
+          triton::MakeRangeOp>(op))
     return true;
   if (!isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::ExtSIOp,
            arith::ExtUIOp, arith::TruncIOp, arith::CmpIOp, arith::AndIOp,
@@ -468,9 +467,8 @@ bool rectangularBatchMask(const BatchExprRef &expr, int axis, unsigned rank) {
   // The canonical -1 < coordinate lower bound must be true on the full
   // original box, as checked by the existing byte-domain contract. It is
   // never used to shorten a prefix or to remove the source load mask.
-  bool nonnegative = expr->kind == K::SLT &&
-                     expr->lhs && expr->lhs->kind == K::Constant &&
-                     expr->lhs->value == -1;
+  bool nonnegative = expr->kind == K::SLT && expr->lhs &&
+                     expr->lhs->kind == K::Constant && expr->lhs->value == -1;
   unsigned coordinates = 0;
   for (unsigned dim = 0; dim < rank; ++dim) {
     unsigned budget = 4096;
@@ -502,8 +500,8 @@ bool constantZero(Value value) {
   // Stock block-pointer normalization materializes scalar zero + tt.splat,
   // whereas the frontend usually emits a dense zero. Recognize both exact
   // representations without accepting NaN, nonzero, or device-loaded other.
-  if (auto splat = value ? value.getDefiningOp<triton::SplatOp>()
-                         : triton::SplatOp{})
+  if (auto splat =
+          value ? value.getDefiningOp<triton::SplatOp>() : triton::SplatOp{})
     value = splat.getSrc();
   auto c =
       value ? value.getDefiningOp<arith::ConstantOp>() : arith::ConstantOp{};
@@ -774,8 +772,8 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   if (regionBudgetExceeded)
     return reject("REGION_DEPTH_EXCEEDED");
   bool cvControlFlow = request.cv && llvm::any_of(validated, [](Operation *op) {
-    return isa<scf::ForOp, scf::IfOp>(op);
-  });
+                         return isa<scf::ForOp, scf::IfOp>(op);
+                       });
   for (Operation *operation : validated) {
     Operation &op = *operation;
     diagnosticOp = &op;
@@ -801,8 +799,9 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       if (a.getRank() != 2 || b.getRank() != 2 || c.getRank() != 2)
         return reject("CV_REQUIRES_RANK_TWO_DOT");
       auto element = a.getElementType();
-      bool floatingDot = (element.isF16() || element.isBF16() ||
-                          element.isF32()) && c.getElementType().isF32();
+      bool floatingDot =
+          (element.isF16() || element.isBF16() || element.isF32()) &&
+          c.getElementType().isF32();
       bool integerDot = element.isSignlessInteger(8) &&
                         c.getElementType().isSignlessInteger(32);
       if (!(floatingDot || integerDot) || b.getElementType() != element ||
@@ -875,10 +874,9 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
     SmallVector<int64_t, 3> extents = staticGridExtents(module);
     for (int i = 0; i < 3; ++i)
       if (axes[i] &&
-          (extents.empty() ||
-           (request.cv ? (extents[i] >= request.factor &&
-                          extents[i] % request.factor == 0)
-                       : extents[i] > 1))) {
+          (extents.empty() || (request.cv ? (extents[i] >= request.factor &&
+                                             extents[i] % request.factor == 0)
+                                          : extents[i] > 1))) {
         axis = i;
         break;
       }
@@ -991,7 +989,8 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
     for (Operation *op : validated) {
       if (auto dot = dyn_cast<triton::DotOp>(op)) {
         integerCV |= cast<RankedTensorType>(dot.getA().getType())
-                         .getElementType().isSignlessInteger(8);
+                         .getElementType()
+                         .isSignlessInteger(8);
         // Shared operands use a rank-two spatial concatenation proof, never
         // the unvalidated shared-operand rank-three broadcast lowering.
         sharedCV |=
@@ -1068,7 +1067,8 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   const BatchLoopFact *scheduledFact = programLoop;
   auto scheduledLegality = legality;
   if (!scheduledLoop && access.loops.size() == 1 &&
-      report.operations.count("scf.for") && report.operations.at("scf.for") == 1) {
+      report.operations.count("scf.for") &&
+      report.operations.at("scf.for") == 1) {
     function.walk([&](scf::ForOp loop) {
       if (loop->getParentOp() == function.getOperation() &&
           !control.isVarying(loop.getLowerBound()) &&
@@ -1082,16 +1082,19 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
     }
   }
   auto loopLowering = selectBatchLoopLowering(
-      scheduledFact, scheduledLegality.axis ? &*scheduledLegality.axis : nullptr,
-      ranges, request.factor);
+      scheduledFact,
+      scheduledLegality.axis ? &*scheduledLegality.axis : nullptr, ranges,
+      request.factor);
   if (!request.cv && !request.semanticOnly &&
       loopLowering == BatchLoopLowering::SequentialIterations) {
     if (validated.size() > 8192 / request.factor)
       return reject("LOOP_GROUP_CODE_SIZE_EXCEEDED");
-    object["loop_schedule"] = llvm::json::Object{
-        {"version", 1}, {"kind", "sequential_iterations_v1"},
-        {"grid_policy", "preserve"}, {"factor", request.factor},
-        {"loop", batchLoopJSON(*scheduledFact)}};
+    object["loop_schedule"] =
+        llvm::json::Object{{"version", 1},
+                           {"kind", "sequential_iterations_v1"},
+                           {"grid_policy", "preserve"},
+                           {"factor", request.factor},
+                           {"loop", batchLoopJSON(*scheduledFact)}};
     report.guardJSON = llvm::formatv("{0}", *guard).str();
     report.vvLowering = "sequential_iterations_v1";
     report.selectedAxis = axis;
@@ -1162,8 +1165,10 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       if (!guard || !guard->getAsObject())
         return failure();
       (*guard->getAsObject())["cv_control_flow_contract"] = llvm::json::Object{
-          {"version", 1}, {"lane_semantics", "original_program_clone"},
-          {"uniform_bounds", true}, {"dot_rank", 2},
+          {"version", 1},
+          {"lane_semantics", "original_program_clone"},
+          {"uniform_bounds", true},
+          {"dot_rank", 2},
           {"for_count", static_cast<int64_t>(report.operations["scf.for"])},
           {"if_count", static_cast<int64_t>(report.operations["scf.if"])}};
       (*guard->getAsObject())["cv_loop_fusion_rejection"] = fusionReason;
@@ -1196,11 +1201,16 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
         auto guard = llvm::json::parse(report.guardJSON);
         if (!guard || !guard->getAsObject())
           return failure();
-        (*guard->getAsObject())["cv_control_flow_contract"] = llvm::json::Object{
-            {"version", 1}, {"lane_semantics", "spatial_concatenation"},
-            {"uniform_bounds", true}, {"dot_rank", 2},
-            {"for_count", static_cast<int64_t>(report.operations["scf.for"])},
-            {"if_count", static_cast<int64_t>(report.operations["scf.if"])}};
+        (*guard->getAsObject())["cv_control_flow_contract"] =
+            llvm::json::Object{
+                {"version", 1},
+                {"lane_semantics", "spatial_concatenation"},
+                {"uniform_bounds", true},
+                {"dot_rank", 2},
+                {"for_count",
+                 static_cast<int64_t>(report.operations["scf.for"])},
+                {"if_count",
+                 static_cast<int64_t>(report.operations["scf.if"])}};
         report.guardJSON = llvm::formatv("{0}", *guard).str();
       }
       report.selectedAxis = axis;
@@ -1221,16 +1231,19 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       auto guard = llvm::json::parse(report.guardJSON);
       if (!guard || !guard->getAsObject())
         return failure();
-      (*guard->getAsObject())["cv_integer_contract"] = llvm::json::Object{
-          {"version", 1}, {"input_bits", 8}, {"accumulator_bits", 32},
-          {"lane_semantics", "original_program_clone"}, {"dot_rank", 2}};
+      (*guard->getAsObject())["cv_integer_contract"] =
+          llvm::json::Object{{"version", 1},
+                             {"input_bits", 8},
+                             {"accumulator_bits", 32},
+                             {"lane_semantics", "original_program_clone"},
+                             {"dot_rank", 2}};
       report.guardJSON = llvm::formatv("{0}", *guard).str();
       report.cvLowering = "static_integer_lanes_v1";
       report.selectedAxis = axis;
       report.laneWidth = request.factor;
       report.layoutJSON = serializeBatchLayouts({});
       if (failed(rewriteStructuredCV(module, function, originals, axis,
-                                    request.factor)))
+                                     request.factor)))
         return failure();
       report.status = "REWRITTEN";
       report.reason = "";
@@ -1267,16 +1280,21 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
         return failure();
       (*guard->getAsObject())["cv_mask_contract"] = std::move(*contract);
       if (cvControlFlow)
-        (*guard->getAsObject())["cv_control_flow_contract"] = llvm::json::Object{
-            {"version", 1}, {"lane_semantics", "independent_batch"},
-            {"uniform_bounds", true}, {"dot_rank", 3},
-            {"for_count", static_cast<int64_t>(report.operations["scf.for"])},
-            {"if_count", static_cast<int64_t>(report.operations["scf.if"])}};
+        (*guard->getAsObject())["cv_control_flow_contract"] =
+            llvm::json::Object{
+                {"version", 1},
+                {"lane_semantics", "independent_batch"},
+                {"uniform_bounds", true},
+                {"dot_rank", 3},
+                {"for_count",
+                 static_cast<int64_t>(report.operations["scf.for"])},
+                {"if_count",
+                 static_cast<int64_t>(report.operations["scf.if"])}};
       report.guardJSON = llvm::formatv("{0}", *guard).str();
       // Keep the original masked-load values and masked-store effects. There
       // is no all-true launch proof and no mask erasure in this path.
       report.cvLowering = cvControlFlow ? "rank3_uniform_control_batch_v1"
-                                       : "rank3_masked_batch_v1";
+                                        : "rank3_masked_batch_v1";
       maskedBatch = true;
     }
     if (report.structuredMasks && !maskedBatch) {
@@ -1306,18 +1324,20 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
       scheduledLegality.safe && scheduledLegality.axis &&
       scheduledLegality.axis->distribution == BatchLogicalAxis::Blocked &&
       batchLoopBoundsAreLaneUniform(*scheduledFact, ranges) &&
-      !report.operations.count("scf.if") && !report.operations.count("tt.reduce") &&
-      !report.operations.count("tt.scan") && !report.operations.count("tt.dot") &&
-      !layouts.empty() &&
+      !report.operations.count("scf.if") &&
+      !report.operations.count("tt.reduce") &&
+      !report.operations.count("tt.scan") &&
+      !report.operations.count("tt.dot") && !layouts.empty() &&
       llvm::all_of(layouts, [&](const BatchLayoutPlan &layout) {
         const auto &fact = access.accesses[layout.accessID];
         return layout.action == BatchLayoutPlan::Keep &&
                layout.reason == "ALREADY_STRUCTURED" &&
-               layout.maskClass == "independent_axes" &&
-               !fact.deviceAddress && !fact.isVolatile &&
-               !fact.shape.empty() &&
-               llvm::count_if(fact.shape, [](int64_t size) { return size != 1; }) <= 1 &&
-               fact.loops.size() == 1 && fact.loops.front().id == scheduledFact->id;
+               layout.maskClass == "independent_axes" && !fact.deviceAddress &&
+               !fact.isVolatile && !fact.shape.empty() &&
+               llvm::count_if(fact.shape,
+                              [](int64_t size) { return size != 1; }) <= 1 &&
+               fact.loops.size() == 1 &&
+               fact.loops.front().id == scheduledFact->id;
       })) {
     diagnosticOp = scheduledLoop;
     return reject("LOOP_POINTWISE_MEMORY_VIEW_REQUIRED");
@@ -1326,14 +1346,16 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
   //
   // 没有循环时 Keep 是安全的：证不出就不改写，交回通用的 lane 加宽，程序号派生
   // 的值被提成 lane 张量，数值照样对。程序轴循环破坏了这个兜底——合并后循环变量
-  // 必须是各 lane 共享的标量（scf.for 的界不可能按 lane 不同），于是只由它派生的
-  // 值也被判成非 varying、不会被提，lane u 该读的那一份只存在于布局层重建的程序号
-  // 项里。这类访存一旦落到 Keep，合并后会对所有 lane 读同一处——**静默算错**。
-  // 看的是 linearMemoryView 而不是 action：证到了 PROVEN_… 但这一位为假的访存，
-  // BatchMemoryView.cpp:451 照样跳过，结果一样是循环重分块了而访存原样不动。
+  // 必须是各 lane 共享的标量（scf.for 的界不可能按 lane
+  // 不同），于是只由它派生的 值也被判成非 varying、不会被提，lane u
+  // 该读的那一份只存在于布局层重建的程序号 项里。这类访存一旦落到
+  // Keep，合并后会对所有 lane 读同一处——**静默算错**。 看的是 linearMemoryView
+  // 而不是 action：证到了 PROVEN_… 但这一位为假的访存， BatchMemoryView.cpp:451
+  // 照样跳过，结果一样是循环重分块了而访存原样不动。
   //
   // 这道检查必须在动 IR 之前做完。改写开始之后没有回滚：原 op 已经删、事实上的
-  // operation 句柄已经清空，那时再拒既给不出诊断位置，也会留下一个改了一半的模块。
+  // operation
+  // 句柄已经清空，那时再拒既给不出诊断位置，也会留下一个改了一半的模块。
   if (legality.axis)
     for (const auto &plan : layouts)
       if (!access.accesses[plan.accessID].loops.empty() &&
@@ -1533,9 +1555,10 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
           replacement = created;
         } else {
           auto loop = cast<scf::ForOp>(op);
-          // 程序轴循环的三个界不能照搬映射：下界是 pid 的函数，而 pid 在新体里是
-          // 一个 lane 张量，scf.for 的界只能是标量。重分块把界里的程序号换成合并
-          // 后的标量 group*F，lane 间的差异改由布局层重建的程序号项承担。
+          // 程序轴循环的三个界不能照搬映射：下界是 pid 的函数，而 pid
+          // 在新体里是 一个 lane 张量，scf.for
+          // 的界只能是标量。重分块把界里的程序号换成合并 后的标量 group*F，lane
+          // 间的差异改由布局层重建的程序号项承担。
           BatchRetiledBounds retiled;
           if (loop == form.programLoop)
             retiled = retileBatchLoopBounds(
@@ -1577,17 +1600,18 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
           if (loop == form.programLoop) {
             // lane u 这一圈处理的行是 iv + u*R，R 是一个原程序拥有的行距。
             //
-            // R 不取 axis.chunk：那个量对定长分块恒为 1，不是行距。两种分布的下界
-            // 都是 p*R 这个一次式（关卡 1 已经证过形态），所以直接从界里取差分：
-            // R = lower(p=1) - lower(p=0)。对成块发与定长分块一样成立，也不用把
+            // R 不取 axis.chunk：那个量对定长分块恒为
+            // 1，不是行距。两种分布的下界 都是 p*R 这个一次式（关卡 1
+            // 已经证过形态），所以直接从界里取差分： R = lower(p=1) -
+            // lower(p=0)。对成块发与定长分块一样成立，也不用把
             // 新字段加进判定层的契约。
             OpBuilder::InsertionGuard guard(rewriter);
             // 行距在循环外算一次。
             rewriter.setInsertionPoint(created);
             auto at = [&](int64_t p) {
               return retileBatchLoopBounds(
-                         rewriter, loop, *legality.axis, pidSource->getResult(0),
-                         constant(i32, p),
+                         rewriter, loop, *legality.axis,
+                         pidSource->getResult(0), constant(i32, p),
                          [&](Value v) { return mapping.lookupOrNull(v); })
                   .lower;
             };
@@ -1596,9 +1620,10 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
               return rejectRewrite("LOOP_RETILING_FAILED");
             Value rows = rewriter.create<arith::SubIOp>(loc, atOne, atZero);
             rewriter.setInsertionPointToStart(created.getBody());
-            // 循环变量不一定是 i32。源码只要写过 tl.program_id(0).cast(tl.int64)，
-            // 整条循环就抬到 i64，而 lane 号是 tt.make_range 出来的，只能是 i32。
-            // 两边不同宽就拼不出 iv + u*R，改写会产出过不了验证的 IR。
+            // 循环变量不一定是 i32。源码只要写过
+            // tl.program_id(0).cast(tl.int64)， 整条循环就抬到 i64，而 lane
+            // 号是 tt.make_range 出来的，只能是 i32。 两边不同宽就拼不出 iv +
+            // u*R，改写会产出过不了验证的 IR。
             Type rowType = created.getInductionVar().getType();
             auto rowInt = dyn_cast<IntegerType>(rowType);
             if (!rowInt || rowInt.getWidth() < 32)
@@ -1629,8 +1654,8 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
               Value base = mapping.lookup(initial);
               if (base.getType() != to.getType())
                 base = lift(initial, cast<RankedTensorType>(to.getType()));
-              if (Value affine = rebuildCVPointerRecurrence(
-                      from, base, yielded, created, rewriter))
+              if (Value affine = rebuildCVPointerRecurrence(from, base, yielded,
+                                                            created, rewriter))
                 mapped = affine;
             }
             values.map(from, mapped, control.isVarying(from));
@@ -1687,11 +1712,12 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
         Value period = constant(i32, divisor);
         if (isa<arith::DivSIOp>(op)) {
           Value quotient = rewriter.create<arith::DivSIOp>(loc, folded, period);
-          replacement =
-              rewriter.create<triton::SplatOp>(loc, lane32, quotient);
+          replacement = rewriter.create<triton::SplatOp>(loc, lane32, quotient);
         } else {
-          Value remainder = rewriter.create<arith::RemSIOp>(loc, folded, period);
-          Value start = rewriter.create<triton::SplatOp>(loc, lane32, remainder);
+          Value remainder =
+              rewriter.create<arith::RemSIOp>(loc, folded, period);
+          Value start =
+              rewriter.create<triton::SplatOp>(loc, lane32, remainder);
           replacement = rewriter.create<arith::AddIOp>(loc, start, lane);
         }
       } else if (auto intToPtr = dyn_cast<triton::IntToPtrOp>(op)) {
@@ -1879,8 +1905,8 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
         Value mask;
         if (needsBatchActiveMask(op, *descriptor))
           mask = liveFor(liftedType(op->getResult(0).getType()));
-        auto safe = prepareBatchElementwiseOperands(op, *descriptor, lifted, mask,
-                                                    loc, rewriter);
+        auto safe = prepareBatchElementwiseOperands(op, *descriptor, lifted,
+                                                    mask, loc, rewriter);
         replacement = rewriteBatchElementwise(
             op, *descriptor, safe, liftedType(op->getResult(0).getType()), loc,
             rewriter);
@@ -2001,9 +2027,8 @@ static FailureOr<BatchRewriteReport> rewriteImpl(ModuleOp module,
 }
 namespace {
 // 两个入口共用的那一步：改写永远发生在私有沙箱上，差别只在成功之后提不提交。
-FailureOr<BatchRewriteReport> rewriteInSandbox(ModuleOp module,
-                                               BatchRequest request,
-                                               bool commit) {
+FailureOr<BatchRewriteReport>
+rewriteInSandbox(ModuleOp module, BatchRequest request, bool commit) {
   OwningOpRef<ModuleOp> sandbox(module.clone());
   auto result = rewriteImpl(sandbox.get(), request);
   if (commit && succeeded(result) && result->status == "REWRITTEN") {

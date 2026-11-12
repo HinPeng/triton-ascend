@@ -57,9 +57,8 @@ int main() {
   }
   for (auto fact : {loop(0, 8000000000000000000LL, 4000000000000000000LL),
                     loop(min, max, 1), loop(0, max, max),
-                    loop(0, 2147483647, 1073741824, 32),
-                    loop(0, 1, 0), loop(0, 1, -1),
-                    loop(max - 3, max, 1)}) {
+                    loop(0, 2147483647, 1073741824, 32), loop(0, 1, 0),
+                    loop(0, 1, -1), loop(max - 3, max, 1)}) {
     check(batchLoopIterationArithmetic(fact, facts, 2) == Arithmetic::Unsafe,
           "known overflowing or invalid unroll arithmetic must be unsafe");
     check(selectBatchLoopLowering(&fact, &axis, facts, 2) ==

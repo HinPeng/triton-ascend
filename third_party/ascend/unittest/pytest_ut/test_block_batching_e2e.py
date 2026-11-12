@@ -39,14 +39,16 @@ def test_dynamic_grid_and_callable_are_preserved(axis, graph):
     for extent in (1, 2, 3, 4, 7):
         grid = [2, 2, 2]
         grid[axis] = extent
-        out = torch.full((grid[0] * grid[1] * grid[2],), -1, device="npu", dtype=torch.int32)
+        out = torch.full((grid[0] * grid[1] * grid[2], ), -1, device="npu", dtype=torch.int32)
+
         def get_grid(meta):
             nonlocal calls
             calls += 1
             return tuple(grid)
+
         before = calls
-        compiled = _original_grid_kernel[get_grid](
-            out, block_batching_factor=3, block_batching_axis=axis, enable_graph_optimize=graph)
+        compiled = _original_grid_kernel[get_grid](out, block_batching_factor=3, block_batching_axis=axis,
+                                                   enable_graph_optimize=graph)
         torch.npu.synchronize()
         assert calls == before + 1
         torch.testing.assert_close(out, torch.full_like(out, grid[0] + 100 * grid[1] + 10000 * grid[2]))
@@ -58,10 +60,11 @@ def test_runtime_write_alias_selects_complete_baseline():
     a = torch.randn((10, 129), device="npu")
     b = torch.randn_like(a)
     beta = .5
+
     def launch(out):
-        return _fused_situgluv2_fwd_triton_kernel[(10, 2)](
-            a, b, out, 129, 129, 1, 129, 1, 129, 1, beta, 2., beta, 2.,
-            BLOCK=128, block_batching_factor=3, block_batching_axis=0)
+        return _fused_situgluv2_fwd_triton_kernel[(10, 2)](a, b, out, 129, 129, 1, 129, 1, 129, 1, beta, 2., beta, 2.,
+                                                           BLOCK=128, block_batching_factor=3, block_batching_axis=0)
+
     separate = torch.empty_like(a)
     kernel = launch(separate)
     torch.npu.synchronize()
@@ -91,7 +94,7 @@ def test_capture_replay_selects_baseline():
 
 @pytest.mark.parametrize("axis", [0, 1, 2])
 def test_empty_grid_never_launches_candidate(axis):
-    out = torch.full((8,), -1, device="npu", dtype=torch.int32)
+    out = torch.full((8, ), -1, device="npu", dtype=torch.int32)
     kernel = _original_grid_kernel[(2, 2, 2)](out, block_batching_factor=3, block_batching_axis=axis)
     torch.npu.synchronize()
     assert kernel.last_launch["runtime_status"] == "APPLIED", kernel.block_batching

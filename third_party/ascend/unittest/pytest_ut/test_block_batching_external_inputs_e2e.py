@@ -28,11 +28,12 @@ def test_external_inputs_preserve_exceptional_values_and_guards(power, blocks):
     x_cpu = values.repeat(triton.cdiv(n, len(values)))[:n]
     y_cpu = exponents.repeat(triton.cdiv(n, len(exponents)))[:n]
     x, y = x_cpu.npu(), y_cpu.npu()
-    storage = [torch.full((n + 32,), -123., device="npu") for _ in range(2)]
+    storage = [torch.full((n + 32, ), -123., device="npu") for _ in range(2)]
     outputs = [value[16:16 + n] for value in storage]
-    kernels = [external_inputs[(blocks,)](x, y, out, n, width, power,
-                block_batching_factor=factor, num_warps=4, num_stages=1)
-               for factor, out in zip((1, 2), outputs)]
+    kernels = [
+        external_inputs[(blocks, )](x, y, out, n, width, power, block_batching_factor=factor, num_warps=4, num_stages=1)
+        for factor, out in zip((1, 2), outputs)
+    ]
     torch.npu.synchronize()
     expected = torch.pow(x_cpu, y_cpu) if power else torch.tanh(x_cpu)
     for out, allocation in zip(outputs, storage):
@@ -62,11 +63,12 @@ def test_constant_power_preserves_values_tail_and_candidate(exponent, factor):
     values = torch.tensor([-float("inf"), -2., -0., 0., .5, 2., float("inf"), float("nan")])
     x_cpu = values.repeat(triton.cdiv(n, len(values)))[:n]
     x = x_cpu.npu()
-    storage = [torch.full((n + 32,), -123., device="npu") for _ in range(2)]
+    storage = [torch.full((n + 32, ), -123., device="npu") for _ in range(2)]
     outputs = [value[16:16 + n] for value in storage]
-    kernels = [constant_power[(blocks,)](
-        x, out, n, width, exponent, block_batching_factor=f, num_warps=4, num_stages=1)
-        for f, out in zip((1, factor), outputs)]
+    kernels = [
+        constant_power[(blocks, )](x, out, n, width, exponent, block_batching_factor=f, num_warps=4, num_stages=1)
+        for f, out in zip((1, factor), outputs)
+    ]
     torch.npu.synchronize()
     # Tensor exponents exercise pow semantics. torch's scalar 0.5 shortcut
     # uses sqrt, which differs at -Inf and signed zero from device_pow.

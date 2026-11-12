@@ -22,9 +22,10 @@ def test_scan_rows_match_reference_and_preserve_tail(dtype, reverse, rows, colum
     source = torch.randint(-4, 5, (rows, columns), dtype=torch.int32).to(dtype)
     x = source.npu()
     outputs = [torch.full((rows + 1, columns), -12345, dtype=dtype, device="npu") for _ in range(2)]
-    kernels = [scan_rows[(rows,)](x, out, columns, triton.next_power_of_2(columns), reverse,
-                                block_batching_factor=factor, num_warps=4, num_stages=1)
-               for factor, out in zip((1, 2), outputs)]
+    kernels = [
+        scan_rows[(rows, )](x, out, columns, triton.next_power_of_2(columns), reverse, block_batching_factor=factor,
+                            num_warps=4, num_stages=1) for factor, out in zip((1, 2), outputs)
+    ]
     torch.npu.synchronize()
     expected = source.flip(1) if reverse else source
     expected = expected.cumsum(1, dtype=dtype)

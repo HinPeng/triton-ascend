@@ -21,24 +21,28 @@ def row_stream(X, O, N, SX, SO, B: tl.constexpr, MODE: tl.constexpr):
 
 
 @pytest.mark.parametrize('factor,n,mode,dtype', [
-    (2, 0, 0, torch.float32), (2, 1, 0, torch.float32),
-    (2, 127, 0, torch.float32), (2, 128, 1, torch.float32),
-    (2, 129, 1, torch.float16), (3, 513, 2, torch.float32),
-    (6, 255, 0, torch.float32), (2, 8193, 2, torch.float32),
+    (2, 0, 0, torch.float32),
+    (2, 1, 0, torch.float32),
+    (2, 127, 0, torch.float32),
+    (2, 128, 1, torch.float32),
+    (2, 129, 1, torch.float16),
+    (3, 513, 2, torch.float32),
+    (6, 255, 0, torch.float32),
+    (2, 8193, 2, torch.float32),
 ])
 def test_unbridged_uniform_loop_uses_identical_baseline(factor, n, mode, dtype):
     rows = factor * 64 + 1
     sx, so = n + 11, n + 23
     source = torch.randn((rows, sx), generator=torch.Generator().manual_seed(881)).to(dtype)
     if mode == 0 and n > 8:
-        source[:, :8] = torch.tensor([-0., 0., -float('inf'), float('inf'),
-                                      float('nan'), 1e-5, -1e5, 1.], dtype=dtype)
+        source[:, :8] = torch.tensor([-0., 0., -float('inf'), float('inf'), float('nan'), 1e-5, -1e5, 1.], dtype=dtype)
     x = source.npu()
-    allocations = [torch.full((rows * so + 32,), -123., dtype=dtype, device='npu') for _ in range(2)]
+    allocations = [torch.full((rows * so + 32, ), -123., dtype=dtype, device='npu') for _ in range(2)]
     outputs = [a[16:-16].reshape(rows, so) for a in allocations]
-    kernels = [row_stream[(rows,)](x, out, n, sx, so, 128, mode,
-               block_batching_factor=f, block_batching_axis=0, num_warps=4)
-               for f, out in zip((1, factor), outputs)]
+    kernels = [
+        row_stream[(rows, )](x, out, n, sx, so, 128, mode, block_batching_factor=f, block_batching_axis=0, num_warps=4)
+        for f, out in zip((1, factor), outputs)
+    ]
     torch.npu.synchronize()
     value = source[:, :n].float()
     expected = (-value if mode == 0 else value * .5 + .25 if mode == 1 else torch.exp(value * .1)).to(dtype)
@@ -51,8 +55,7 @@ def test_unbridged_uniform_loop_uses_identical_baseline(factor, n, mode, dtype):
         assert (allocation[-16:].cpu() == -123.).all()
     torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0, equal_nan=True)
     zeros = torch.isfinite(expected) & (expected == 0)
-    assert torch.equal(torch.signbit(outputs[0].cpu()[:, :n][zeros]),
-                       torch.signbit(outputs[1].cpu()[:, :n][zeros]))
+    assert torch.equal(torch.signbit(outputs[0].cpu()[:, :n][zeros]), torch.signbit(outputs[1].cpu()[:, :n][zeros]))
     torch.testing.assert_close(x.cpu(), source, rtol=0, atol=0, equal_nan=True)
     bundle = kernels[1]
     assert bundle.last_launch['applied_factor'] == 1

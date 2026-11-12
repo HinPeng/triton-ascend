@@ -108,17 +108,23 @@ def test_pow_sanitizes_exponent_without_selecting_its_base(tmp_path):
 
 
 @pytest.mark.parametrize("value,sanitize", [
-    ("2.0", False), ("-3.0", False), ("0.0", False), ("0.5", False),
-    ("2147483520.0", False), ("-2147483520.0", False),
-    ("2147483648.0", True), ("-2147483648.0", True),
-    ("0x7F800000", True), ("0xFF800000", True), ("0x7FC00000", True),
+    ("2.0", False),
+    ("-3.0", False),
+    ("0.0", False),
+    ("0.5", False),
+    ("2147483520.0", False),
+    ("-2147483520.0", False),
+    ("2147483648.0", True),
+    ("-2147483648.0", True),
+    ("0x7F800000", True),
+    ("0xFF800000", True),
+    ("0x7FC00000", True),
 ])
 def test_pow_preserves_proven_safe_constant_exponent(tmp_path, value, sanitize):
     # The pow implementation casts abs(exponent) to signed i32. Safe literal
     # exponents need no inactive-lane select; unknown/unsafe inputs still do.
     text = case_ir("pow").replace(
-        "%result = tt.extern_elementwise %xv, %yv",
-        f"%exponent = arith.constant dense<{value}> : tensor<8xf32>\n"
+        "%result = tt.extern_elementwise %xv, %yv", f"%exponent = arith.constant dense<{value}> : tensor<8xf32>\n"
         "    %result = tt.extern_elementwise %xv, %exponent")
     module = parse(tmp_path, text)
     report = ascend.passes.ttir.rewrite_block_batching(module, 3, 0)

@@ -77,7 +77,8 @@ unsigned lowerBatchLaneScans(ModuleOp module, int64_t factor) {
     Value zeroAxis = rewriter.create<arith::ConstantIntOp>(loc, 0, 32);
     SmallVector<OpFoldResult> sizes(source.getRank(), rewriter.getIndexAttr(1));
     sizes[scanAxis] = rewriter.getIndexAttr(source.getDimSize(scanAxis));
-    SmallVector<OpFoldResult> strides(source.getRank(), rewriter.getIndexAttr(1));
+    SmallVector<OpFoldResult> strides(source.getRank(),
+                                      rewriter.getIndexAttr(1));
     Value assembled = call.getOperand(0);
     for (int64_t lane = 0; lane < factor; ++lane) {
       func::FuncOp declaration;
@@ -92,13 +93,16 @@ unsigned lowerBatchLaneScans(ModuleOp module, int64_t factor) {
       // The downstream adapter erases a cumulative-call declaration after
       // consuming one call. Give each lane its own symbol, including when
       // several scans in this module had shared the original declaration.
-      SmallVector<OpFoldResult> offsets(source.getRank(), rewriter.getIndexAttr(0));
+      SmallVector<OpFoldResult> offsets(source.getRank(),
+                                        rewriter.getIndexAttr(0));
       offsets[0] = rewriter.getIndexAttr(lane);
       Value input = rewriter.create<tensor::ExtractSliceOp>(
           loc, row, call.getOperand(0), offsets, sizes, strides);
-      Value scanned = rewriter.create<func::CallOp>(
-          loc, declaration.getSymName(), TypeRange{row},
-          ValueRange{input, zeroAxis, call.getOperand(2)}).getResult(0);
+      Value scanned = rewriter
+                          .create<func::CallOp>(
+                              loc, declaration.getSymName(), TypeRange{row},
+                              ValueRange{input, zeroAxis, call.getOperand(2)})
+                          .getResult(0);
       assembled = rewriter.create<tensor::InsertSliceOp>(
           loc, scanned, assembled, offsets, sizes, strides);
     }

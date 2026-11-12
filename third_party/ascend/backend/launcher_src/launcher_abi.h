@@ -135,8 +135,8 @@ int triton_npu_launch_v1(const TritonNpuLaunchPlan *plan,
 
 TritonNpuLaunchPlan *
 triton_npu_create_plan_v2(const TritonNpuLaunchSpecV2 *spec,
-                         const TritonNpuArgTypeV1 *types, size_t num_types,
-                         char *error, size_t error_size);
+                          const TritonNpuArgTypeV1 *types, size_t num_types,
+                          char *error, size_t error_size);
 int triton_npu_launch_v2(const TritonNpuLaunchPlan *plan,
                          const TritonNpuLaunchRequestV1 *request,
                          const void *const *args, const size_t *arg_sizes,

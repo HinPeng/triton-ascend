@@ -21,12 +21,10 @@ def _annotate_launch_grid(kwargs, grid, *, bind=None):
     factor = kwargs.get("block_batching_factor", 1)
     # An explicit axis is already selected; launch extents must not split
     # the candidate or its baseline cache, for static or callable grids.
-    if (factor == 1 or "block_batching_grid" in kwargs
-            or kwargs.get("block_batching_axis", -1) != -1):
+    if (factor == 1 or "block_batching_grid" in kwargs or kwargs.get("block_batching_axis", -1) != -1):
         return grid
     if callable(grid):
-        if (bind is None or type(factor) is not int or factor <= 1
-                or kwargs.get("block_batching_cv", False)):
+        if (bind is None or type(factor) is not int or factor <= 1 or kwargs.get("block_batching_cv", False)):
             return grid
         grid = grid(bind())
     if not isinstance(grid, (tuple, list)) or not 1 <= len(grid) <= 3:
@@ -93,11 +91,9 @@ def vv_layout_refusal(report):
 
     independent = [access for access in accesses if access.get("mask_class") == "independent_axes"]
     if independent and all(
-            access.get("action") == "Keep" and access.get("rewritten") is False
-            and ((access.get("mask_class") == "independent_axes"
-                  and row_rank(access) == 1)
-                 or (access.get("mask_class") == "shared"
-                     and row_rank(access) in (0, 1))) for access in accesses):
+            access.get("action") == "Keep" and access.get("rewritten") is False and (
+                (access.get("mask_class") == "independent_axes" and row_rank(access) == 1) or
+                (access.get("mask_class") == "shared" and row_rank(access) in (0, 1))) for access in accesses):
         return "VV_POINTWISE_MEMORY_VIEW_REQUIRED"
     return None
 
@@ -369,8 +365,8 @@ class BatchKernel:
                 # VV candidates protect partial groups with a lane mask and
                 # safe inactive operands. CV still requires complete groups.
                 reason = "CV_GRID_NOT_DIVISIBLE"
-            elif not self._preserve_grid and not _reduces_blocks(
-                    grid, self.block_batching["selected_axis"], self.request.factor):
+            elif not self._preserve_grid and not _reduces_blocks(grid, self.block_batching["selected_axis"],
+                                                                 self.request.factor):
                 # The device task domain is one dimensional: prepareGrid divides
                 # the selected axis and then multiplies all three extents. An
                 # axis too short to divide leaves that product untouched while
@@ -544,10 +540,9 @@ def compile_bundle(backend, src, options, compile_variant):
                 errors="replace") if isinstance(cause.stderr, bytes) else str(cause.stderr or "")
             if _internal_backend_error(cause.returncode, detail):
                 raise
-            reason = ("BATCH_TARGET_RESOURCE_REJECTED" if _cv_resource_refusal(cause.returncode, detail)
-                      else "BACKEND_COMPILE_REJECTED")
-            report.update(reason=reason, backend_returncode=cause.returncode,
-                          backend_diagnostic=detail[-16000:])
+            reason = ("BATCH_TARGET_RESOURCE_REJECTED"
+                      if _cv_resource_refusal(cause.returncode, detail) else "BACKEND_COMPILE_REJECTED")
+            report.update(reason=reason, backend_returncode=cause.returncode, backend_diagnostic=detail[-16000:])
         else:
             # Internal verifier/runtime errors and unknown compiler failures
             # retain their original wrapped diagnostics instead of disappearing

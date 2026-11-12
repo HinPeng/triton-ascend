@@ -53,8 +53,8 @@ def test_unknown_or_unsupported_regions_keep_complete_baseline(tmp_path, kind, o
 
 def test_loop_and_terminal_stores_still_require_noninterference(tmp_path):
     from test_block_batching_guard_v2 import module as guard
-    source = control_ir('for_accumulate').replace('scf.yield %updated : f32',
-        'tt.store %out, %updated : !tt.ptr<f32>\n      scf.yield %updated : f32')
+    source = control_ir('for_accumulate').replace(
+        'scf.yield %updated : f32', 'tt.store %out, %updated : !tt.ptr<f32>\n      scf.yield %updated : f32')
     module = parse(tmp_path, source)
     report = ascend.passes.ttir.rewrite_block_batching(module, 3, 0)
     assert report['compile_status'] == 'REWRITTEN', report
