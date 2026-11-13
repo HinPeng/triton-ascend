@@ -8,6 +8,7 @@ struct BatchLayoutTerm {
   BatchExpr::Kind kind;
   int64_t id;
   BatchExprRef coefficient;
+  int64_t divisor = 0;
 };
 struct BatchLayoutPlan {
   enum Action { Keep, MemoryView, PointwiseRegion };
@@ -20,16 +21,25 @@ struct BatchLayoutPlan {
   // Owned DAGs survive the original IR, unlike an MLIR Value captured here.
   BatchExprRef elementOrigin, elementStride;
   bool symbolic = false;
-  std::string runtimeGuardJSON;
   bool linearMemoryView = false;
   SmallVector<BatchLayoutTerm> restTerms;
   SmallVector<BatchExprRef> residualMasks;
   std::string reason = "DIRECTION_UNPROVEN", maskClass = "unknown";
   std::string location;
   BatchExprRef coordinate, upper;
-  bool rewritten = false;
   bool controlFlowIndependent = false;
 };
+// An owned outcome, never an IR handle. Layout attempts may downgrade this
+// copy to Keep without changing the accepted source plan.
+struct BatchLayoutResult {
+  BatchLayoutPlan layout;
+  bool rewritten = false;
+  std::string runtimeGuardJSON;
+};
+SmallVector<BatchLayoutResult, 0>
+initialBatchLayoutResults(ArrayRef<BatchLayoutPlan> plans);
+std::string serializeBatchLayoutResults(ArrayRef<BatchLayoutResult> results);
+
 SmallVector<BatchLayoutPlan, 0>
 planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor);
 // Read-only proof for automatic axis selection. Uses the same closed-region
@@ -37,12 +47,13 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor);
 bool hasBatchColumnPointwiseRegion(triton::FuncOp function,
                                    const BatchAccessReport &accesses, int axis,
                                    int64_t factor);
+
 std::string serializeBatchLayouts(ArrayRef<BatchLayoutPlan> plans);
-LogicalResult rewriteBatchMemoryViews(ModuleOp module,
-                                      const BatchAccessReport &accesses,
-                                      SmallVectorImpl<BatchLayoutPlan> &plans,
-                                      ArrayRef<Operation *> semanticAccesses,
-                                      Value group, unsigned originalArgCount,
-                                      int axis, int64_t factor);
+LogicalResult
+rewriteBatchMemoryViews(ModuleOp module, const BatchAccessReport &accesses,
+                        ArrayRef<BatchLayoutPlan> plans,
+                        SmallVectorImpl<BatchLayoutResult> &results,
+                        ArrayRef<Operation *> semanticAccesses, Value group,
+                        unsigned originalArgCount, int axis, int64_t factor);
 } // namespace mlir::triton::cfg
 #endif

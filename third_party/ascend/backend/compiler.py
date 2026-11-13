@@ -76,6 +76,8 @@ from triton.backends.ascend.compiler_capabilities import optimized_metaop_option
 from triton.backends.ascend.block_batching import BatchRequest, analyze_request, BatchingRejected, IMPLEMENTATION_VERSION
 from triton.backends.ascend.block_batching import memory_compile_options as batching_memory_compile_options
 from triton.backends.ascend.block_batching import vv_layout_refusal as batching_vv_layout_refusal
+from triton.backends.ascend.block_batching import vv_computation_refusal as batching_vv_computation_refusal
+from triton.backends.ascend.block_batching import vv_memory_lowering_refusal as batching_vv_memory_lowering_refusal
 from triton.backends.ascend.block_batching_report import (
     VALIDATION_POLICY,
     CV_AUTO_BLOCKIFY_LOWERINGS,
@@ -404,8 +406,14 @@ def make_ttir(mod, metadata, opt):
             raise BatchingRejected("REWRITER_IMPLEMENTATION_MISMATCH")
         if report.get("lane_width") != opt.block_batching_factor and report["compile_status"] == "REWRITTEN":
             raise BatchingRejected("CANDIDATE_LAYOUT_MISMATCH")
+        # Retain native evidence even when admission fails before layout.
+        report["computation"] = json.loads(report.pop("computation_json", "") or "{}")
         if report["compile_status"] != "REWRITTEN":
-            raise BatchingRejected(report["reason"])
+            analysis = {
+                key: report[key]
+                for key in ("selected_axis", "operations", "computation", "operation", "context", "location")
+            }
+            raise BatchingRejected(report["reason"], analysis={"stage": "source", **analysis})
         report["layout"] = json.loads(report.pop("layout_json"))
         report["layout"]["requested_policy"] = opt.block_batching_layout
         report["layout"]["selected_policy"] = layout_policy
@@ -420,11 +428,19 @@ def make_ttir(mod, metadata, opt):
         from .block_batching_guard_v3 import bind_plan
         bind_plan(report["guard"], batch_source)
         report["owner"] = "block_batching"
+        refusal = batching_vv_computation_refusal(report)
+        if refusal:
+            raise BatchingRejected(
+                refusal,
+                analysis={"stage": "source", "computation": report["computation"], "operations": report["operations"]})
+        report["admission"] = {"version": 1, "source": "proven", "layout": "pending", "memory_lowering": "pending"}
         refusal = batching_vv_layout_refusal(report)
         if refusal:
-            raise BatchingRejected(refusal,
-                                   analysis={key: report[key]
-                                             for key in ("selected_axis", "operations", "layout")})
+            raise BatchingRejected(
+                refusal,
+                analysis={key: report[key]
+                          for key in ("selected_axis", "operations", "layout", "computation")})
+        report["admission"]["layout"] = "proven"
         report["plan_id"] = metadata["hash"]
         report["candidate_factor"] = opt.block_batching_factor
         metadata["block_batching"] = report
@@ -577,8 +593,8 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
 
         linalg_text = _serialize_module(mod, opt)
         if "block_batching" in metadata:
-            # Observations describe the module, not individual source accesses.
-            # They never authorize a layout or reject valid internal SIMT code.
+            # Check the actual lowered GM helpers, not the presence of scan,
+            # reduction or internal SIMT arithmetic in the compute body.
             metadata["block_batching"]["layout"]["lowering_observation"] = {
                 "scope": "module",
                 "stage": "ttadapter",
@@ -593,6 +609,18 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
         if opt.debug:
             dump_manager = get_dump_manager(metadata["hash"])
             dump_manager.put(linalg_text, "kernel.ttadapter.mlir", binary=False)
+
+        if "block_batching" in metadata:
+            report = metadata["block_batching"]
+            refusal = batching_vv_memory_lowering_refusal(report)
+            if refusal:
+                analysis = {
+                    key: report[key]
+                    for key in ("selected_axis", "operations", "layout", "computation", "admission")
+                }
+                report["admission"]["memory_lowering"] = "rejected"
+                raise BatchingRejected(refusal, analysis={"stage": "ttadapter", **analysis})
+            report["admission"]["memory_lowering"] = "proven"
 
         return linalg_text
 

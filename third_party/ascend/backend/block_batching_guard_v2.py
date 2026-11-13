@@ -2,6 +2,7 @@
 """Byte-domain proof for static tensor-axis-aware access summaries."""
 from dataclasses import dataclass
 
+from .block_batching_affine import affine_uniform, affine_add, affine_scale
 from .block_batching_guard import GuardFailure, I32_MAX, checked, integer
 
 
@@ -10,16 +11,13 @@ class AffineND:
     offset: int
     coefficients: tuple
 
-    @property
-    def uniform(self):
-        return not any(self.coefficients)
+    uniform = property(affine_uniform)
 
     def add(self, other, sign=1):
-        return AffineND(self.offset + sign * other.offset,
-                        tuple(a + sign * b for a, b in zip(self.coefficients, other.coefficients)))
+        return affine_add(self, other, sign, AffineND)
 
     def scale(self, value):
-        return AffineND(self.offset * value, tuple(c * value for c in self.coefficients))
+        return affine_scale(self, value, AffineND)
 
 
 class ByteDomain:
@@ -538,8 +536,20 @@ def check_layout_guards(guard, arguments, grid, factor):
         # The bridged address carries the in-loop offset, so the loop domain
         # belongs here too; it is read by the same constructor as the original
         # access guard. Program coordinates then range over the physical grid.
-        domain = ByteDomain(arguments, grid, {"shape": layout["shape"], "loops": layout["loops"]})
-        domain.full = (*physical, *domain.shape, *domain.loop_counts)
+        domain = ByteDomain(
+            arguments, grid, {
+                "shape": layout["shape"],
+                "loops": layout["loops"],
+                "pointer_checks": layout["positive"] + layout["checks"] + layout["pointer_checks"],
+            })
+        # Register shared program quotient/remainder expressions before
+        # evaluating them. Preserve their extra axes and the original grid
+        # used by scalar bounds; only the batched program count changes.
+        if guard["axis"] in domain.program_splits:
+            raise GuardFailure("INVALID_LAYOUT_PROGRAM_SPLIT")
+        counts = list(domain.full)
+        counts[guard["axis"]] = physical[guard["axis"]]
+        domain.full = tuple(counts)
         for expr in layout["positive"]:
             value = domain.expression(expr)
             if not value.uniform or value.offset <= 0:

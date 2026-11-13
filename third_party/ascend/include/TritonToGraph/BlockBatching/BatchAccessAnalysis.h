@@ -1,34 +1,26 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #ifndef TRITON_TO_GRAPH_BLOCK_BATCHING_ACCESS_ANALYSIS_H
 #define TRITON_TO_GRAPH_BLOCK_BATCHING_ACCESS_ANALYSIS_H
-#include "TritonToGraph/BlockBatching/BatchExpr.h"
+#include "TritonToGraph/BlockBatching/BatchAccessFact.h"
 #include "TritonToGraph/BlockBatching/BatchLoopFacts.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
-#include "llvm/Support/JSON.h"
+#include "llvm/ADT/DenseMap.h"
 #include <string>
 namespace mlir::triton::cfg {
-struct BatchAccessFact {
-  // Valid only until the original body is erased. Consumers must copy plans
-  // and map this operation while both original and generated bodies are alive.
-  Operation *operation = nullptr;
-  int root = -1;
-  unsigned bytes = 0;
-  bool write = false;
-  SmallVector<int64_t> shape;
-  BatchExprRef byteOffset, mask;
-  SmallVector<BatchExprRef> pointerChecks;
-  // 包着这条访存的 scf.for，由内向外。S2b 之前这里直接存 JSON，判定层要用就
-  // 得先把字符串解回来；现在存事实本身，序列化留给报告路径（BatchFactsJSON.h）。
-  // 零内联：绝大多数访存根本不在循环里，有循环时再上堆。默认内联会让
-  // BatchAccessFact 直接撑过 SmallVector 的 256 字节门槛。
-  SmallVector<BatchLoopFact, 0> loops;
-  bool isVolatile = false;
-  // Missing summaries retain a real device SSA effect, never an empty domain.
-  bool deviceAddress = false;
-  bool normalizedPointer = false;
+// Borrowed handles indexed by the original traversal. Invalidate before
+// erasing the source body; the owned facts/projection survive that boundary.
+struct BatchSourceIndex {
+  SmallVector<Operation *> accesses;
+  llvm::DenseMap<Operation *, unsigned> loopIDs;
+  void clear() {
+    accesses.clear();
+    loopIDs.clear();
+  }
 };
 struct BatchAccessReport {
+  BatchSourceIndex sources;
+  BatchEffectProjection effects;
   std::string guardJSON;
   std::string reason;
   Operation *operation = nullptr;

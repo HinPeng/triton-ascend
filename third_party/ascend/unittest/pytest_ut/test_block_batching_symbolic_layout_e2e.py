@@ -144,12 +144,20 @@ def test_dynamic_stride_auto_and_semantic_have_identical_baseline(monkeypatch):
         kernel = _symbolic_rows[(5, )](x, y, 9, 5, 16, 24, False, 2, 8, block_batching_factor=3, block_batching_axis=0,
                                        block_batching_layout=policy)
         torch.npu.synchronize()
-        assert kernel.last_launch['runtime_status'] == 'APPLIED'
+        if policy == 'auto':
+            assert kernel.last_launch['runtime_status'] == 'APPLIED'
+        else:
+            # The semantic-only candidate has indirect GM loads/stores and
+            # must obey the existing VV memory-lowering admission contract.
+            assert kernel.last_launch['runtime_status'] == 'BASELINE_SELECTED'
+            assert kernel.block_batching['reason'] == 'VV_INDIRECT_MEMORY_NOT_SUPPORTED'
+            assert kernel.candidate is None
         kernels.append(kernel)
         outputs.append(y.clone())
     assert kernels[0] is kernels[2]
     assert kernels[0].baseline.asm['ttir'] == kernels[1].baseline.asm['ttir']
-    assert kernels[0].candidate.hash != kernels[1].candidate.hash
-    assert 'layout_checks' not in kernels[1].block_batching['guard']
+    rejected = kernels[1].block_batching['candidate_analysis']['layout']
+    assert rejected['lowering_observation']['indirect_load_ops'] > 0
+    assert not any(p['rewritten'] for p in rejected['accesses'])
     torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
     torch.testing.assert_close(outputs[0], outputs[2], rtol=0, atol=0)

@@ -8,6 +8,8 @@ No tensor data or allocation capacity is read. Unknown domains select baseline.
 from dataclasses import dataclass
 import operator
 
+from .block_batching_affine import affine_uniform, affine_add, affine_scale
+
 I32_MAX = (1 << 31) - 1
 U64_MAX = (1 << 64) - 1
 
@@ -38,16 +40,13 @@ class Affine:
     offset: int
     coefficients: tuple = (0, 0, 0, 0)
 
-    @property
-    def uniform(self):
-        return not any(self.coefficients)
+    uniform = property(affine_uniform)
 
     def add(self, other, sign=1):
-        return Affine(self.offset + sign * other.offset,
-                      tuple(a + sign * b for a, b in zip(self.coefficients, other.coefficients)))
+        return affine_add(self, other, sign, Affine)
 
     def scale(self, scale):
-        return Affine(self.offset * scale, tuple(c * scale for c in self.coefficients))
+        return affine_scale(self, scale, Affine)
 
 
 class Domain:

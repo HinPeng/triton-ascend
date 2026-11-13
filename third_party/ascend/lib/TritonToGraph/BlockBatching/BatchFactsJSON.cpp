@@ -6,6 +6,32 @@ namespace {
 llvm::json::Value exprJSON(const BatchExpr &self);
 } // namespace
 
+llvm::json::Value batchAccessesJSON(const BatchEffectProjection &effects) {
+  llvm::json::Array accesses;
+  using A = llvm::json::Array;
+  for (const auto &fact : effects.accesses) {
+    A checks, shape, loops;
+    for (const auto &step : fact.pointerChecks)
+      checks.push_back(batchExprJSON(step));
+    for (int64_t extent : fact.shape)
+      shape.push_back(extent);
+    for (const auto &loop : fact.loops)
+      loops.push_back(batchLoopJSON(loop));
+    accesses.push_back(
+        llvm::json::Object{{"root", fact.root},
+                           {"offset", batchExprJSON(fact.byteOffset)},
+                           {"shape", std::move(shape)},
+                           {"mask", batchExprJSON(fact.mask)},
+                           {"write", fact.write},
+                           {"bytes", fact.bytes},
+                           {"pointer_checks", std::move(checks)},
+                           {"loops", std::move(loops)},
+                           {"volatile", fact.isVolatile},
+                           {"device_address", fact.deviceAddress}});
+  }
+  return llvm::json::Object{{"version", 2}, {"accesses", std::move(accesses)}};
+}
+
 llvm::json::Value batchExprJSON(const BatchExprRef &expr) {
   return expr ? exprJSON(*expr) : llvm::json::Value(nullptr);
 }

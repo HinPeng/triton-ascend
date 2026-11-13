@@ -5,7 +5,7 @@ Call only after successful compilation and verification of the output binary.
 UB numbers are optional diagnostics, not another resource admission gate.
 No custom AscendNPU-IR report or transitive SIMD proof is required.
 """
-from .block_batching import BatchingRejected
+from .block_batching import BatchingRejected, _is_cv_report
 
 VALIDATION_POLICY = "ta_only_v1"
 CV_VALIDATION_POLICY = "ta_cv_integer_rank_two_v23"
@@ -150,3 +150,33 @@ def validate_compilation_result(metadata):
         workspace_bytes=workspace,
         workspace_source="callback" if "workspace_size" in metadata else "standard_backend_default",
     )
+
+
+def validated_candidate_report(candidate, request, implementation_version):
+    """Check the complete compiled candidate before publishing its report.
+
+    Preserve the existing check order and shallow report-copy semantics.
+    Runtime proof, lazy handle initialization and variant selection are separate.
+    """
+    import hashlib
+    native_report = getattr(candidate.metadata, "block_batching", {})
+    cv = _is_cv_report(native_report)
+    if (native_report.get("cv_mode") not in ("disabled", "independent_batch_v1", "spatial_concat_v1")
+            or native_report.get("compile_status") != "COMPILED_GUARDED"
+            or native_report.get("validation_policy") != (CV_VALIDATION_POLICY if cv else VALIDATION_POLICY)):
+        raise BatchingRejected("CANDIDATE_VALIDATION_MISSING")
+    if (native_report.get("implementation_version") != implementation_version
+            or native_report.get("lane_width") != request.factor):
+        raise BatchingRejected("CANDIDATE_LAYOUT_MISMATCH")
+    if cv and native_report.get("tail_policy") != "full_groups_only":
+        raise BatchingRejected("CV_CONTRACT_MISMATCH")
+    expected = getattr(candidate.metadata, "block_batching_binary_sha256", None)
+    if expected != hashlib.sha256(candidate.kernel).hexdigest():
+        raise BatchingRejected("CANDIDATE_BINARY_CHANGED")
+    from .block_batching_guard_v3 import validate_plan_binding
+    guard = native_report.get("guard", {})
+    if (not validate_plan_binding(guard)
+            or getattr(candidate.metadata, "block_batching_plan_sha256", None) != guard.get("plan_fingerprint")):
+        raise BatchingRejected("CANDIDATE_PLAN_CHANGED")
+    validate_vv_loop_contract(candidate.metadata._asdict())
+    return dict(native_report)

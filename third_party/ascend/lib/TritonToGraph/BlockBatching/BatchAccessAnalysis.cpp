@@ -38,13 +38,14 @@ E scale(E value, int64_t factor) {
 // One convex hull per scalar column falsely aliases interleaved row fields.
 // Group only unconditional, adjacent fields of the same scalar SSA pointer.
 // The IR and layout access IDs remain unchanged; only the proof is normalized.
-SmallVector<BatchAccessFact>
+BatchEffectProjection
 jointScalarStoreEffects(triton::FuncOp function,
-                        ArrayRef<BatchAccessFact> accesses) {
+                        ArrayRef<BatchAccessFact> accesses,
+                        const BatchSourceIndex &sources) {
   SmallVector<BatchAccessFact> effects(accesses.begin(), accesses.end());
   llvm::DenseMap<Value, SmallVector<std::pair<int64_t, unsigned>>> groups;
   for (auto [id, fact] : llvm::enumerate(accesses)) {
-    auto store = dyn_cast<triton::StoreOp>(fact.operation);
+    auto store = dyn_cast<triton::StoreOp>(sources.accesses[id]);
     if (!store || store->getParentOp() != function.getOperation() ||
         store.getMask() || !fact.shape.empty() || !fact.loops.empty() ||
         fact.isVolatile)
@@ -89,7 +90,7 @@ jointScalarStoreEffects(triton::FuncOp function,
     for (auto member : llvm::drop_begin(members))
       effects[member.second].mask = K::leaf(K::False);
   }
-  return effects;
+  return {std::move(effects)};
 }
 bool hasUnknown(E expression) {
   return expression &&
@@ -103,7 +104,7 @@ struct Pointer {
   explicit operator bool() const { return root >= 0; }
 };
 
-struct Analysis {
+struct AccessFactBuilder {
   triton::FuncOp function;
   unsigned indexBits;
   unsigned budget = 1024;
@@ -113,7 +114,7 @@ struct Analysis {
   bool pointerRecurrences = false;
   llvm::DenseMap<Value, unsigned> inductionVariables;
   BatchAccessReport report;
-  explicit Analysis(triton::FuncOp function, unsigned indexBits)
+  explicit AccessFactBuilder(triton::FuncOp function, unsigned indexBits)
       : function(function), indexBits(indexBits) {}
   bool spend(Value value) {
     if (!report.reason.empty())
@@ -523,11 +524,12 @@ unsigned getBatchIndexBitWidth(ModuleOp module) {
 BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
                                        unsigned indexBits,
                                        bool pointerRecurrences) {
-  Analysis analysis(function, indexBits);
+  AccessFactBuilder analysis(function, indexBits);
   analysis.pointerRecurrences = pointerRecurrences;
 
   unsigned loopID = 0;
   function.walk([&](scf::ForOp loop) {
+    analysis.report.sources.loopIDs[loop.getOperation()] = loopID;
     analysis.inductionVariables[loop.getInductionVar()] = loopID++;
   });
   function.walk([&](Operation *op) {
@@ -626,8 +628,9 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
     E mask = analysis.mask(predicate, axes);
     if (!analysis.report.reason.empty())
       return;
+    analysis.report.sources.accesses.push_back(op);
     analysis.report.accesses.push_back(
-        {op, base.root, bytes, write, std::move(shape), std::move(base.offset),
+        {base.root, bytes, write, std::move(shape), std::move(base.offset),
          std::move(mask), std::move(base.checks), std::move(loops), isVolatile,
          deviceAddress, analysis.normalizedPointer});
   });
@@ -646,33 +649,10 @@ BatchAccessReport analyzeBatchAccesses(triton::FuncOp function,
       analysis.report.loops.push_back(*byID[id]);
   }
   if (analysis.report.reason.empty()) {
-    A accesses;
-    for (const auto &fact :
-         jointScalarStoreEffects(function, analysis.report.accesses)) {
-      A checks, shape, loops;
-      for (const auto &step : fact.pointerChecks)
-        checks.push_back(batchExprJSON(step));
-      for (int64_t extent : fact.shape)
-        shape.push_back(extent);
-      for (const auto &loop : fact.loops)
-        loops.push_back(batchLoopJSON(loop));
-      accesses.push_back(
-          llvm::json::Object{{"root", fact.root},
-                             {"offset", batchExprJSON(fact.byteOffset)},
-                             {"shape", std::move(shape)},
-                             {"mask", batchExprJSON(fact.mask)},
-                             {"write", fact.write},
-                             {"bytes", fact.bytes},
-                             {"pointer_checks", std::move(checks)},
-                             {"loops", std::move(loops)},
-                             {"volatile", fact.isVolatile},
-                             {"device_address", fact.deviceAddress}});
-    }
+    analysis.report.effects = jointScalarStoreEffects(
+        function, analysis.report.accesses, analysis.report.sources);
     analysis.report.guardJSON =
-        llvm::formatv("{0}",
-                      J(llvm::json::Object{{"version", 2},
-                                           {"accesses", std::move(accesses)}}))
-            .str();
+        llvm::formatv("{0}", batchAccessesJSON(analysis.report.effects)).str();
   }
   return analysis.report;
 }

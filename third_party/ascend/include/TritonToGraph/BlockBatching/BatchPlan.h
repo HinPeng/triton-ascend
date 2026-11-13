@@ -44,6 +44,7 @@ struct BatchAnalysisReport {
   std::string operation;
   std::string context;
   std::string layoutJSON;
+  std::string computationJSON;
   std::map<std::string, unsigned> operations;
 };
 
@@ -56,6 +57,8 @@ struct BatchRewriteReport : BatchAnalysisReport {
   int selectedAxis = -1;
   int64_t laneWidth = 1;
 };
+// Describe original aggregation domains before the rewrite erases them.
+std::string describeBatchComputation(Operation *root);
 void setBatchDiagnostic(BatchAnalysisReport &report, Operation *op,
                         llvm::StringRef reason);
 

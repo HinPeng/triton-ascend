@@ -1,7 +1,7 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #ifndef TRITON_TO_GRAPH_BLOCK_BATCHING_FACTS_JSON_H
 #define TRITON_TO_GRAPH_BLOCK_BATCHING_FACTS_JSON_H
-#include "TritonToGraph/BlockBatching/BatchExpr.h"
+#include "TritonToGraph/BlockBatching/BatchAccessFact.h"
 #include "TritonToGraph/BlockBatching/BatchLoopFacts.h"
 #include "llvm/Support/JSON.h"
 
@@ -16,6 +16,8 @@
 // 只有报告路径 include 这个头。判定层与事实层只认 BatchExpr / BatchLoopFact
 // 这两个纯数据类型，不认它们的 JSON 形态。
 namespace mlir::triton::cfg {
+
+llvm::json::Value batchAccessesJSON(const BatchEffectProjection &effects);
 
 llvm::json::Value batchExprJSON(const BatchExprRef &expr);
 
