@@ -1,5 +1,8 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+#include "TritonToGraph/BlockBatching/BatchAffine.h"
+#include "TritonToGraph/BlockBatching/BatchFactsJSON.h"
 #include "TritonToGraph/BlockBatching/BatchLayoutPlan.h"
+#include "TritonToGraph/BlockBatching/BatchLoopSchedule.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
@@ -11,57 +14,10 @@ namespace {
 using E = BatchExprRef;
 using K = BatchExpr;
 using Key = std::pair<K::Kind, int64_t>;
-// Deliberately bounded exact integer algebra. No sampled dynamic stride or
-// equality of byte strides can establish a logical direction.
-struct Linear {
-  int64_t constant = 0;
-  std::map<Key, int64_t> terms;
-};
-std::optional<Linear> linear(E e, unsigned &budget) {
-  if (!e || !budget)
-    return std::nullopt;
-  --budget;
-  if (e->kind == K::Constant)
-    return Linear{e->value, {}};
-  if (e->kind == K::Coordinate || e->kind == K::Program ||
-      e->kind == K::Argument || e->kind == K::Grid)
-    return Linear{0, {{{e->kind, e->value}, 1}}};
-  // Signed extension is exact under the existing no-wrap guard. Unsigned
-  // extension and truncation require additional range facts: KEEP for now.
-  if (e->kind == K::ExtSI)
-    return linear(e->lhs, budget);
-  if (e->kind != K::Add && e->kind != K::Sub && e->kind != K::Mul)
-    return std::nullopt;
-  auto a = linear(e->lhs, budget), b = linear(e->rhs, budget);
-  if (!a || !b)
-    return std::nullopt;
-  if (e->kind == K::Mul) {
-    if (!a->terms.empty() && !b->terms.empty())
-      return std::nullopt;
-    if (b->terms.empty())
-      std::swap(a, b);
-    int64_t scale = a->constant;
-    if (llvm::MulOverflow(b->constant, scale, b->constant))
-      return std::nullopt;
-    for (auto &[key, value] : b->terms)
-      if (llvm::MulOverflow(value, scale, value))
-        return std::nullopt;
-    return b;
-  }
-  if (e->kind == K::Sub) {
-    if (llvm::MulOverflow(b->constant, int64_t(-1), b->constant))
-      return std::nullopt;
-    for (auto &[key, value] : b->terms)
-      if (llvm::MulOverflow(value, int64_t(-1), value))
-        return std::nullopt;
-  }
-  if (llvm::AddOverflow(a->constant, b->constant, a->constant))
-    return std::nullopt;
-  for (auto [key, value] : b->terms)
-    if (llvm::AddOverflow(a->terms[key], value, a->terms[key]))
-      return std::nullopt;
-  return a;
-}
+// The exact integer affine decomposition now lives in BatchAffine.h, shared
+// with the loop judgment layer. This file keeps its historical leaf set
+// (kBatchLayoutLeaves): induction variables still fail the decomposition here,
+// so a loop-dependent bound still falls through to KEEP exactly as before.
 
 // Parameter-affine addresses: coordinates vary inside the batch; scalar
 // arguments/grid extents are uniform parameters of their coefficients. Keep
@@ -125,9 +81,10 @@ struct Scalar {
     return result;
   }
 };
+using LayoutKey = std::tuple<K::Kind, int64_t, int64_t>;
 struct ParameterAffine {
   Scalar offset;
-  std::map<Key, Scalar> terms;
+  std::map<LayoutKey, Scalar> terms;
   bool symbolic() const {
     return !offset.parameters.empty() ||
            llvm::any_of(terms, [](const auto &term) {
@@ -135,7 +92,8 @@ struct ParameterAffine {
            });
   }
 };
-std::optional<ParameterAffine> parameterAffine(E e, unsigned &budget) {
+std::optional<ParameterAffine> parameterAffine(E e, unsigned &budget,
+                                               int axis) {
   if (!e || !budget)
     return std::nullopt;
   --budget;
@@ -148,17 +106,30 @@ std::optional<ParameterAffine> parameterAffine(E e, unsigned &budget) {
     value.parameters[{e->kind, e->value, e->bits}] = 1;
     return ParameterAffine{value, {}};
   }
-  if (e->kind == K::Coordinate || e->kind == K::Program || e->kind == K::Grid) {
+  // Induction 在这里和坐标同级：normalizeBatchAccessOnLogicalAxis 已经把循环
+  // 变量换成「下界 + 圈内偏移」，剩下的这个叶子代表圈内偏移，各份相同。
+  if (e->kind == K::Coordinate || e->kind == K::Program || e->kind == K::Grid ||
+      e->kind == K::Induction) {
     ParameterAffine value;
-    value.terms[{e->kind, e->value}] = Scalar{1, {}};
+    value.terms[{e->kind, e->value, 0}] = Scalar{1, {}};
+    return value;
+  }
+  // Quotient/remainder of another program axis is uniform within this
+  // batch. Preserve its divisor and existing proof rather than treating it
+  // as a linear function of the selected axis.
+  if (e->kind == K::ProgramQuotient || e->kind == K::ProgramRemainder) {
+    if (e->value == axis || e->extent <= 0)
+      return std::nullopt;
+    ParameterAffine value;
+    value.terms[{e->kind, e->value, e->extent}] = Scalar{1, {}};
     return value;
   }
   if (e->kind == K::ExtSI)
-    return parameterAffine(e->lhs, budget);
+    return parameterAffine(e->lhs, budget, axis);
   if (e->kind != K::Add && e->kind != K::Sub && e->kind != K::Mul)
     return std::nullopt;
-  auto a = parameterAffine(e->lhs, budget);
-  auto b = parameterAffine(e->rhs, budget);
+  auto a = parameterAffine(e->lhs, budget, axis);
+  auto b = parameterAffine(e->rhs, budget, axis);
   if (!a || !b)
     return std::nullopt;
   if (e->kind == K::Mul) {
@@ -209,6 +180,23 @@ void conjuncts(E mask, SmallVectorImpl<E> &out) {
   } else
     out.push_back(mask);
 }
+// Block-pointer boundary checks include x >= 0, represented by -1 < x.
+// Program ids and local coordinates are nonnegative. Remove this predicate
+// from layout matching only when exact affine algebra proves it redundant.
+// The original access mask and its no-wrap guard remain unchanged; arbitrary
+// scalar parameters, induction variables and negative origins are not proven.
+bool redundantNonnegativeBound(E predicate) {
+  if (predicate->kind != K::SLT || !predicate->lhs ||
+      predicate->lhs->kind != K::Constant || predicate->lhs->value != -1)
+    return false;
+  unsigned budget = 256;
+  auto form = batchLinearForm(predicate->rhs, budget,
+                              batchLeaf(K::Program) | batchLeaf(K::Coordinate) |
+                                  batchLeaf(K::Grid));
+  return form && form->constant >= 0 &&
+         llvm::all_of(form->terms,
+                      [](const auto &term) { return term.second >= 0; });
+}
 void coordinateIDs(E e, SmallVectorImpl<int64_t> &ids) {
   if (!e)
     return;
@@ -233,13 +221,14 @@ bool rangeGroup(E e, ArrayRef<int64_t> axes) {
 // A bound on a coordinate, before byte scaling, associates that coordinate's
 // local projections with the selected program direction. It excludes all
 // other program directions, even if their strides happen to be equal.
-bool bind(E predicate, const BatchAccessFact &fact, BatchLayoutPlan &plan) {
+// 名字不叫 bind：实参里有 std::shared_ptr，ADL 会把 std::bind 拉进候选集。
+bool bindProgramDirection(E predicate, const BatchAccessFact &fact,
+                          BatchLayoutPlan &plan) {
   if (predicate->kind != K::SLT || contains(predicate->rhs, K::Coordinate) ||
-      contains(predicate->rhs, K::Program) ||
-      contains(predicate->rhs, K::Induction))
+      contains(predicate->rhs, K::Program))
     return false;
   unsigned budget = 256;
-  auto form = linear(predicate->lhs, budget);
+  auto form = batchLinearForm(predicate->lhs, budget, kBatchLoopLeaves);
   if (!form)
     return false;
   SmallVector<int64_t> axes;
@@ -248,6 +237,9 @@ bool bind(E predicate, const BatchAccessFact &fact, BatchLayoutPlan &plan) {
       continue;
     if (key.first == K::Coordinate && value > 0)
       axes.push_back(key.second);
+    // 圈内偏移对整块是一个各份相同的平移，不参与方向绑定，放行但不记轴。
+    else if (key.first == K::Induction)
+      continue;
     else if (key != Key{K::Program, plan.gridAxis})
       return false;
   }
@@ -273,21 +265,50 @@ bool bind(E predicate, const BatchAccessFact &fact, BatchLayoutPlan &plan) {
 SmallVector<BatchLayoutPlan, 0>
 planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
   SmallVector<BatchLayoutPlan, 0> plans;
-  for (auto [id, fact] : llvm::enumerate(accesses.accesses)) {
+  for (auto [id, originalFact] : llvm::enumerate(accesses.accesses)) {
+    // 把循环变量接回程序号，再往下全程用归一后的这一份。不接的话，一条按行走
+    // 的访存地址里只有归纳变量、没有 K::Program，下面第一个分支就会判它
+    // SHARED_ACCESS——字面正确但结论错，程序号只是藏在循环下界里。
+    //
+    // 地址与掩码必须一起换、而且只换一次：下面要拿 plan.coordinate 和谓词做
+    // 指针相等比较，两边来源不同就对不上。
+    BatchAccessFact fact = originalFact;
+    bool normalized = true;
+    for (const BatchLoopFact &loop : originalFact.loops) {
+      fact.byteOffset =
+          normalizeBatchAccessOnLogicalAxis(fact.byteOffset, loop);
+      fact.mask = normalizeBatchAccessOnLogicalAxis(fact.mask, loop);
+      normalized &= bool(fact.byteOffset);
+    }
     BatchLayoutPlan plan;
     plan.accessID = id;
     plan.gridAxis = axis;
     plan.shape = fact.shape;
+    // Reuse the access proof: nested execution, device-derived addresses and
+    // unknown expressions do not establish control-flow-independent memory.
+    plan.controlFlowIndependent =
+        isa<triton::FuncOp>(accesses.sources.accesses[id]->getParentOp()) &&
+        !fact.deviceAddress && fact.byteOffset &&
+        !contains(fact.byteOffset, K::Unknown) &&
+        !contains(fact.mask, K::Unknown);
     llvm::raw_string_ostream stream(plan.location);
-    fact.operation->getLoc().print(stream);
+    accesses.sources.accesses[id]->getLoc().print(stream);
+    if (!normalized) {
+      // 归一不下去就按证不出处理，绝不退回原式：那等于把"程序号不在地址里"这个
+      // 错误结论静默放行。
+      plan.reason = "LOOP_ORIGIN_UNPROVEN";
+      plans.push_back(std::move(plan));
+      continue;
+    }
     SmallVector<E> predicates;
     conjuncts(fact.mask, predicates);
+    llvm::erase_if(predicates, redundantNonnegativeBound);
     bool bound = false, unknown = false;
     for (auto predicate : predicates) {
       if (predicate->kind == K::Unknown)
         unknown = true;
       if (contains(predicate, K::Program, axis)) {
-        if (bound || !bind(predicate, fact, plan)) {
+        if (bound || !bindProgramDirection(predicate, fact, plan)) {
           unknown = true;
           continue;
         }
@@ -303,23 +324,24 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
     } else if (bound && !unknown) {
       // Direction is established above. Check the byte-stride chain only now.
       unsigned budget = 512;
-      auto address = parameterAffine(fact.byteOffset, budget);
+      auto address = parameterAffine(fact.byteOffset, budget, axis);
       bool strides = bool(address);
       if (address) {
         int64_t weight = 1;
-        Scalar stride = address->terms[{K::Coordinate, plan.localAxes.back()}];
+        Scalar stride =
+            address->terms[{K::Coordinate, plan.localAxes.back(), 0}];
         // Positive dynamic stride is checked at launch, never sampled here.
         strides = !stride.parameters.empty() || stride.constant > 0;
         for (int64_t local : llvm::reverse(plan.localAxes)) {
           auto expected = stride.multiply(Scalar{weight, {}});
           if (!expected ||
-              !(address->terms[{K::Coordinate, local}] == *expected))
+              !(address->terms[{K::Coordinate, local, 0}] == *expected))
             strides = false;
           if (llvm::MulOverflow(weight, fact.shape[local], weight))
             strides = false;
         }
         auto expected = stride.multiply(Scalar{weight, {}});
-        if (!expected || !(address->terms[{K::Program, axis}] == *expected))
+        if (!expected || !(address->terms[{K::Program, axis, 0}] == *expected))
           strides = false;
       }
       bool extraMask = false;
@@ -354,11 +376,29 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
           leading &= local == static_cast<int64_t>(position);
         bool columnRegion =
             fact.shape.size() == 2 && plan.localAxes == SmallVector<int64_t>{1};
-        bool simple = (leading || columnRegion) && fact.shape.size() <= 3 &&
-                      fact.loops.empty();
+        // A rank-one tile may still be relative to a separate grid row.
+        // Preserve that uniform row origin just as for [1, N] tiles; the
+        // closed-region verifier below the planner proves the computation.
+        bool rowVector =
+            fact.shape.size() == 1 && fact.loops.empty() &&
+            plan.localAxes == SmallVector<int64_t>{0} &&
+            llvm::any_of(address->terms, [&](const auto &term) {
+              auto [kind, id, divisor] = term.first;
+              return kind == K::Program && id != axis && !term.second.isZero();
+            });
+        // 这里原本还带一条 fact.loops.empty()。它挡住的不只是程序轴循环——块内
+        // 循环今天就放行，这类访存一路证得出
+        // PROVEN_DIRECTION_AND_STRIDE_CHAIN， 却因为这一条而 linearMemoryView
+        // 为假，于是 BatchMemoryView.cpp:451
+        // 一律跳过：证出来了从不改写。删掉之后它们第一次进入改写路径，这是本步
+        // 唯一一处改变已发布行为的地方，干跑 diff 要逐行过目。
+        //
+        // 地址里真的用到循环变量时，圈内偏移会作为 K::Induction 的 rest term
+        // 留下来，由下面两处和发射器一起接住。
+        bool simple = (leading || columnRegion) && fact.shape.size() <= 3;
         auto origin = address->offset.divide(fact.bytes);
         auto stride =
-            address->terms[{K::Coordinate, plan.localAxes.back()}].divide(
+            address->terms[{K::Coordinate, plan.localAxes.back(), 0}].divide(
                 fact.bytes);
         if (!origin || !stride) {
           plan.action = BatchLayoutPlan::Keep;
@@ -369,9 +409,16 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
         plan.symbolic = address->symbolic();
         plan.elementOrigin = origin->expression();
         plan.elementStride = stride->expression();
-        // First symbolic emitter supports leading (row) groups only. Column
-        // region propagation remains on the previously verified constant path.
-        if (plan.symbolic && !leading) {
+        // Unit-stride columns can use the same closed pointwise-region map
+        // with dynamic row pitches. The emitter preserves those pitches and
+        // publishes guards for every new wide address intermediate. Keep
+        // non-unit symbolic column strides on the original semantic path.
+        bool contiguousColumn = (columnRegion || rowVector) &&
+                                stride->parameters.empty() &&
+                                stride->constant == 1;
+        if (rowVector && contiguousColumn)
+          plan.action = BatchLayoutPlan::PointwiseRegion;
+        if (plan.symbolic && !leading && !contiguousColumn) {
           plan.action = BatchLayoutPlan::Keep;
           plan.reason = "SYMBOLIC_LAYOUT_BRIDGE_UNSUPPORTED";
           plans.push_back(std::move(plan));
@@ -383,25 +430,32 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
         magnitude += origin->constant < 0 ? -__int128(origin->constant)
                                           : origin->constant;
         for (const auto &[key, coefficient] : address->terms) {
-          if (coefficient.isZero() || key == Key{K::Program, axis} ||
-              (key.first == K::Coordinate &&
-               llvm::is_contained(plan.localAxes, key.second)))
+          auto [kind, id, divisor] = key;
+          bool uniformDivision =
+              kind == K::ProgramQuotient || kind == K::ProgramRemainder;
+          if (coefficient.isZero() || key == LayoutKey{K::Program, axis, 0} ||
+              (kind == K::Coordinate && llvm::is_contained(plan.localAxes, id)))
             continue;
           auto scaled = coefficient.divide(fact.bytes);
           if (!scaled) {
             simple = false;
             continue;
           }
-          if (key.first != K::Coordinate && key.first != K::Program &&
-              key.first != K::Grid)
+          // Induction 与前三者同级：它代表圈内偏移，发射器从外层 scf.for 取回
+          // 循环变量（BatchMemoryView.cpp 的 Emitter::upper）。
+          if (kind != K::Coordinate && kind != K::Program && kind != K::Grid &&
+              kind != K::Induction && !uniformDivision)
             simple = false;
-          // Defer nonfused dynamic strides until their target lowering has a
-          // dedicated contract; this slice is the dynamic row-stride model.
-          if (!scaled->parameters.empty())
+          // A closed unit-column region retains other coordinates and their
+          // parameter-affine pitches, without permuting its computation.
+          // Other layouts still require the previously supported loop term.
+          if (!scaled->parameters.empty() && kind != K::Induction &&
+              !contiguousColumn && !uniformDivision)
             simple = false;
+          // New wide scalar operations use the same layout guard contract.
+          plan.symbolic |= uniformDivision;
           int64_t c = scaled->constant;
-          plan.restTerms.push_back(
-              {key.first, key.second, scaled->expression()});
+          plan.restTerms.push_back({kind, id, scaled->expression(), divisor});
           magnitude += (__int128(INT32_MAX) + 1) * (c < 0 ? -__int128(c) : c);
         }
         for (auto predicate : predicates)
@@ -430,14 +484,28 @@ planBatchLayouts(const BatchAccessReport &accesses, int axis, int64_t factor) {
   }
   return plans;
 }
+SmallVector<BatchLayoutResult, 0>
+initialBatchLayoutResults(ArrayRef<BatchLayoutPlan> plans) {
+  SmallVector<BatchLayoutResult, 0> results;
+  for (const auto &plan : plans)
+    results.push_back({plan, false, {}});
+  return results;
+}
 std::string serializeBatchLayouts(ArrayRef<BatchLayoutPlan> plans) {
+  return serializeBatchLayoutResults(initialBatchLayoutResults(plans));
+}
+std::string serializeBatchLayoutResults(ArrayRef<BatchLayoutResult> results) {
   llvm::json::Array rows;
-  for (const auto &plan : plans) {
-    llvm::json::Array axes, shape;
+  for (const auto &result : results) {
+    const auto &plan = result.layout;
+    llvm::json::Array axes, shape, effectiveShape;
     for (auto axis : plan.localAxes)
       axes.push_back(axis);
-    for (auto extent : plan.shape)
+    for (auto extent : plan.shape) {
       shape.push_back(extent);
+      if (extent != 1)
+        effectiveShape.push_back(extent);
+    }
     rows.push_back(llvm::json::Object{
         {"access_id", plan.accessID},
         {"action", plan.action == BatchLayoutPlan::Keep ? "Keep"
@@ -447,18 +515,20 @@ std::string serializeBatchLayouts(ArrayRef<BatchLayoutPlan> plans) {
         {"selected_grid_axis", plan.gridAxis},
         {"local_axes", std::move(axes)},
         {"original_shape", std::move(shape)},
+        {"effective_shape", std::move(effectiveShape)},
+        {"control_flow_independent", plan.controlFlowIndependent},
         {"tile_extent", plan.tileExtent},
         {"origin", plan.origin},
         {"reason", plan.reason},
         {"mask_class", plan.maskClass},
         {"source_location", plan.location},
-        {"rewritten", plan.rewritten},
-        {"bridge", !plan.rewritten ? "not_applied"
+        {"rewritten", result.rewritten},
+        {"bridge", !result.rewritten ? "not_applied"
                    : plan.action == BatchLayoutPlan::PointwiseRegion
                        ? "direct_pointwise"
                        : "ordered_view"},
         {"expected_memory_form",
-         plan.rewritten ? "strided_block_candidate" : "semantic"},
+         result.rewritten ? "strided_block_candidate" : "semantic"},
         {"symbolic_stride", plan.symbolic},
         {"element_stride", batchExprJSON(plan.elementStride)},
         {"proof_scope", plan.symbolic ? "original_and_layout_runtime_guard"

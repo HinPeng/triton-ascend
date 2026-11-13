@@ -4,8 +4,9 @@ This note describes the initial static-lane experiment. See the maintained
 [CV block-batching contract](ascend/cv_block_batching.md) for current spatial,
 masked batch-matmul, unified guard and AutoBlockify support.
 
-Manual API: `block_batching_cv=True, block_batching_factor=2,
-block_batching_axis=0`. Pass the original grid. Implementation version 21.
+The historical implementation version 21 used a separate CV opt-in. Current
+callers use `block_batching_factor=2, block_batching_axis=0` with the original
+grid; dot-containing kernels automatically select CV batching.
 
 For residual structured memory masks, `static_masked_lanes_v1` clones the
 normalized straight-line body F times within one program. Clone l uses

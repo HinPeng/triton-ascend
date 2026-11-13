@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-spec = importlib.util.spec_from_file_location(
-    "_batch_program_grid", Path(__file__).parents[2] / "backend/program_grid.py")
+spec = importlib.util.spec_from_file_location("_batch_program_grid",
+                                              Path(__file__).parents[2] / "backend/program_grid.py")
 grid = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(grid)
 pytestmark = pytest.mark.backend("native")
@@ -16,12 +16,21 @@ pytestmark = pytest.mark.backend("native")
 
 def contract(axis=0, factor=3, version=3):
     axes = [0, 1, 2] if version == 3 else [0, 1]
-    return {"version": version, "extent_source": "runtime_original_grid",
-            "hidden_extent_axes": axes,
-            "hidden_argument_order": ["originalGrid" + a for a in "XYZ"[:len(axes)]],
-            "hidden_argument_types": ["i32"] * len(axes),
-            "transforms": [{"order": 0, "kind": "ceil_div", "axis": axis, "factor": factor,
-                            "persistent_coverage": False, "grid_stride_abi_verified": False}]}
+    return {
+        "version":
+        version, "extent_source":
+        "runtime_original_grid", "hidden_extent_axes":
+        axes, "hidden_argument_order":
+        ["originalGrid" + a for a in "XYZ"[:len(axes)]], "hidden_argument_types": ["i32"] * len(axes), "transforms": [{
+            "order":
+            0, "kind":
+            "ceil_div", "axis":
+            axis, "factor":
+            factor, "persistent_coverage":
+            False, "grid_stride_abi_verified":
+            False
+        }]
+    }
 
 
 @pytest.mark.parametrize("axis", [0, 1, 2])
@@ -36,9 +45,13 @@ def test_v3_tail_and_empty(axis, factor):
 
 
 @pytest.mark.parametrize("field,value", [
-    ("version", True), ("version", 4), ("hidden_extent_axes", [False, 1, 2]),
-    ("hidden_extent_axes", [0.0, 1, 2]), ("hidden_extent_axes", None),
-    ("hidden_extent_axes", [0, 1]), ("hidden_argument_types", ["i32", "i32"]),
+    ("version", True),
+    ("version", 4),
+    ("hidden_extent_axes", [False, 1, 2]),
+    ("hidden_extent_axes", [0.0, 1, 2]),
+    ("hidden_extent_axes", None),
+    ("hidden_extent_axes", [0, 1]),
+    ("hidden_argument_types", ["i32", "i32"]),
     ("hidden_argument_order", ["originalGridY", "originalGridX", "originalGridZ"]),
     ("transforms", []),
 ])
@@ -50,8 +63,14 @@ def test_v3_bad_schema(field, value):
 
 
 @pytest.mark.parametrize("field,value", [
-    ("factor", True), ("factor", 1), ("factor", 1 << 31), ("axis", 3), ("axis", False),
-    ("order", 1), ("persistent_coverage", True), ("grid_stride_abi_verified", True),
+    ("factor", True),
+    ("factor", 1),
+    ("factor", 1 << 31),
+    ("axis", 3),
+    ("axis", False),
+    ("order", 1),
+    ("persistent_coverage", True),
+    ("grid_stride_abi_verified", True),
 ])
 def test_v3_bad_transform(field, value):
     schema = contract()

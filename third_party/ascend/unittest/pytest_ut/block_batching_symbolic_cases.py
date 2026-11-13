@@ -2,6 +2,18 @@
 """Small native IR fixture with independent dynamic input/output row strides."""
 
 
+def symbolic_columns_ir():
+    source = symbolic_memory_ir()
+    return source.replace(
+        "%cw = arith.extsi %cc : tensor<4xi32> to tensor<4xi64>", """%column_p = tt.get_program_id y : i32
+    %column_pw = arith.extsi %column_p : i32 to i64
+    %four = arith.constant 4 : i64
+    %column_base = arith.muli %column_pw, %four : i64
+    %column_bv = tt.splat %column_base : i64 -> tensor<4xi64>
+    %cw_local = arith.extsi %cc : tensor<4xi32> to tensor<4xi64>
+    %cw = arith.addi %cw_local, %column_bv : tensor<4xi64>""")
+
+
 def symbolic_memory_ir(axis=0, mode="plain", origin=0):
     stride = "%sx"
     prelude = ""

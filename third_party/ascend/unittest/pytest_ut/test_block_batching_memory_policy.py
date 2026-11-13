@@ -1,6 +1,7 @@
 """Native policy preservation, boundary lowering and transactional rejection."""
 import json
 import pytest
+from triton.backends.ascend.block_batching import IMPLEMENTATION_VERSION
 
 extension = pytest.importorskip("triton._C.libtriton")
 from test_block_batching_rewrite import parse, pointwise
@@ -29,7 +30,7 @@ def test_memory_policies_survive_semantic_and_layout_rewrite(tmp_path, layout, l
     module = parse(tmp_path, source)
     report = ascend.passes.ttir.rewrite_block_batching(module, 3, 0, layout)
     assert report["compile_status"] == "REWRITTEN", report
-    assert report["implementation_version"] == 27
+    assert report["implementation_version"] == IMPLEMENTATION_VERSION
     assert module.verify()
     text = str(module)
     loads = [line for line in text.splitlines() if " = tt.load " in line]

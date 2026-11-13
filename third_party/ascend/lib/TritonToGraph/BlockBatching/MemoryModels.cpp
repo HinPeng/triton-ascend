@@ -1,9 +1,12 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #include "TritonToGraph/BlockBatching/MemoryModels.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/STLExtras.h"
 #include <algorithm>
+#include <limits>
 #include <utility>
 namespace mlir::triton::cfg {
 namespace {
@@ -13,6 +16,48 @@ Type scalarType(Type type) {
   return type;
 }
 } // namespace
+bool hasBatchDynamicContiguousCopy(ModuleOp module) {
+  auto owner = module->getAttrOfType<StringAttr>("hacc.block_mapping_owner");
+  if (!owner || owner.getValue() != "block_batching")
+    return false;
+
+  // A dynamic outer prefix with complete, densely packed inner dimensions
+  // lowers to a variable-length 1D transfer. A padded row, strided element
+  // or dynamic inner dimension does not establish this property.
+  auto isDynamicContiguous = [](Type type) {
+    auto memref = dyn_cast<MemRefType>(type);
+    if (!memref || memref.getRank() == 0 || !memref.isDynamicDim(0))
+      return false;
+    SmallVector<int64_t> strides;
+    int64_t offset;
+    if (failed(memref.getStridesAndOffset(strides, offset)))
+      return false;
+    int64_t expected = 1;
+    for (int64_t dim = memref.getRank() - 1; dim >= 0; --dim) {
+      if (strides[dim] != expected)
+        return false;
+      if (dim == 0)
+        break;
+      int64_t size = memref.getDimSize(dim);
+      if (size <= 0 || expected > std::numeric_limits<int64_t>::max() / size)
+        return false;
+      expected *= size;
+    }
+    return true;
+  };
+
+  bool found = false;
+  module.walk([&](Operation *op) {
+    if (auto copy = dyn_cast<memref::CopyOp>(op))
+      found |= isDynamicContiguous(copy.getSource().getType()) &&
+               isDynamicContiguous(copy.getTarget().getType());
+    else if (auto store =
+                 dyn_cast<bufferization::MaterializeInDestinationOp>(op))
+      found |= isDynamicContiguous(store.getDest().getType());
+  });
+  return found;
+}
+
 bool isBatchBoolToByteCast(Operation *op) {
   auto cast = dyn_cast_or_null<triton::BitcastOp>(op);
   if (!cast)

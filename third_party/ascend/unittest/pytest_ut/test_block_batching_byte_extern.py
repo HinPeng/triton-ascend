@@ -1,6 +1,8 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 import json
+import re
 import pytest
+from triton.backends.ascend.block_batching import IMPLEMENTATION_VERSION
 from triton._C.libtriton import ir, ascend
 from block_batching_byte_extern_cases import case_ir
 
@@ -30,7 +32,7 @@ def test_new_subsets_keep_lane_mapping_and_memory_contract(tmp_path, kind, facto
     module = parse(tmp_path, case_ir(kind))
     report = ascend.passes.ttir.rewrite_block_batching(module, factor, 0)
     assert report["compile_status"] == "REWRITTEN", report
-    assert report["implementation_version"] == 27
+    assert report["implementation_version"] == IMPLEMENTATION_VERSION
     assert module.verify()
     text = str(module)
     assert f"tensor<{factor}x8xf32>" in text
@@ -39,7 +41,9 @@ def test_new_subsets_keep_lane_mapping_and_memory_contract(tmp_path, kind, facto
         if kind == "bool": assert "was_bool_to_int8 = true" in text
     else:
         assert "tt.extern_elementwise" in text
-        assert "arith.select" in text  # inputs sanitized before the external call
+        # tanh lowers to total floating arithmetic; pow retains its
+        # conservative input policy because its implementation casts values.
+        assert ("hacc.block_batching_safe_input" in text) == (kind == "pow")
         assert ("__hmf_pow_fp32" if kind == "pow" else "__hmf_tanhf") in text
 
 
@@ -89,3 +93,44 @@ def test_read_address_division_preserves_device_ssa(tmp_path):
     report = ascend.passes.ttir.rewrite_block_batching(module, 3, 0)
     assert report["compile_status"] == "REWRITTEN", report
     assert module.verify()
+
+
+def test_pow_sanitizes_exponent_without_selecting_its_base(tmp_path):
+    module = parse(tmp_path, case_ir("pow"))
+    report = ascend.passes.ttir.rewrite_block_batching(module, 2, 0)
+    assert report["compile_status"] == "REWRITTEN", report
+    text = str(module)
+    base, exponent = re.search(r'tt.extern_elementwise (%\w+), (%\w+)', text).groups()
+    definitions = dict(re.findall(r'(%\w+) = ([^\n]+)', text))
+    assert "hacc.block_batching_safe_input" not in definitions[base]
+    assert "hacc.block_batching_safe_input" in definitions[exponent]
+    assert module.verify()
+
+
+@pytest.mark.parametrize("value,sanitize", [
+    ("2.0", False),
+    ("-3.0", False),
+    ("0.0", False),
+    ("0.5", False),
+    ("2147483520.0", False),
+    ("-2147483520.0", False),
+    ("2147483648.0", True),
+    ("-2147483648.0", True),
+    ("0x7F800000", True),
+    ("0xFF800000", True),
+    ("0x7FC00000", True),
+])
+def test_pow_preserves_proven_safe_constant_exponent(tmp_path, value, sanitize):
+    # The pow implementation casts abs(exponent) to signed i32. Safe literal
+    # exponents need no inactive-lane select; unknown/unsafe inputs still do.
+    text = case_ir("pow").replace(
+        "%result = tt.extern_elementwise %xv, %yv", f"%exponent = arith.constant dense<{value}> : tensor<8xf32>\n"
+        "    %result = tt.extern_elementwise %xv, %exponent")
+    module = parse(tmp_path, text)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 3, 0)
+    assert report["compile_status"] == "REWRITTEN", report
+    assert module.verify()
+    rewritten = str(module)
+    assert ("hacc.block_batching_safe_input" in rewritten) == sanitize
+    # Preserve the external function and its math semantics.
+    assert 'symbol = "__hmf_pow_fp32"' in rewritten

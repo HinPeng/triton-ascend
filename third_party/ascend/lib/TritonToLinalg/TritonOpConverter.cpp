@@ -22,6 +22,7 @@
  */
 
 #include "ascend/include/TritonToLinalg/TritonOpConverter.h"
+#include "ascend/include/TritonToGraph/BlockBatching/ElementwiseModels.h"
 #include "ascend/include/TritonToLinalg/BlockPtrAnalysis.h"
 #include "ascend/include/TritonToLinalg/MaskAnalysis.h"
 #include "ascend/include/TritonToLinalg/TritonToLinalgPass.h"
@@ -549,6 +550,13 @@ LogicalResult PreciseDivConverter::matchAndRewrite(
 LogicalResult
 SelectCanonicalizer::matchAndRewrite(arith::SelectOp op,
                                      PatternRewriter &rewriter) const {
+  // A batch safety select sanitizes inputs before a potentially undefined
+  // operation. Keep that ordering while allowing elementwise fusion; the
+  // slice/insert form materializes a filled tensor and a UB-to-UB copy even
+  // for a fully active group. Ordinary structured selects are unchanged.
+  if (op->hasAttr(mlir::triton::cfg::kBatchSafeInputAttr))
+    return failure();
+
   auto loc = op.getLoc();
 
   // 0. Shortcut for scalars and bool type
@@ -2281,6 +2289,12 @@ LogicalResult ExternElementwiseClOpConverter::matchAndRewrite(
       customOp->setAttr("arg_attrs", argAttrsArray);
       customOp.setInlineMode(hivm::InlineMode::AlwaysInline);
 
+      // The frontend owns the libdevice workspace ABI and size calculation.
+      for (StringRef name : {"extra_buffers_types", "extra_buffers_sizes"}) {
+        if (Attribute attr = op->getAttr(name))
+          customOp->setAttr(name, attr);
+      }
+
       // Restore the result's shape and element type
       Value finalResult = customOp.getResults().front();
       if (needsExpand) {
@@ -2740,7 +2754,8 @@ MatmulConverter::matchAndRewrite(triton::DotOp op, OpAdaptor adaptor,
   };
 
   Operation *matmulOp;
-  if (mlir::isa<mlir::FloatType>(elemTy) && !elemTy.isF32()) {
+  if (mlir::isa<mlir::FloatType>(elemTy) &&
+      elemTy.getIntOrFloatBitWidth() < 32) {
     RankedTensorType opcFp32Ty =
         RankedTensorType::get(dstType.getShape(), rewriter.getF32Type());
     Value opcFp32 = rewriter.create<arith::ExtFOp>(op.getLoc(), opcFp32Ty, opc);
@@ -3116,12 +3131,35 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
                      rhsElemType == triton::ScaleDotElemType::E5M2);
   bool isFP4Input = (lhsElemType == triton::ScaleDotElemType::E2M1) &&
                     (rhsElemType == triton::ScaleDotElemType::E2M1);
+  if ((isFP8Input || isFP4Input) && !lhsScale) {
+    auto lhsTy = cast<RankedTensorType>(lhs.getType());
+    int64_t k = lhsTy.getShape().back();
+    if (lhsElemType == triton::ScaleDotElemType::E2M1 && op.getLhsKPack())
+      k *= 2;
+    auto defaultScaleTy = RankedTensorType::get(
+        {dstType.getDimSize(dstType.getRank() - 2), (k + 31) / 32},
+        rewriter.getI8Type());
+    // The native MX path uses E8M0, whose encoding of one is 127.
+    Value defaultScaleVal =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getI8IntegerAttr(127));
+    Value defaultScaleEmpty = rewriter.create<tensor::EmptyOp>(
+        loc, defaultScaleTy.getShape(), defaultScaleTy.getElementType());
+    lhsScale = rewriter
+                   .create<linalg::FillOp>(loc, ValueRange{defaultScaleVal},
+                                           ValueRange{defaultScaleEmpty})
+                   .getResult(0);
+  }
   if (isFP8Input || isFP4Input) {
     if (!rhsScale) {
-      RankedTensorType defaultScaleTy =
-          RankedTensorType::get({1}, rewriter.getI8Type());
-      Value defaultScaleVal =
-          rewriter.create<arith::ConstantOp>(loc, rewriter.getI8IntegerAttr(1));
+      auto rhsTy = cast<RankedTensorType>(rhs.getType());
+      int64_t k = rhsTy.getDimSize(rhsTy.getRank() - 2);
+      if (rhsElemType == triton::ScaleDotElemType::E2M1 && op.getRhsKPack())
+        k *= 2;
+      auto defaultScaleTy = RankedTensorType::get(
+          {dstType.getShape().back(), (k + 31) / 32}, rewriter.getI8Type());
+      // E8M0 encodes a scale factor of one with exponent bias 127.
+      Value defaultScaleVal = rewriter.create<arith::ConstantOp>(
+          loc, rewriter.getI8IntegerAttr(127));
       Value defaultScaleEmpty = rewriter.create<tensor::EmptyOp>(
           loc, defaultScaleTy.getShape(), defaultScaleTy.getElementType());
       rhsScale = rewriter

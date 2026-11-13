@@ -27,11 +27,14 @@ def test_explicit_request_is_preserved(factor, axis):
 
 
 def test_options_cache_identity():
-    options = [NPUOptions(arch="Ascend950", block_batching_factor=f, block_batching_axis=a)
-               for f in (1, 2, 3, 6) for a in (-1, 0, 1, 2)]
+    options = [
+        NPUOptions(arch="Ascend950", block_batching_factor=f, block_batching_axis=a)
+        for f in (1, 2, 3, 6)
+        for a in (-1, 0, 1, 2)
+    ]
     assert len({option.hash() for option in options}) == len(options)
-    assert NPUOptions(arch="Ascend950").hash() == NPUOptions(
-        arch="Ascend950", block_batching_factor=1, block_batching_axis=-1).hash()
+    assert NPUOptions(arch="Ascend950").hash() == NPUOptions(arch="Ascend950", block_batching_factor=1,
+                                                             block_batching_axis=-1).hash()
 
 
 def test_disabled_and_unrepresentable_requests_do_not_enter_cpp():

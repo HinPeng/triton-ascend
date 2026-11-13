@@ -49,7 +49,9 @@ def test_bool_marker_and_extern_protection_survive(tmp_path):
             assert 'tensor<24x!tt.ptr<i8>>' in str(module)
         if kind in ('tanh', 'pow'):
             assert 'tt.extern_elementwise' in str(module)
-            assert 'arith.select' in str(module)
+            # tanh uses total floating arithmetic; only the unknown pow
+            # exponent in this fixture requires inactive-lane sanitization.
+            assert ('hacc.block_batching_safe_input' in str(module)) == (kind == 'pow')
 
 
 def test_layout_options_identity_and_disabled_normalization():

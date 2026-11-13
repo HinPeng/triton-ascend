@@ -159,11 +159,13 @@ bool mlir::triton::cfg::hasProgramGridHiddenExtentArguments(
   const unsigned first = function.getNumArguments() - count;
   return hasNamedI32Argument(function.getArgument(first), kHiddenXName) &&
          hasNamedI32Argument(function.getArgument(first + 1), kHiddenYName) &&
-         (count == 2 || hasNamedI32Argument(function.getArgument(first + 2), kHiddenZName));
+         (count == 2 ||
+          hasNamedI32Argument(function.getArgument(first + 2), kHiddenZName));
 }
 
-LogicalResult mlir::triton::cfg::addProgramGridHiddenExtentArguments(
-    triton::FuncOp function, int64_t version) {
+LogicalResult
+mlir::triton::cfg::addProgramGridHiddenExtentArguments(triton::FuncOp function,
+                                                       int64_t version) {
   if (version != 2 && version != 3)
     return failure();
   if (hasProgramGridHiddenExtentArguments(function, version))
@@ -184,9 +186,9 @@ LogicalResult mlir::triton::cfg::addProgramGridHiddenExtentArguments(
   for (llvm::StringRef name : {kHiddenXName, kHiddenYName, kHiddenZName}) {
     if (name == kHiddenZName && version == 2)
       break;
-    if (failed(function.insertArgument(function.getNumArguments(),
-             IntegerType::get(context, 32), empty,
-             NameLoc::get(StringAttr::get(context, name), function.getLoc()))))
+    if (failed(function.insertArgument(
+            function.getNumArguments(), IntegerType::get(context, 32), empty,
+            NameLoc::get(StringAttr::get(context, name), function.getLoc()))))
       return failure();
     if (hasAttrs)
       attrs.push_back(empty);
@@ -240,7 +242,11 @@ mlir::triton::cfg::parseProgramGridTransformContract(Attribute attribute) {
   SmallVector<int64_t> axes{0, 1};
   SmallVector<llvm::StringRef> order{kOriginalGridX, kOriginalGridY};
   SmallVector<llvm::StringRef> types{kI32, kI32};
-  if (batch) { axes.push_back(2); order.push_back(kOriginalGridZ); types.push_back(kI32); }
+  if (batch) {
+    axes.push_back(2);
+    order.push_back(kOriginalGridZ);
+    types.push_back(kI32);
+  }
   if (!hasExactIntegerArray(contract.get(kHiddenExtentAxes), axes) ||
       !hasExactStringArray(contract.get(kHiddenArgumentOrder), order) ||
       !hasExactStringArray(contract.get(kHiddenArgumentTypes), types))
@@ -268,7 +274,8 @@ mlir::triton::cfg::parseProgramGridTransformContract(Attribute attribute) {
         getBoolean(transform, kGridStrideAbiVerified);
     if (!order || !kind || !axis || !factor || !persistent || !gridStride ||
         *order != static_cast<int64_t>(expectedOrder) ||
-        kind.getValue() != kCeilDiv || *axis < 0 || *axis > (batch ? 2 : 1) || *factor < 2 ||
+        kind.getValue() != kCeilDiv || *axis < 0 || *axis > (batch ? 2 : 1) ||
+        *factor < 2 ||
         (batch && (*factor > INT32_MAX || *persistent || *gridStride)) ||
         *persistent != *gridStride || seenAxis[*axis])
       return failure();
@@ -302,28 +309,30 @@ DictionaryAttr mlir::triton::cfg::serializeProgramGridTransformContract(
          {builder.getStringAttr(kGridStrideAbiVerified),
           builder.getBoolAttr(transform.gridStrideAbiVerified)}}));
   }
-  SmallVector<Attribute> axes{builder.getI64IntegerAttr(0), builder.getI64IntegerAttr(1)};
-  SmallVector<Attribute> order{builder.getStringAttr(kOriginalGridX), builder.getStringAttr(kOriginalGridY)};
-  SmallVector<Attribute> types{builder.getStringAttr(kI32), builder.getStringAttr(kI32)};
+  SmallVector<Attribute> axes{builder.getI64IntegerAttr(0),
+                              builder.getI64IntegerAttr(1)};
+  SmallVector<Attribute> order{builder.getStringAttr(kOriginalGridX),
+                               builder.getStringAttr(kOriginalGridY)};
+  SmallVector<Attribute> types{builder.getStringAttr(kI32),
+                               builder.getStringAttr(kI32)};
   if (contract.version == 3) {
     axes.push_back(builder.getI64IntegerAttr(2));
     order.push_back(builder.getStringAttr(kOriginalGridZ));
     types.push_back(builder.getStringAttr(kI32));
   }
-  return DictionaryAttr::get(
-      context,
-      {{builder.getStringAttr(kVersion),
-        builder.getI64IntegerAttr(contract.version)},
-       {builder.getStringAttr(kExtentSource),
-        builder.getStringAttr(kRuntimeOriginalGrid)},
-       {builder.getStringAttr(kHiddenExtentAxes),
-        ArrayAttr::get(context, axes)},
-       {builder.getStringAttr(kHiddenArgumentOrder),
-        ArrayAttr::get(context, order)},
-       {builder.getStringAttr(kHiddenArgumentTypes),
-        ArrayAttr::get(context, types)},
-       {builder.getStringAttr(kTransforms),
-        ArrayAttr::get(context, transforms)}});
+  return DictionaryAttr::get(context,
+                             {{builder.getStringAttr(kVersion),
+                               builder.getI64IntegerAttr(contract.version)},
+                              {builder.getStringAttr(kExtentSource),
+                               builder.getStringAttr(kRuntimeOriginalGrid)},
+                              {builder.getStringAttr(kHiddenExtentAxes),
+                               ArrayAttr::get(context, axes)},
+                              {builder.getStringAttr(kHiddenArgumentOrder),
+                               ArrayAttr::get(context, order)},
+                              {builder.getStringAttr(kHiddenArgumentTypes),
+                               ArrayAttr::get(context, types)},
+                              {builder.getStringAttr(kTransforms),
+                               ArrayAttr::get(context, transforms)}});
 }
 
 LogicalResult mlir::triton::cfg::setProgramGridTransformContract(

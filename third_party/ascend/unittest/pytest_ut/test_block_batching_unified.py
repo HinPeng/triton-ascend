@@ -53,7 +53,9 @@ def terminal_guard():
 
 
 def test_dependent_terminal_read_needs_neither_ids_data_nor_allocation_query():
+
     class AddressOnly:
+
         def data_ptr(self):
             return 1 << 32
 
@@ -64,8 +66,8 @@ def test_dependent_terminal_read_needs_neither_ids_data_nor_allocation_query():
     assert module.check_guard(spec, [AddressOnly(), 1 << 45, 4, 4, 4], (2, 1, 1), 3)[0]
 
 
-@pytest.mark.parametrize('mutation', ['missing', 'duplicate', 'wrong_id', 'boolean',
-                                    'extra_write', 'late_read', 'volatile', 'no_write'])
+@pytest.mark.parametrize(
+    'mutation', ['missing', 'duplicate', 'wrong_id', 'boolean', 'extra_write', 'late_read', 'volatile', 'no_write'])
 def test_invalid_terminal_dependency_is_rejected(mutation):
     spec = terminal_guard()
     if mutation == 'missing':
@@ -153,7 +155,8 @@ def test_tiled_statistics_then_selective_read_is_rewritten(tmp_path, factor, axi
     from test_block_batching_shapes import parse
     from triton._C.libtriton import ascend
     source = INDIRECT.replace('%p = tt.get_program_id x', '%p = tt.get_program_id ' + 'xy'[axis])
-    source = source.replace('    %ip = tt.addptr', '''    %c0 = arith.constant 0 : i32
+    source = source.replace(
+        '    %ip = tt.addptr', '''    %c0 = arith.constant 0 : i32
     %c1 = arith.constant 1 : i32
     %c4 = arith.constant 4 : i32
     %zero = arith.constant 0.0 : f32
@@ -316,7 +319,8 @@ def test_indirect_read_after_different_root_write_is_rejected(tmp_path):
     from test_block_batching_shapes import parse
     from triton._C.libtriton import ascend
     source = INDIRECT.replace('%y: !tt.ptr<f32>)', '%y: !tt.ptr<f32>, %alias: !tt.ptr<f32>)')
-    source = source.replace('%xp = tt.addptr %x, %id', '''%a = tt.addptr %alias, %p : !tt.ptr<f32>, i32
+    source = source.replace(
+        '%xp = tt.addptr %x, %id', '''%a = tt.addptr %alias, %p : !tt.ptr<f32>, i32
     %two = arith.constant 2.0 : f32
     tt.store %a, %two : !tt.ptr<f32>
     %xp = tt.addptr %x, %id''')
@@ -401,7 +405,8 @@ def test_opaque_read_with_multiple_outputs_is_rejected(tmp_path):
     %extra = tt.load %address : !tt.ptr<f32>
 """
     source = source.replace('    %value = tt.load', extra + '    %value = tt.load')
-    source = source.replace('tt.return', """
+    source = source.replace(
+        'tt.return', """
     %target = tt.addptr %out, %p : !tt.ptr<f32>, i32
     tt.store %target, %extra : !tt.ptr<f32>
     tt.return""")
@@ -411,7 +416,6 @@ def test_opaque_read_with_multiple_outputs_is_rejected(tmp_path):
     assert report['compile_status'] == 'REJECTED', report
     assert report['reason'] == 'UNPROVEN_MEMORY_NONINTERFERENCE'
     assert str(mod) == before and mod.verify()
-
 
 
 def test_proven_shared_read_after_store_does_not_request_fences(tmp_path):

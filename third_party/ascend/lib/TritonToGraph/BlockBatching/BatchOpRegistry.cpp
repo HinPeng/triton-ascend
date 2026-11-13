@@ -1,5 +1,6 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #include "TritonToGraph/BlockBatching/BatchOpRegistry.h"
+#include "TritonToGraph/BlockBatching/ElementwiseModels.h"
 #include "TritonToGraph/BlockBatching/MemoryModels.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -150,6 +151,11 @@ LogicalResult verifyBatchAttributes(Operation *op,
   if (op->hasAttr("was_bool_to_int8") && !isBatchNormalizedBoolLoad(op))
     return failure();
   for (NamedAttribute attr : op->getAttrs()) {
+    // This lowering-only hint does not change select semantics. Rewritten IR
+    // is checked again, so recognize the exact marker on selects only.
+    if (attr.getName() == kBatchSafeInputAttr && isa<arith::SelectOp>(op) &&
+        isa<UnitAttr>(attr.getValue()))
+      continue;
     if (!allowsAttribute(descriptor.attributes, attr.getName().strref()))
       return failure();
     // Non-default fast-math/overflow promises need their own proof of the new

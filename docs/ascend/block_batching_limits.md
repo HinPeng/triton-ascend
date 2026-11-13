@@ -1,5 +1,8 @@
 # Block batching 当前能力与限制
 
+本页保留历史版本记录；当前接口和限制请参阅 [Block batching](block_batching.md)。
+CV 已纳入统一 block 合并入口，由编译器根据 IR 自动识别，不再需要单独的 CV 编译开关。
+
 实现版本 20，布局规划版本 2，runtime guard schema 3、语义契约版本 4。使用统一效果、控制流值域与布局计划。标准后端决定固定 factor 的资源可行性；只修改 TA。
 
 ## 访存依赖与保守回退（版本20）

@@ -230,6 +230,7 @@ def bundle_environment(monkeypatch):
     utils.backend_policy = 'torch_npu'
     monkeypatch.setitem(sys.modules, PACKAGE + '.utils', utils)
     monkeypatch.setattr(batching, '_capture_state', lambda: False)
+    monkeypatch.setattr(batching, '_core_floor', lambda: 0)
     monkeypatch.setattr(batching, '_freeze_source', lambda backend, src, opts, revision: src)
     launches = []
 
@@ -262,7 +263,7 @@ def bundle_environment(monkeypatch):
     report = {
         'compile_status': 'COMPILED_GUARDED', 'selected_axis': 0, 'owner': 'block_batching', 'guard':
         rows_guard(4, None), 'candidate_factor': 3, 'implementation_version': batching.IMPLEMENTATION_VERSION,
-        'lane_width': 3
+        'lane_width': 3, 'cv_mode': 'disabled'
     }
     base, candidate = Kernel('baseline'), Kernel('candidate', report)
     wrapper = batching.BatchKernel(base, candidate, batching.BatchRequest(3, 0), report, [0, 1, 2, 3])
@@ -288,7 +289,8 @@ def test_bundle_selects_complete_variant_and_rechecks_alias(bundle_environment):
 
 def test_cv_partial_group_selects_complete_baseline(bundle_environment):
     env = bundle_environment
-    env.wrapper.request = batching.BatchRequest(2, 0, True)
+    env.wrapper.request = batching.BatchRequest(2, 0)
+    env.report['cv_mode'] = 'independent_batch_v1'
     env.wrapper.run(*env.launch)
     assert env.wrapper.last_launch['runtime_status'] == 'APPLIED'
     partial = list(env.launch)
@@ -581,7 +583,7 @@ def test_ub_compile_failure_selects_complete_baseline(bundle_environment):
 
     kernel = batching.compile_bundle(backend, src, {"block_batching_factor": 64}, compile_variant)
     assert kernel.candidate is None
-    assert kernel.block_batching["reason"] == "BACKEND_COMPILE_REJECTED"
+    assert kernel.block_batching["reason"] == "BATCH_TARGET_RESOURCE_REJECTED"
     assert "ub overflow" in kernel.block_batching["backend_diagnostic"]
     kernel.run(*env.launch)
     assert env.launches[-1][0] == "baseline"
@@ -628,3 +630,58 @@ def test_mask_cannot_hide_its_own_i32_wraparound():
     values, grid = [1 << 40, 1 << 45, 1], ((1 << 30) + 1, 1, 1)
     assert check_guard(specification, values, grid, 3) == (False, "INDEX_OVERFLOW")
     assert guard_module.RuntimeGuard(specification, 3)(values, grid) == (False, "INDEX_OVERFLOW")
+
+
+@pytest.mark.parametrize('rows', [2, 3, 4, 5, 7])
+def test_vv_complete_and_partial_groups_execute_candidate(bundle_environment, rows):
+    env = bundle_environment
+    launch = list(env.launch)
+    launch[0] = rows
+    env.wrapper.run(*launch)
+    assert env.wrapper.last_launch['runtime_status'] == 'APPLIED'
+    assert env.wrapper.last_launch['batch_grid'] == ((rows + 2) // 3, 1, 1)
+    assert env.launches[-1][0] == 'candidate'
+
+
+@pytest.mark.parametrize('floor', [4, 8, 32])
+@pytest.mark.parametrize('offset,applied', [(-3, False), (-1, True), (0, True), (1, True)])
+def test_core_floor_boundary_uses_ceiling_batch_count(bundle_environment, monkeypatch, floor, offset, applied):
+    env = bundle_environment
+    monkeypatch.setattr(batching, '_core_floor', lambda: floor)
+    launch = list(env.launch)
+    launch[0] = floor * 3 + offset
+    env.wrapper.run(*launch)
+    assert env.wrapper.last_launch['applied_factor'] == (3 if applied else 1)
+    if not applied:
+        assert env.wrapper.last_launch['reason'] == 'GRID_BELOW_CORE_FLOOR'
+
+
+def test_baseline_grid_hint_is_removed_before_freezing_and_compilation(bundle_environment, monkeypatch):
+    env = bundle_environment
+    backend = types.SimpleNamespace(
+        target=types.SimpleNamespace(arch='Ascend950'), parse_options=lambda opts: types.SimpleNamespace(
+            is_pure_simt=False, compile_mode='simd', block_batching_backend_revision='test'))
+    src = types.SimpleNamespace(fn=types.SimpleNamespace(arg_names=['x']), signature={'x': '*fp32'}, constants={})
+    frozen_options, baseline_options, candidate_options = [], [], []
+
+    def freeze(backend, source, opts, revision):
+        frozen_options.append(dict(opts))
+        return source
+
+    def compile_variant(opts, frozen):
+        assert frozen is src
+        if opts['block_batching_factor'] == 1:
+            baseline_options.append(dict(opts))
+            return env.base
+        candidate_options.append(dict(opts))
+        raise batching.BatchingRejected('RESOURCE_LIMIT')
+
+    monkeypatch.setattr(batching, '_freeze_source', freeze)
+    for grid in ((1, 128, 1), (256, 1, 1)):
+        options = dict(block_batching_factor=2, block_batching_axis=-1, block_batching_grid=grid)
+        result = batching.compile_bundle(backend, src, options, compile_variant)
+        assert result.baseline is env.base
+        assert options['block_batching_grid'] == grid
+    assert all('block_batching_grid' not in opts for opts in frozen_options + baseline_options)
+    assert frozen_options[0] == frozen_options[1] == baseline_options[0] == baseline_options[1]
+    assert [opts['block_batching_grid'] for opts in candidate_options] == [(1, 128, 1), (256, 1, 1)]

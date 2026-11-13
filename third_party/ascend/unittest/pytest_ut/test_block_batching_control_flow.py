@@ -17,7 +17,9 @@ def assign_npu():
 @pytest.mark.parametrize("factor", [3, 6])
 def test_recursive_uniform_regions_preserve_lane_results(tmp_path, kind, factor):
     module = parse(tmp_path, control_ir(kind))
-    report = ascend.passes.ttir.rewrite_block_batching(module, factor, 0)
+    # Exercise the original lane model independently of the automatic loop
+    # schedule. Sequential composition has its own real-kernel regressions.
+    report = ascend.passes.ttir.rewrite_block_batching(module, factor, 0, 'semantic_only')
     assert report["compile_status"] == "REWRITTEN", report
     assert module.verify()
     text = str(module)
@@ -36,11 +38,9 @@ def test_recursive_uniform_regions_preserve_lane_results(tmp_path, kind, factor)
 
 @pytest.mark.parametrize("kind,old,new,reason", [
     ("if_join", "arith.cmpi sgt, %k, %zero", "arith.cmpi sgt, %p, %zero", "VARYING_CONTROL_CONDITION"),
-    ("for_accumulate", "to %k step", "to %p step", "VARYING_LOOP_BOUND"),
+    ("for_accumulate", "to %k step", "to %p step", "LOOP_WITHOUT_MEMORY_ACCESS"),
     ("for_accumulate", "step %one iter_args", "step %k iter_args", "UNPROVEN_POSITIVE_LOOP_STEP"),
     ("for_accumulate", "%one = arith.constant 1", "%one = arith.constant -1", "UNPROVEN_POSITIVE_LOOP_STEP"),
-    ("for_accumulate", "scf.yield %updated : f32",
-     "tt.store %out, %updated : !tt.ptr<f32>\n      scf.yield %updated : f32", "LOOP_WRITE_NOT_IMPLEMENTED"),
 ])
 def test_unknown_or_unsupported_regions_keep_complete_baseline(tmp_path, kind, old, new, reason):
     module = parse(tmp_path, control_ir(kind).replace(old, new))
@@ -49,6 +49,20 @@ def test_unknown_or_unsupported_regions_keep_complete_baseline(tmp_path, kind, o
     assert report["compile_status"] == "REJECTED", report
     assert report["reason"] == reason
     assert str(module) == before
+
+
+def test_loop_and_terminal_stores_still_require_noninterference(tmp_path):
+    from test_block_batching_guard_v2 import module as guard
+    source = control_ir('for_accumulate').replace(
+        'scf.yield %updated : f32', 'tt.store %out, %updated : !tt.ptr<f32>\n      scf.yield %updated : f32')
+    module = parse(tmp_path, source)
+    report = ascend.passes.ttir.rewrite_block_batching(module, 3, 0)
+    assert report['compile_status'] == 'REWRITTEN', report
+    assert module.verify()
+    spec = json.loads(report['guard_json'])
+    # The existing write-domain proof rejects repeated writes before the
+    # subsequent cross-access alias check is reached.
+    assert guard.check_guard(spec, [1 << 32, 1 << 40, 7, 4], (7, 1, 1), 3) == (False, 'OVERLAPPING_BLOCK_WRITES')
 
 
 @pytest.mark.parametrize("kind", CONTROL_KINDS)

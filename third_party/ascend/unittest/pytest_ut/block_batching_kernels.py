@@ -4,17 +4,16 @@
 import triton
 import triton.language as tl
 
+
 @triton.jit
-def _rmsnorm_fwd_fused(
-    input_ptr,  # pointer to the input
-    output_ptr,  # pointer to the output
-    weight_ptr,  # pointer to the weights
-    rrms_ptr,  # pointer to the rrms
-    stride,  # how much to increase the pointer when moving by 1 row
-    d,  # number of columns in input
-    eps,  # epsilon to avoid division by zero
-    D_ROUNDED: tl.constexpr
-):
+def _rmsnorm_fwd_fused(input_ptr,  # pointer to the input
+                       output_ptr,  # pointer to the output
+                       weight_ptr,  # pointer to the weights
+                       rrms_ptr,  # pointer to the rrms
+                       stride,  # how much to increase the pointer when moving by 1 row
+                       d,  # number of columns in input
+                       eps,  # epsilon to avoid division by zero
+                       D_ROUNDED: tl.constexpr):
     # Map the program id to the row of input and output it should compute.
     row_idx = tl.program_id(0).to(tl.int64)
     output_ptr += row_idx * stride
@@ -46,25 +45,23 @@ def _tanh(x):
 
 
 @triton.jit
-def _rmsnorm_bwd_dxdw_fused(
-    dy_ptr,  # pointer to the output grads
-    dx_ptr,  # pointer to the input grads
-    dw_ptr,  # pointer to the partial weights grads
-    input_ptr,  # pointer to the input
-    weight_ptr,  # pointer to the weights
-    rrms_ptr,  # pointer to the rrms
-    stride,  # how much to increase the pointer when moving by 1 row
-    s,  # number of rows in input_ptr
-    d,  # number of columns in input_ptr, hidden dimension
-    BLOCK_S: tl.constexpr, D_ROUNDED: tl.constexpr
-):
+def _rmsnorm_bwd_dxdw_fused(dy_ptr,  # pointer to the output grads
+                            dx_ptr,  # pointer to the input grads
+                            dw_ptr,  # pointer to the partial weights grads
+                            input_ptr,  # pointer to the input
+                            weight_ptr,  # pointer to the weights
+                            rrms_ptr,  # pointer to the rrms
+                            stride,  # how much to increase the pointer when moving by 1 row
+                            s,  # number of rows in input_ptr
+                            d,  # number of columns in input_ptr, hidden dimension
+                            BLOCK_S: tl.constexpr, D_ROUNDED: tl.constexpr):
     # Map the program id to the row of all the data should compute
     row_block_idx = tl.program_id(0).to(tl.int64)  # group_size_s * d, group_id
     col_offsets = tl.arange(0, D_ROUNDED)  # full d for each row
     col_mask = col_offsets < d
     w = tl.load(weight_ptr + col_offsets, mask=col_mask, other=0.).to(tl.float32)
 
-    partial_dw = tl.zeros((D_ROUNDED,), dtype=tl.float32)
+    partial_dw = tl.zeros((D_ROUNDED, ), dtype=tl.float32)
     start = row_block_idx * BLOCK_S
     end = min(start + BLOCK_S, s)
     for row in range(start, end):
@@ -87,11 +84,16 @@ def _rmsnorm_bwd_dxdw_fused(
 
 @triton.jit
 def _fused_situgluv2_fwd_triton_kernel(
-    a_ptr, b_ptr, out_ptr,
+    a_ptr,
+    b_ptr,
+    out_ptr,
     N,
-    stride_am, stride_an,
-    stride_bm, stride_bn,
-    stride_om, stride_on,
+    stride_am,
+    stride_an,
+    stride_bm,
+    stride_bn,
+    stride_om,
+    stride_on,
     beta,
     inv_beta,
     linear_beta,
@@ -126,16 +128,26 @@ def _fused_situgluv2_fwd_triton_kernel(
 
 @triton.jit
 def _fused_situgluv2_bwd_triton_kernel(
-    a_ptr, b_ptr, dout_ptr,
-    da_ptr, db_ptr,
+    a_ptr,
+    b_ptr,
+    dout_ptr,
+    da_ptr,
+    db_ptr,
     N,
-    stride_am, stride_an,
-    stride_bm, stride_bn,
-    stride_dom, stride_don,
-    stride_dam, stride_dan,
-    stride_dbm, stride_dbn,
-    beta, inv_beta,
-    linear_beta, inv_linear_beta,
+    stride_am,
+    stride_an,
+    stride_bm,
+    stride_bn,
+    stride_dom,
+    stride_don,
+    stride_dam,
+    stride_dan,
+    stride_dbm,
+    stride_dbn,
+    beta,
+    inv_beta,
+    linear_beta,
+    inv_linear_beta,
     BLOCK: tl.constexpr,
 ):
     m = tl.program_id(0).to(tl.int64)

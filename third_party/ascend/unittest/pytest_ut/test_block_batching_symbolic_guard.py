@@ -31,6 +31,7 @@ def layout_guard(factor=3, *, read_only=False):
         "factor":
         factor,
         "shape": [factor * 2, 4],
+        "loops": [],
         "positive": [arg(4)],
         "checks": [start, row, endpoint, ["minsi", 64, arg(2, 32), endpoint], base, local, byte_base, byte_offset],
         "pointer_checks": [byte_base, byte_offset],

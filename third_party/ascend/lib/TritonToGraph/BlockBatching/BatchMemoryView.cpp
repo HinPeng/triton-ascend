@@ -1,6 +1,9 @@
 // Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+#include "TritonToGraph/BlockBatching/BatchFactsJSON.h"
 #include "TritonToGraph/BlockBatching/BatchLayoutPlan.h"
 #include "TritonToGraph/BlockBatching/BatchOpRegistry.h"
+#include "TritonToGraph/BlockBatching/ControlFlowModels.h"
+#include "TritonToGraph/BlockBatching/ElementwiseModels.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
@@ -14,6 +17,18 @@ using K = BatchExpr;
 bool isConstant(BatchExprRef expression, int64_t value) {
   return expression && expression->kind == K::Constant &&
          expression->value == value;
+}
+
+// 逐节点比对两个表达式。表达式不做 hash-cons，相同的式子会是两个不同的对象，
+// 所以指针相等问不出"是不是同一个量"。
+bool sameExpression(BatchExprRef a, BatchExprRef b) {
+  if (a == b)
+    return true;
+  if (!a || !b)
+    return false;
+  return a->kind == b->kind && a->bits == b->bits && a->value == b->value &&
+         a->extent == b->extent && sameExpression(a->lhs, b->lhs) &&
+         sameExpression(a->rhs, b->rhs);
 }
 
 // Describe the newly emitted wide arithmetic over the FULL physical tile,
@@ -48,8 +63,17 @@ std::string layoutRuntimeGuard(const BatchLayoutPlan &plan,
     if (tensor) {
       int64_t id = coordinateMap[term.id];
       value = K::leaf(K::Coordinate, id, 32, targetShape[id]);
-    } else
-      value = K::leaf(term.kind, term.id, 32);
+    } else {
+      // 循环变量的位宽按它那条循环来，不能写死 32。源码只要写过
+      // tl.program_id(0).cast(tl.int64)，整条循环就是 i64，运行期守卫会拿这一位
+      // 和循环域里登记的位宽对照，对不上直接报 INVALID_LOOP_DOMAIN。
+      unsigned bits = 32;
+      if (term.kind == K::Induction)
+        for (const auto &loop : fact.loops)
+          if (loop.id == term.id)
+            bits = loop.bits;
+      value = K::leaf(term.kind, term.id, bits, term.divisor);
+    }
     if (!isConstant(term.coefficient, 1))
       value = mul(value, term.coefficient);
     if (tensor)
@@ -59,9 +83,14 @@ std::string layoutRuntimeGuard(const BatchLayoutPlan &plan,
   }
   E byteBase = mul(offsetBase, constant(fact.bytes));
   E byteOffset = mul(add(offsetBase, offset), constant(fact.bytes));
-  llvm::json::Array shape, checks;
+  llvm::json::Array shape, checks, loops;
   for (int64_t n : targetShape)
     shape.push_back(n);
+  // 桥上的地址含圈内偏移，运行期要解释 iv 就得有循环域。和原访存守卫共用同一份
+  // 序列化与同一段解释代码（ByteDomain.__init__），不另立一套语义。没有循环的
+  // 访存这里是空数组，运行期行为一个字不变。
+  for (const auto &loop : fact.loops)
+    loops.push_back(batchLoopJSON(loop));
   for (E expression : {logicalBase, add(logicalBase, range), endpoint,
                        K::node(K::MinSI, 64, plan.upper, endpoint), offsetBase,
                        offset, byteBase, byteOffset})
@@ -75,6 +104,7 @@ std::string layoutRuntimeGuard(const BatchLayoutPlan &plan,
                         {"root", fact.root},
                         {"bytes", fact.bytes},
                         {"shape", std::move(shape)},
+                        {"loops", std::move(loops)},
                         {"positive",
                          llvm::json::Array{batchExprJSON(plan.elementStride)}},
                         {"checks", std::move(checks)},
@@ -117,6 +147,11 @@ struct Emitter {
   unsigned originalArgs;
   SmallVector<int64_t> targetShape;
   SmallVector<int64_t> coordinateMap;
+  // 循环编号到循环变量。布局分析把圈内偏移留成一个 K::Induction 的 rest term，
+  // 这里是把它还原成 SSA 值的唯一依据。按访存逐条填，见 inductionVariables()。
+  // 显式写出初值：DenseMap 的默认构造函数是
+  // explicit，聚合初始化省略它会编不过， 而现有的三个构造点都不传这一项。
+  llvm::DenseMap<int64_t, Value> inductionVars{};
   Value constant(int64_t n) {
     return r.create<arith::ConstantIntOp>(loc, n, 64);
   }
@@ -136,6 +171,21 @@ struct Emitter {
     case K::Program:
       return wide(r.create<triton::GetProgramIdOp>(
           loc, static_cast<triton::ProgramIDDim>(e->value)));
+    case K::ProgramQuotient:
+    case K::ProgramRemainder: {
+      assert(e->extent > 0 && "unproved program divisor");
+      Value pid = wide(r.create<triton::GetProgramIdOp>(
+          loc, static_cast<triton::ProgramIDDim>(e->value)));
+      Value divisor = constant(e->extent);
+      if (e->kind == K::ProgramQuotient)
+        return r.create<arith::DivSIOp>(loc, pid, divisor);
+      return r.create<arith::RemSIOp>(loc, pid, divisor);
+    }
+    case K::Induction:
+      // 查不到就是编号配不上，宁可崩在这里也不能发一条地址错了的访存。调用方在
+      // 填表时已经把配不上的情形整条拒掉了，所以走到这里说明两边的约定破了。
+      assert(inductionVars.count(e->value) && "unmapped loop induction value");
+      return wide(inductionVars.lookup(e->value));
     case K::ExtSI:
       return upper(e->lhs);
     case K::Add:
@@ -177,7 +227,10 @@ struct Emitter {
     return expandAxis(value, axis);
   }
   Value axisMask(Value base, Value limit, unsigned axis) {
-    Emitter local{r, loc, function, originalArgs, {targetShape[axis]}, {}};
+    // inductionVars 要跟着传：局部 Emitter 也会走 expression()，拿不到映射的话
+    // 一个圈内偏移叶子就会在 upper() 里取到空值。
+    Emitter local{r,  loc,          function, originalArgs, {targetShape[axis]},
+                  {}, inductionVars};
     Value index =
         r.create<arith::AddIOp>(loc, local.splat(base), local.range(0));
     Value mask = r.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, index,
@@ -202,15 +255,21 @@ struct Emitter {
       return splat(expression(expr));
     unsigned axis = *axes.begin();
     SmallVector<int64_t> projection(coordinateMap.size(), 0);
-    Emitter local{r,         loc, function, originalArgs, {targetShape[axis]},
-                  projection};
+    Emitter local{
+        r,          loc,          function, originalArgs, {targetShape[axis]},
+        projection, inductionVars};
     return expandAxis(local.expression(expr), axis);
   }
   Value expression(BatchExprRef e) {
     if (e->kind == K::Coordinate)
       return range(coordinateMap[e->value]);
+    // Induction 和其余标量叶子一样转给 upper()。漏掉它的话这里会掉进下面的二元
+    // 分支，对空的 e->lhs 解引用——不是报错，是直接崩。圈内偏移正是以这种叶子的
+    // 形式出现在 rest term 里的。
     if (e->kind == K::Constant || e->kind == K::Argument ||
-        e->kind == K::Grid || e->kind == K::Program)
+        e->kind == K::Grid || e->kind == K::Program ||
+        e->kind == K::Induction || e->kind == K::ProgramQuotient ||
+        e->kind == K::ProgramRemainder)
       return upper(e);
     if (e->kind == K::ExtSI)
       return expression(e->lhs);
@@ -389,13 +448,72 @@ struct PointwiseRegion {
     return result;
   }
 };
+
+// The same closed map covers [N] and [M, N]. Only the final contiguous
+// dimension is widened; other dimensions and scalar row origins are kept.
+bool pointwiseTile(const BatchLayoutPlan &plan) {
+  return (plan.shape.size() == 1 &&
+          plan.localAxes == SmallVector<int64_t>{0}) ||
+         (plan.shape.size() == 2 && plan.localAxes == SmallVector<int64_t>{1});
+}
 } // namespace
-LogicalResult rewriteBatchMemoryViews(ModuleOp module,
-                                      const BatchAccessReport &accesses,
-                                      SmallVectorImpl<BatchLayoutPlan> &plans,
-                                      ArrayRef<Operation *> semanticAccesses,
-                                      Value group, unsigned originalArgCount,
-                                      int axis, int64_t factor) {
+bool hasBatchColumnPointwiseRegion(triton::FuncOp function,
+                                   const BatchAccessReport &accesses, int axis,
+                                   int64_t factor) {
+  auto plans = planBatchLayouts(accesses, axis, factor);
+  if (plans.empty())
+    return false;
+  PointwiseRegion region;
+  region.block = &function.getBody().front();
+  region.semanticShape = plans.front().shape;
+  for (const auto &plan : plans) {
+    if (plan.action != BatchLayoutPlan::PointwiseRegion ||
+        !plan.linearMemoryView || plan.shape != region.semanticShape ||
+        !pointwiseTile(plan) || !isConstant(plan.elementStride, 1) ||
+        !supportedUpper(plan.upper) ||
+        llvm::any_of(plan.residualMasks, [&](BatchExprRef predicate) {
+          return !supportedPredicate(predicate, axis, plan.localAxes);
+        }))
+      return false;
+    const auto &access = accesses.accesses[plan.accessID];
+    if (access.deviceAddress || !access.loops.empty() ||
+        accesses.sources.accesses[plan.accessID]->getBlock() != region.block)
+      return false;
+    if (isa<triton::LoadOp>(accesses.sources.accesses[plan.accessID]))
+      region.loads.insert(accesses.sources.accesses[plan.accessID]);
+    else if (isa<triton::StoreOp>(accesses.sources.accesses[plan.accessID]))
+      region.stores.insert(accesses.sources.accesses[plan.accessID]);
+    else
+      return false;
+  }
+  if (region.loads.empty() || region.stores.empty() || !region.verify())
+    return false;
+  auto control = analyzeBatchControlFlow(function, axis);
+  if (!control.reason.empty())
+    return false;
+  // A scalar program-id expression becomes lane-varying after batching;
+  // unlike a shared scalar parameter, it cannot be splatted into this map.
+  for (Value value : region.checked)
+    if (Value scalar = region.uniformScalar(value))
+      if (control.isVarying(scalar))
+        return false;
+  // Newly introduced lane masks are not part of the closed source region.
+  // Leave poison-sensitive arithmetic on the existing axis-selection path.
+  for (Operation *op : region.oldOperations)
+    if (const auto *descriptor = lookupBatchOp(op->getName().getStringRef()))
+      if (descriptor->model == BatchModel::Elementwise &&
+          needsBatchActiveMask(op, *descriptor))
+        return false;
+  return true;
+}
+
+LogicalResult
+rewriteBatchMemoryViews(ModuleOp module, const BatchAccessReport &accesses,
+                        ArrayRef<BatchLayoutPlan> plans,
+                        SmallVectorImpl<BatchLayoutResult> &results,
+                        ArrayRef<Operation *> semanticAccesses, Value group,
+                        unsigned originalArgCount, int axis, int64_t factor) {
+  auto attempts = initialBatchLayoutResults(plans);
   IRMapping mapping;
   OwningOpRef<ModuleOp> sandbox(cast<ModuleOp>(module->clone(mapping)));
   auto function = *sandbox->getOps<triton::FuncOp>().begin();
@@ -422,7 +540,7 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
                                  }) &&
                     plan.action == BatchLayoutPlan::PointwiseRegion &&
                     plan.shape == first->shape &&
-                    plan.localAxes == SmallVector<int64_t>{1};
+                    plan.localAxes == first->localAxes && pointwiseTile(plan);
       Operation *op = mapping.lookupOrNull(semanticAccesses[plan.accessID]);
       if (!op || op->getBlock() != region.block) {
         compatible = false;
@@ -434,29 +552,34 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
         region.stores.insert(op);
     }
     if (compatible) {
-      region.semanticShape = {factor, first->shape[0], first->shape[1]};
-      region.targetShape = {first->shape[0], factor * first->shape[1]};
+      region.semanticShape = {factor};
+      llvm::append_range(region.semanticShape, first->shape);
+      region.targetShape = first->shape;
+      region.targetShape.back() *= factor;
       compatible = region.verify();
     }
     if (!compatible) {
-      for (auto &plan : plans)
+      for (auto &result : attempts) {
+        auto &plan = result.layout;
         if (plan.action == BatchLayoutPlan::PointwiseRegion) {
           plan.action = BatchLayoutPlan::Keep;
           plan.reason = "EXPENSIVE_LAYOUT_BRIDGE";
           plan.linearMemoryView = false;
         }
+      }
       columnRegion = false;
     }
   }
   bool changed = false;
-  for (auto &plan : plans) {
+  for (auto &result : attempts) {
+    auto &plan = result.layout;
     if (!plan.linearMemoryView || !supportedUpper(plan.upper) ||
         llvm::any_of(plan.residualMasks, [&](BatchExprRef predicate) {
           return !supportedPredicate(predicate, axis, plan.localAxes);
         }))
       continue;
-    bool inColumnRegion = columnRegion &&
-                          plan.action == BatchLayoutPlan::PointwiseRegion;
+    bool inColumnRegion =
+        columnRegion && plan.action == BatchLayoutPlan::PointwiseRegion;
     const auto &fact = accesses.accesses[plan.accessID];
     Operation *semantic = semanticAccesses[plan.accessID];
     if (!semantic)
@@ -479,8 +602,35 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
     }
     SmallVector<int64_t> semanticShape{factor};
     llvm::append_range(semanticShape, plan.shape);
+    // 采事实时循环是沿父链自内向外记的（BatchAccessAnalysis.cpp:409-426），
+    // 这里用同样的次序走回来，按位置配上编号。两边对不上就整条放弃——那说明
+    // 克隆改变了嵌套结构，继续发射只会得到一条地址错了的访存。
+    //
+    // 还原的是**圈内偏移**（0, step, 2*step,
+    // …）而不是循环变量本身：布局分析对每 一条循环都做过代换 Induction(id) ≡
+    // lower + Induction(id)' （BatchLayoutAnalysis.cpp:249，经
+    // normalizeBatchAccessOnLogicalAxis），剩下
+    // 的这个节点代表的是等号右边那一项。还整个循环变量的话下界会被算两遍——程序轴
+    // 循环上这正是 g*F*R 那一项，地址直接错掉。
+    SmallVector<Value> enclosing;
+    for (Operation *parent = op->getParentOp(); parent;
+         parent = parent->getParentOp())
+      if (auto loop = dyn_cast<scf::ForOp>(parent)) {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(loop.getBody());
+        enclosing.push_back(rewriter.create<arith::SubIOp>(
+            loop.getLoc(), loop.getInductionVar(), loop.getLowerBound()));
+      }
+    if (enclosing.size() != fact.loops.size()) {
+      plan.linearMemoryView = false;
+      plan.action = BatchLayoutPlan::Keep;
+      plan.reason = "LOOP_NESTING_MISMATCH";
+      continue;
+    }
     Emitter e{rewriter,         op->getLoc(), function,
               originalArgCount, targetShape,  coordinateMap};
+    for (auto [loop, inductionVar] : llvm::zip(fact.loops, enclosing))
+      e.inductionVars[loop.id] = inductionVar;
     Value q = e.wide(mapping.lookup(group));
     Value base = rewriter.create<arith::MulIOp>(e.loc, q, e.constant(count));
     Value t = e.range(fusedTarget);
@@ -488,15 +638,64 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
     if (plan.origin)
       logicalBase =
           rewriter.create<arith::AddIOp>(e.loc, base, e.constant(plan.origin));
+    // 掩码必须界住地址真正落到的那一行。logicalBase 只含程序号那一项，圈内偏移
+    // 在下面以 rest term 的形式加进 offsetBase——两边不同步的话第 k 圈会拿第 0
+    // 圈 的掩码，越界就拦不住了。没有循环时 rest term 里不会有
+    // Induction，这一段是 空转。
+    //
+    // 只在元素步长为 1、元素起点为 0 时成立：那时 offsetBase = base，元素单位和
+    // 逻辑单位是同一个量，圈内偏移可以直接加到 logicalBase 上。别的比例关系要另
+    // 行证明，没证之前整条劝退，不发一条掩码错了的访存。
+    Value shifted;
+    for (const auto &term : plan.restTerms) {
+      if (term.kind != K::Induction)
+        continue;
+      // logicalBase 是**行单位**，而 term.coefficient
+      // 是**元素单位**。两者的换算 系数必须精确知道，不能估。认两种情形：
+      //   元素步长为 1  两种单位本来就是同一个，照搬系数。
+      //   系数恰是元素步长  循环变量就是行号，换算系数精确为 1，行偏移即 iv。
+      //      正例 #7/#8 的二维按行访存全落在这一支；少了它，它们会静悄悄地退回
+      //      语义体——照样 REWRITTEN、照样算对，只是宽访存桥没搭上，比基线慢。
+      bool unit = isConstant(plan.elementStride, 1);
+      if ((!unit && !sameExpression(term.coefficient, plan.elementStride)) ||
+          !isConstant(plan.elementOrigin, 0)) {
+        plan.linearMemoryView = false;
+        plan.action = BatchLayoutPlan::Keep;
+        plan.reason = "LOOP_MASK_UNIT_MISMATCH";
+        break;
+      }
+      Value shift = e.expression(K::leaf(term.kind, term.id, 32));
+      if (unit && !isConstant(term.coefficient, 1))
+        shift = rewriter.create<arith::MulIOp>(e.loc, shift,
+                                               e.upper(term.coefficient));
+      shifted = rewriter.create<arith::AddIOp>(
+          e.loc, shifted ? shifted : logicalBase, shift);
+    }
+    if (!plan.linearMemoryView)
+      continue;
     Value grid = e.wide(function.getArgument(originalArgCount + axis));
     Value endpoint = rewriter.create<arith::MulIOp>(
         e.loc, grid, e.constant(plan.tileExtent));
     if (plan.origin)
       endpoint = rewriter.create<arith::AddIOp>(e.loc, endpoint,
                                                 e.constant(plan.origin));
-    Value limit =
-        rewriter.create<arith::MinSIOp>(e.loc, e.upper(plan.upper), endpoint);
-    Value mask = e.axisMask(logicalBase, limit, fusedTarget);
+    // 没有圈内偏移时两条界融成一条 min，这是已发布的形状，原样保留。
+    //
+    // 有圈内偏移就不能融：两条界管的不是一回事。plan.upper
+    // 界的是这条访存真正落到 的行，圈内偏移要算进去；endpoint = G*tileExtent
+    // 界的是 lane 活没活，它说的是 "原网格只有 G
+    // 份"，和走到第几圈无关。把圈内偏移塞进 min 里，第 k 圈的活 lane
+    // 会被当成越界挡掉——少读，不是多读，但一样是算错。
+    Value mask;
+    if (shifted) {
+      mask = rewriter.create<arith::AndIOp>(
+          e.loc, e.axisMask(shifted, e.upper(plan.upper), fusedTarget),
+          e.axisMask(logicalBase, endpoint, fusedTarget));
+    } else {
+      Value limit =
+          rewriter.create<arith::MinSIOp>(e.loc, e.upper(plan.upper), endpoint);
+      mask = e.axisMask(logicalBase, limit, fusedTarget);
+    }
     for (auto predicate : plan.residualMasks)
       mask =
           rewriter.create<arith::AndIOp>(e.loc, mask, e.predicate(predicate));
@@ -512,7 +711,7 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
                                                   e.upper(plan.elementOrigin));
     Value offset = offsetRange;
     for (const auto &term : plan.restTerms) {
-      Value value = e.expression(K::leaf(term.kind, term.id, 32));
+      Value value = e.expression(K::leaf(term.kind, term.id, 32, term.divisor));
       Value scale = e.upper(term.coefficient);
       if (isa<RankedTensorType>(value.getType()))
         scale = e.splat(scale);
@@ -548,8 +747,9 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
       if (originalType.getShape() != ArrayRef<int64_t>(semanticShape))
         return module.emitError("invalid semantic load shape for memory view"),
                failure();
-      Value other = inColumnRegion ? region.materialize(load.getOther(), rewriter)
-                                 : e.reshape(load.getOther(), targetShape);
+      Value other = inColumnRegion
+                        ? region.materialize(load.getOther(), rewriter)
+                        : e.reshape(load.getOther(), targetShape);
       auto replacement = rewriter.create<triton::LoadOp>(
           e.loc, pointer, mask, other, load.getBoundaryCheck(),
           load.getPadding(), load.getCache(), load.getEvict(),
@@ -575,13 +775,15 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
       rewriter.eraseOp(op);
     }
     if (plan.symbolic)
-      plan.runtimeGuardJSON = layoutRuntimeGuard(
+      result.runtimeGuardJSON = layoutRuntimeGuard(
           plan, fact, targetShape, coordinateMap, fusedTarget, axis, factor);
-    plan.rewritten = true;
+    result.rewritten = true;
     changed = true;
   }
-  if (!changed)
+  if (!changed) {
+    results.assign(attempts.begin(), attempts.end());
     return success();
+  }
   if (columnRegion) {
     SmallVector<Operation *> dead;
     for (Operation &op : *region.block)
@@ -601,6 +803,7 @@ LogicalResult rewriteBatchMemoryViews(ModuleOp module,
            failure();
   module->setAttrs((*sandbox)->getAttrs());
   module.getBodyRegion().takeBody(sandbox->getBodyRegion());
+  results.assign(attempts.begin(), attempts.end());
   return success();
 }
 } // namespace mlir::triton::cfg

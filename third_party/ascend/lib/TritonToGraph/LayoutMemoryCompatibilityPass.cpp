@@ -82,7 +82,8 @@ public:
 
   void runOnOperation() override {
     ModuleOp moduleOp = getOperation();
-    auto owner = moduleOp->getAttrOfType<StringAttr>("hacc.block_mapping_owner");
+    auto owner =
+        moduleOp->getAttrOfType<StringAttr>("hacc.block_mapping_owner");
     const bool batchOwned = owner && owner.getValue() == "block_batching";
     bool wasCoalesced = false;
     switch (phase) {

@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 
 import pytest
+from triton.backends.ascend.block_batching import IMPLEMENTATION_VERSION
 
 from block_batching_op_cases import W1_OPS, W2_OPS
 
@@ -63,6 +64,7 @@ def test_basic_region_families_have_conditional_models():
 
 def test_native_manifest_matches_admission_catalog():
     extension = pytest.importorskip("triton._C.libtriton")
+    from triton.backends.ascend.block_batching import IMPLEMENTATION_VERSION
     binding = extension.ascend.passes.ttir
     assert hasattr(binding, "block_batching_registry"), "rebuild the Ascend extension"
     native = binding.block_batching_registry()
@@ -71,4 +73,4 @@ def test_native_manifest_matches_admission_catalog():
     for row in native:
         expected = entries[row["op_name"]]
         assert all(row[key] == value for key, value in expected.items())
-        assert row["implementation_version"] == 27
+        assert row["implementation_version"] == IMPLEMENTATION_VERSION

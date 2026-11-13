@@ -44,6 +44,7 @@ struct BatchAnalysisReport {
   std::string operation;
   std::string context;
   std::string layoutJSON;
+  std::string computationJSON;
   std::map<std::string, unsigned> operations;
 };
 
@@ -51,15 +52,25 @@ struct BatchRewriteReport : BatchAnalysisReport {
   std::string guardJSON;
   std::string cvMode = "disabled";
   std::string cvLowering = "disabled";
+  std::string vvLowering = "disabled";
   unsigned structuredMasks = 0;
   int selectedAxis = -1;
   int64_t laneWidth = 1;
 };
+// Describe original aggregation domains before the rewrite erases them.
+std::string describeBatchComputation(Operation *root);
 void setBatchDiagnostic(BatchAnalysisReport &report, Operation *op,
                         llvm::StringRef reason);
 
+// 成功时把改写结果提交回 module。
 FailureOr<BatchRewriteReport> rewriteBlockBatching(ModuleOp module,
                                                    BatchRequest request);
+
+// 同样的改写，但**绝不提交**：module 一个字节都不变。干跑用这条。
+// 在它之前，干跑只能靠在外面再 clone 一层来躲开上面那次提交，于是一次干跑要把
+// 整个模块 clone 两遍。
+FailureOr<BatchRewriteReport> probeBlockBatching(ModuleOp module,
+                                                 BatchRequest request);
 
 FailureOr<BatchAnalysisReport> analyzeBlockBatching(ModuleOp module,
                                                     BatchRequest request);
